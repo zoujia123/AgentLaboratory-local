@@ -1,0 +1,31 @@
+{
+  "query_id": "query_001",
+  "recording_id": "20260902T132704151848Z_c4a642b0",
+  "topic": "In the Iris dataset, can using only petal length and petal width achieve classification performance comparable to using all four features?",
+  "seeds": {
+    "strategy": "fixed",
+    "python": 2001,
+    "numpy": 3001,
+    "sklearn": 4001,
+    "pytorch": 5001,
+    "pytorch-deterministic": true
+  },
+  "literature_papers": [],
+  "literature_review": "",
+  "plan": "",
+  "dataset_selection": {},
+  "dataset_code": "",
+  "dataset_output": "",
+  "dataset_manifest": {},
+  "dataset_validation_warnings": [],
+  "experiment_code": "",
+  "experiment_output": "",
+  "supplementary_experiments": [],
+  "interpretation_history": [],
+  "experiment_score": {},
+  "interpretation": "",
+  "paper": "",
+  "readme": "",
+  "reviews": [],
+  "paper_score": {}
+}

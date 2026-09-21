@@ -1,0 +1,11 @@
+{
+  "success_count": 0,
+  "failure_count": 1,
+  "results": [],
+  "failures": [
+    {
+      "query_id": "query_001",
+      "error": "Tool-calling model request failed after 3 attempts: Error code: 429 - {'code': 50609, 'message': 'Request was rejected due to rate limiting. Details: System is too busy now.', 'data': None}"
+    }
+  ]
+}

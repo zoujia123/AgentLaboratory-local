@@ -1,0 +1,22 @@
+material-root: "D:/work/HUST/MASLab_v2"
+output-root: "research_runs_v2"
+max-concurrent-queries: 1
+max-llm-http-attempts-per-query: 100
+console-log: false
+compile-latex: false
+
+seeds:
+  strategy: "fixed"
+  python: 2001
+  numpy: 3001
+  sklearn: 4001
+  pytorch: 5001
+  pytorch-deterministic: true
+
+queries:
+
+
+  - query-id: query_001
+    recording-id: latest 
+
+

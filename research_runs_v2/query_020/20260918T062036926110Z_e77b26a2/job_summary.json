@@ -1,0 +1,56 @@
+{
+  "job_id": "20260918T062036926110Z_e77b26a2",
+  "query_id": "query_020",
+  "recording_id": "20260903T043324986012Z_fec995bc",
+  "topic": "In the UCI Air Quality dataset, after randomly masking 10% of sensor readings, does linear interpolation yield lower reconstruction error than mean imputation?",
+  "seeds": {
+    "strategy": "fixed",
+    "python": 2001,
+    "numpy": 3001,
+    "sklearn": 4001,
+    "pytorch": 5001,
+    "pytorch-deterministic": true
+  },
+  "console_log": false,
+  "success": false,
+  "error": "Tool-calling model request failed after 3 attempts: Error code: 429 - {'code': 50609, 'message': 'Request was rejected due to rate limiting. Details: System is too busy now.', 'data': None}",
+  "workdir": "D:\\work\\HUST\\specKV\\20260806 tool_sort_by_idleness\\AgentLaboratory-main\\AgentLaboratory-main-local\\research_runs_v2\\query_020\\20260918T062036926110Z_e77b26a2",
+  "workflow_log": "D:\\work\\HUST\\specKV\\20260806 tool_sort_by_idleness\\AgentLaboratory-main\\AgentLaboratory-main-local\\research_runs_v2\\query_020\\20260918T062036926110Z_e77b26a2\\workflow.log",
+  "prompt_log": "D:\\work\\HUST\\specKV\\20260806 tool_sort_by_idleness\\AgentLaboratory-main\\AgentLaboratory-main-local\\research_runs_v2\\query_020\\20260918T062036926110Z_e77b26a2\\prompts.jsonl",
+  "llm_http_attempt_budget": {
+    "limit": 100,
+    "used": 15,
+    "remaining": 85,
+    "limit_reached": false,
+    "request_blocked": false
+  },
+  "trace": {
+    "run_id": "20260918T062036932125Z_b72e812f",
+    "started_at": "2026-09-18T06:20:36.932125+00:00",
+    "ended_at": "2026-09-18T06:49:52.750452+00:00",
+    "workflow_elapsed_ms": 1755818.138,
+    "event_count": 22,
+    "tool_call_count": 5,
+    "llm_call_count": 13,
+    "tool_inclusive_duration_ms": 29961.696,
+    "llm_duration_ms": 1722370.841,
+    "note": "Tool durations are inclusive; use parent_call_id to avoid double-counting nested calls."
+  },
+  "replay": {
+    "query_id": "query_020",
+    "recording_id": "20260903T043324986012Z_fec995bc",
+    "material_root": "D:\\work\\HUST\\MASLab_v2",
+    "event_count": 4,
+    "match_counts": {
+      "local_bm25": 2,
+      "object_direct": 2
+    },
+    "strict_offline": true,
+    "latency_mode": "recorded",
+    "latency_scale": 1.0,
+    "unused_calls": {
+      "arxiv.search": 4,
+      "huggingface.search": 0
+    }
+  }
+}

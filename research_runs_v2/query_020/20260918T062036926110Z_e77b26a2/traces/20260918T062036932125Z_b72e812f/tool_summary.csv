@@ -1,0 +1,6 @@
+agent,phase,name,trigger,count,success_count,failure_count,total_ms,avg_ms,p50_ms,p95_ms,max_ms
+LaboratoryWorkflow,workflow,arxiv.full_text,framework_automatic,1,1,0,3279.455,3279.455,3279.455,3279.455,3279.455
+LaboratoryWorkflow,workflow,arxiv.search,framework_automatic,1,1,0,4329.089,4329.089,4329.089,4329.089,4329.089
+LaboratoryWorkflow,workflow,huggingface.dataset.search,framework_automatic,1,1,0,4531.375,4531.375,4531.375,4531.375,4531.375
+LaboratoryWorkflow,workflow,huggingface.index.initialize,framework_automatic,1,1,0,0.003,0.003,0.003,0.003,0.003
+LaboratoryWorkflow,workflow,python.execute_code,framework_automatic,1,1,0,17821.774,17821.774,17821.774,17821.774,17821.774

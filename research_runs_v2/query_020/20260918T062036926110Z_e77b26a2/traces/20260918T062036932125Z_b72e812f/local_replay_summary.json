@@ -1,0 +1,17 @@
+{
+  "query_id": "query_020",
+  "recording_id": "20260903T043324986012Z_fec995bc",
+  "material_root": "D:\\work\\HUST\\MASLab_v2",
+  "event_count": 4,
+  "match_counts": {
+    "local_bm25": 2,
+    "object_direct": 2
+  },
+  "strict_offline": true,
+  "latency_mode": "recorded",
+  "latency_scale": 1.0,
+  "unused_calls": {
+    "arxiv.search": 4,
+    "huggingface.search": 0
+  }
+}

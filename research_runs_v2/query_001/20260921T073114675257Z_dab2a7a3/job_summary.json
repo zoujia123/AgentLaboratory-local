@@ -1,0 +1,56 @@
+{
+  "job_id": "20260921T073114675257Z_dab2a7a3",
+  "query_id": "query_001",
+  "recording_id": "20260902T132704151848Z_c4a642b0",
+  "topic": "In the Iris dataset, can using only petal length and petal width achieve classification performance comparable to using all four features?",
+  "seeds": {
+    "strategy": "fixed",
+    "python": 2001,
+    "numpy": 3001,
+    "sklearn": 4001,
+    "pytorch": 5001,
+    "pytorch-deterministic": true
+  },
+  "console_log": false,
+  "success": false,
+  "error": "Tool-calling model request failed after 3 attempts: Error code: 429 - {'code': 50609, 'message': 'Request was rejected due to rate limiting. Details: System is too busy now.', 'data': None}",
+  "workdir": "D:\\work\\HUST\\specKV\\20260806 tool_sort_by_idleness\\AgentLaboratory-main\\AgentLaboratory-main-local\\research_runs_v2\\query_001\\20260921T073114675257Z_dab2a7a3",
+  "workflow_log": "D:\\work\\HUST\\specKV\\20260806 tool_sort_by_idleness\\AgentLaboratory-main\\AgentLaboratory-main-local\\research_runs_v2\\query_001\\20260921T073114675257Z_dab2a7a3\\workflow.log",
+  "prompt_log": "D:\\work\\HUST\\specKV\\20260806 tool_sort_by_idleness\\AgentLaboratory-main\\AgentLaboratory-main-local\\research_runs_v2\\query_001\\20260921T073114675257Z_dab2a7a3\\prompts.jsonl",
+  "llm_http_attempt_budget": {
+    "limit": 100,
+    "used": 11,
+    "remaining": 89,
+    "limit_reached": false,
+    "request_blocked": false
+  },
+  "trace": {
+    "run_id": "20260921T073114681289Z_d2b02afb",
+    "started_at": "2026-09-21T07:31:14.681289+00:00",
+    "ended_at": "2026-09-21T07:33:34.114575+00:00",
+    "workflow_elapsed_ms": 139434.014,
+    "event_count": 21,
+    "tool_call_count": 6,
+    "llm_call_count": 9,
+    "tool_inclusive_duration_ms": 67429.414,
+    "llm_duration_ms": 71913.406,
+    "note": "Tool durations are inclusive; use parent_call_id to avoid double-counting nested calls."
+  },
+  "replay": {
+    "query_id": "query_001",
+    "recording_id": "20260902T132704151848Z_c4a642b0",
+    "material_root": "D:\\work\\HUST\\MASLab_v2",
+    "event_count": 6,
+    "match_counts": {
+      "local_bm25": 3,
+      "object_direct": 3
+    },
+    "strict_offline": true,
+    "latency_mode": "recorded",
+    "latency_scale": 1.0,
+    "unused_calls": {
+      "arxiv.search": 21,
+      "huggingface.search": 1
+    }
+  }
+}

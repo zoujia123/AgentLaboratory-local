@@ -1,0 +1,7 @@
+agent,phase,name,trigger,count,success_count,failure_count,total_ms,avg_ms,p50_ms,p95_ms,max_ms
+MLESolverAgent,running experiments,llm.query_model_with_tools,agent_requested,3,2,1,1266198.82,422066.273,417660.083,809957.215,809957.215
+MLEngineerAgent,data preparation collaboration,llm.query_model_with_tools,agent_requested,1,1,0,21554.248,21554.248,21554.248,21554.248,21554.248
+PhDStudentAgent,literature review,llm.query_model_with_tools,agent_requested,4,4,0,170090.455,42522.614,35509.961,69341.487,69341.487
+PhDStudentAgent,plan formulation,llm.query_model_with_tools,agent_requested,1,1,0,52847.075,52847.075,52847.075,52847.075,52847.075
+PostdocAgent,plan formulation,llm.query_model_with_tools,agent_requested,2,2,0,69986.256,34993.128,31216.545,38769.711,38769.711
+SWEngineerAgent,data preparation collaboration,llm.query_model_with_tools,agent_requested,2,2,0,141693.987,70846.993,60685.24,81008.747,81008.747

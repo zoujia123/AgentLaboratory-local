@@ -1,0 +1,10 @@
+.env
+.venv/
+venv*/
+.cache/
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+research_runs/
+Figure_*.png
