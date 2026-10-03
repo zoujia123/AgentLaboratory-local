@@ -60,6 +60,50 @@ class ExecutionStatusTest(unittest.TestCase):
         self.assertIn("KeyError", limited)
         self.assertEqual(result["output"], "before error\n")
 
+    def test_preparation_scope_rejects_model_training_before_execution(self):
+        from agents import _run_preparation_code
+
+        code = (
+            "from sklearn.ensemble import RandomForestClassifier\n"
+            "from sklearn.metrics import accuracy_score\n"
+            "model = RandomForestClassifier()\n"
+            "model.fit(X_train, y_train)\n"
+            "accuracy_score(y_test, model.predict(X_test))\n"
+        )
+        with patch("agents.execute_code") as execute:
+            result = _run_preparation_code(code, ".")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "data_preparation_scope_violation")
+        self.assertIn("RandomForestClassifier", result["error"])
+        self.assertIn("accuracy_score", result["error"])
+        execute.assert_not_called()
+
+    def test_preparation_scope_allows_preprocessing(self):
+        from agents import _run_preparation_code
+
+        details = {
+            "success": True,
+            "error_type": None,
+            "error": None,
+            "traceback": "",
+            "exit_code": 0,
+            "output": "prepared\n",
+            "replay_events": [],
+            "artifacts": [],
+            "prepared_data_manifest": None,
+        }
+        code = (
+            "from sklearn.preprocessing import StandardScaler\n"
+            "scaler = StandardScaler()\n"
+            "X_train = scaler.fit_transform(X_train)\n"
+        )
+        with patch("agents.execute_code", return_value=details) as execute:
+            result = _run_preparation_code(code, ".")
+
+        self.assertTrue(result["success"])
+        execute.assert_called_once()
+
     def test_program_printed_diagnostics_are_preserved(self):
         result = self.run_code("print('Traceback user text')\nraise ValueError('bad')")
         self.assertEqual(result["output"], "Traceback user text\n")

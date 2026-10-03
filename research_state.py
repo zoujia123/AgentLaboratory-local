@@ -10,6 +10,7 @@ class ResearchState:
     literature_papers: list = field(default_factory=list)
     literature_review: str = ""
     plan: str = ""
+    data_requirements: str = ""
     dataset_selection: dict = field(default_factory=dict)
     dataset_code: str = ""
     dataset_output: str = ""

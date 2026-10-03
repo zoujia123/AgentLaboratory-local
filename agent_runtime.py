@@ -23,6 +23,7 @@ class ToolDefinition:
     parameters: dict
     handler: object
     allow_multiple: bool = False
+    batch_coalescer: object = None
 
     # strict: bool = True 请求服务端严格遵守工具参数结构
     @property
@@ -32,6 +33,7 @@ class ToolDefinition:
             "function": {
                 "name": self.name,
                 "description": self.description,
+                "strict": True,
                 "parameters": self.parameters,
             },
         }
@@ -56,6 +58,7 @@ class ToolRegistry:
         parameters,
         handler,
         allow_multiple=False,
+        batch_coalescer=None,
     ):
         if name in self._tools:
             raise ValueError(f"Tool {name!r} is already registered")
@@ -67,6 +70,7 @@ class ToolRegistry:
             parameters=parameters,
             handler=handler,
             allow_multiple=bool(allow_multiple),
+            batch_coalescer=batch_coalescer,
         )
         return self
 
@@ -94,6 +98,12 @@ class ToolRegistry:
     def allows_multiple(self, name):
         try:
             return self._tools[name].allow_multiple
+        except KeyError as exc:
+            raise ToolProtocolError(f"Model requested unknown tool {name!r}") from exc
+
+    def batch_coalescer_for(self, name):
+        try:
+            return self._tools[name].batch_coalescer
         except KeyError as exc:
             raise ToolProtocolError(f"Model requested unknown tool {name!r}") from exc
 
@@ -148,9 +158,24 @@ class AgentRuntime:
             int(default_max_rounds if max_rounds is None else max_rounds),
         )
 
-    @staticmethod
-    def _tool_output(value):
-        return json.dumps(value, ensure_ascii=True, default=str)
+    # @staticmethod
+    def _tool_output(self, value):
+        raw = json.dumps(value, ensure_ascii=True, default=str)
+        if self.phase != "literature review" or len(raw) <= 2000:
+            return raw
+
+        compact = {
+            "success": value.get("success"),
+            "arxiv_id": value.get("arxiv_id"),
+            "candidate_ids": value.get("candidate_ids"),
+            "candidate_count": value.get("candidate_count"),
+            "decision_required": value.get("decision_required"),
+            "next_action_hint": value.get("next_action_hint"),
+            "history_truncated": True,
+            "original_chars": len(raw),
+            "preview": raw[:4000],
+        }
+        return json.dumps(compact, ensure_ascii=True, default=str)
 
     @staticmethod
     def _assistant_tool_call(tool_call):
@@ -179,6 +204,54 @@ class AgentRuntime:
             default=str,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _apply_failure_history_compactor(
+        self,
+        messages,
+        failure_history_compactor,
+        tool_call,
+        arguments,
+        value,
+        step,
+    ):
+        if failure_history_compactor is None:
+            return False
+        if not isinstance(value, dict) or value.get("success") is not False:
+            return False
+        compacted_messages = failure_history_compactor(
+            tool_call=tool_call,
+            arguments=arguments,
+            value=value,
+        )
+        if compacted_messages is None:
+            return False
+        if (
+            not isinstance(compacted_messages, list)
+            or not all(isinstance(message, dict) for message in compacted_messages)
+        ):
+            raise ToolProtocolError(
+                "failure_history_compactor must return a list of message objects"
+            )
+        previous_count = len(messages)
+        messages[:] = compacted_messages
+        current_run_logger().info(
+            f"[{self.agent_name}][{self.phase}][step={step}] "
+            "MODEL HISTORY COMPACTED "
+            f"failure_tool={tool_call.name} messages={previous_count}->"
+            f"{len(messages)}"
+        )
+        current_prompt_recorder().record({
+            "event": "failure_history_compacted",
+            "agent": self.agent_name,
+            "phase": self.phase,
+            "step": step,
+            "failure_tool": tool_call.name,
+            "error_type": value.get("error_type"),
+            "code_hash": value.get("code_hash"),
+            "previous_message_count": previous_count,
+            "message_count": len(messages),
+        })
+        return True
 
     @staticmethod
     def _compact_failed_arguments(arguments):
@@ -226,6 +299,30 @@ class AgentRuntime:
                 f"{self.agent_name} returned invalid JSON arguments for "
                 f"{tool_call.name!r}: {exc}"
             ) from exc
+
+    def _coalesce_tool_calls(self, registry, tool_calls):
+        """Return one safe synthetic call when a registered atomic tool can merge it."""
+        if len(tool_calls) < 2:
+            return None
+        names = {call.name for call in tool_calls}
+        if len(names) != 1:
+            return None
+        name = next(iter(names))
+        coalescer = registry.batch_coalescer_for(name)
+        if coalescer is None:
+            return None
+        try:
+            argument_batches = [self._parse_arguments(call) for call in tool_calls]
+            arguments = coalescer(argument_batches)
+        except (ToolProtocolError, TypeError, ValueError):
+            return None
+        if not isinstance(arguments, dict):
+            return None
+        return ModelToolCall(
+            call_id=tool_calls[0].call_id,
+            name=name,
+            arguments=json.dumps(arguments, ensure_ascii=True, default=str),
+        )
 
     def _execute_tool(self, registry, tool_call, arguments, step):
         logger = current_run_logger()
@@ -660,7 +757,7 @@ class AgentRuntime:
                 },
             )
 
-    def run(self,system_prompt,user_prompt,registry,terminal_tools,tool_names_provider=None,return_after_tool=False,automatic_tools=(),):
+    def run(self,system_prompt,user_prompt,registry,terminal_tools,tool_names_provider=None,return_after_tool=False,automatic_tools=(),failure_history_compactor=None,):
         # Alternating collaborators hand back each tool result, including failures.
         # Other agents retain the default loop-until-success behavior.
 
@@ -731,6 +828,14 @@ class AgentRuntime:
                         "tool_call_id": tool_call.call_id,
                         "content": self._tool_output(value),
                     })
+                    self._apply_failure_history_compactor(
+                        messages,
+                        failure_history_compactor,
+                        tool_call,
+                        {},
+                        value,
+                        step,
+                    )
                     terminal_success = not (
                         isinstance(value, dict) and value.get("success") is False
                     )
@@ -875,6 +980,31 @@ class AgentRuntime:
                     current_round,
                 )
                 continue
+            if len(response.tool_calls) > 1:
+                original_calls = list(response.tool_calls)
+                coalesced_call = self._coalesce_tool_calls(
+                    registry,
+                    original_calls,
+                )
+                if coalesced_call is not None:
+                    response.tool_calls = [coalesced_call]
+                    logger.info(
+                        f"[{self.agent_name}][{self.phase}][step={step}] "
+                        "TOOL CALLS COALESCED "
+                        f"tool={coalesced_call.name} count={len(original_calls)}"
+                    )
+                    prompt_recorder.record({
+                        "event": "tool_calls_coalesced",
+                        "agent": self.agent_name,
+                        "phase": self.phase,
+                        "step": step,
+                        "tool_name": coalesced_call.name,
+                        "source_tool_call_ids": [
+                            call.call_id for call in original_calls
+                        ],
+                        "coalesced_tool_call_id": coalesced_call.call_id,
+                        "source_call_count": len(original_calls),
+                    })
             if len(response.tool_calls) > 1:
                 disallowed = [  # 检查这批工具是否都允许批量调用
                     call.name
@@ -1039,6 +1169,14 @@ class AgentRuntime:
                 "tool_call_id": tool_call.call_id,
                 "content": self._tool_output(value),
             })  # 把工具结果加入对话
+            self._apply_failure_history_compactor(
+                messages,
+                failure_history_compactor,
+                tool_call,
+                arguments,
+                value,
+                step,
+            )
 
             # 如果连续发生完全相同的失败，就累加次数；否则重新计数
             if tool_failed:

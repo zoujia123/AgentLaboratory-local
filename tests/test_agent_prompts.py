@@ -11,8 +11,16 @@ from agents import (
     PostdocAgent,
     SWEngineerAgent,
     _prepared_manifest_validation_issues,
+    _run_preparation_code,
 )
 from prompts import ml_dataset_selection_prompt, sw_data_preparation_prompt
+
+
+COLLABORATION_ROUNDS = {
+    "plan_max_rounds": 8,
+    "data_preparation_max_rounds": 12,
+    "interpretation_max_phd_reviews": 8,
+}
 
 
 def dataset_contract(**overrides):
@@ -57,41 +65,444 @@ def dataset_code_arguments(code):
 
 
 class AgentPromptTest(unittest.TestCase):
-    def test_ml_inspected_candidate_requires_first_trial_only(self):
-        for inspected, pending in ((None, False), ({"dataset_id": "owner/data"}, True),
-                                   ({"dataset_id": "owner/data"}, False)):
-            with self.subTest(inspected=inspected, pending=pending), patch(
+    def test_sw_automatically_promotes_verified_trial_without_reexecution(self):
+        selection = {
+            "dataset_id": "owner/data",
+            "revision": "r1",
+            "config_name": "default",
+            "split": "train",
+        }
+        verified_trial = {
+            "success": True,
+            "code": "data = [1, 2]",
+            "output": "prepared",
+            "selection": dict(selection),
+            "artifacts": [],
+            "prepared_data_manifest": None,
+        }
+        with patch("agent_runtime.query_model_with_tools") as query, patch(
+            "agents.execute_code"
+        ) as execute:
+            result = SWEngineerAgent("model", "key").data_preparation_turn(
+                "topic",
+                "requirements",
+                ".",
+                inspected_dataset={"success": True, **selection},
+                verified_trial=verified_trial,
+            )
+
+        self.assertEqual(result.tool_name, "submit_dataset_code")
+        self.assertTrue(result.value.pop("automatic_execution"))
+        self.assertEqual(result.value, verified_trial)
+        query.assert_not_called()
+        execute.assert_not_called()
+
+    def test_workflow_promotes_matching_successful_trial_before_next_ml_turn(self):
+        import tempfile
+        from workflows.laboratory import LaboratoryWorkflow
+        from research_state import ResearchState
+
+        selection = {
+            "dataset_id": "owner/data",
+            "revision": "r1",
+            "config_name": "default",
+            "split": "train",
+        }
+        inspected = {
+            "success": True,
+            **selection,
+            "dataset_schema": {"columns": {"value": "int64"}},
+        }
+        actions = [
+            ("search_huggingface", {
+                "success": True,
+                "results": [],
+                "selected_dataset": dict(selection),
+            }),
+            ("inspect_huggingface_dataset", {
+                **inspected,
+                "selected_dataset": dict(selection),
+            }),
+            ("execute_dataset_code", {
+                "success": True,
+                "code": "data = [1, 2]",
+                "output": "prepared",
+                "selection": dict(selection),
+                "artifacts": [],
+                "prepared_data_manifest": None,
+            }),
+        ]
+        ml_calls = []
+        sw_verified_trials = []
+
+        def ml_turn(*args, **kwargs):
+            ml_calls.append(kwargs)
+            name, value = actions[len(ml_calls) - 1]
+            return SimpleNamespace(tool_name=name, value=value)
+
+        def sw_turn(*args, **kwargs):
+            verified_trial = kwargs.get("verified_trial")
+            sw_verified_trials.append(verified_trial)
+            if verified_trial is not None:
+                return SimpleNamespace(
+                    tool_name="submit_dataset_code",
+                    value=dict(verified_trial),
+                )
+            return SimpleNamespace(
+                tool_name="send_dialogue",
+                value={"success": True, "message": "Continue."},
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = LaboratoryWorkflow(
+                ResearchState("query", "recording", "topic"),
+                "model",
+                "key",
+                directory,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
+            with patch.object(
+                workflow.ml_engineer,
+                "data_preparation_turn",
+                side_effect=ml_turn,
+            ), patch.object(
+                workflow.sw_engineer,
+                "data_preparation_turn",
+                side_effect=sw_turn,
+            ):
+                result_selection, submitted = workflow._prepare_dataset_collaboratively()
+
+        self.assertEqual(len(ml_calls), 3)
+        self.assertEqual(submitted["code"], "data = [1, 2]")
+        self.assertEqual(result_selection["dataset_id"], "owner/data")
+        self.assertTrue(all(trial is None for trial in sw_verified_trials))
+
+    def test_workflow_promotes_successful_multisplit_trial_with_provenance_warnings(self):
+        import tempfile
+        from workflows.laboratory import LaboratoryWorkflow
+        from research_state import ResearchState
+
+        inspected_selection = {
+            "dataset_id": "owner/data",
+            "revision": "r1",
+            "config_name": "default",
+            "split": "train",
+        }
+        inspected = {
+            "success": True,
+            **inspected_selection,
+            "dataset_schema": {"columns": {"value": "int64"}},
+        }
+        trial_selection = {
+            "dataset_id": "owner/data",
+            "revision": "r2",
+            "config_name": "default",
+            "split": None,
+        }
+        actions = [
+            ("search_huggingface", {
+                "success": True,
+                "results": [],
+                "selected_dataset": dict(inspected_selection),
+            }),
+            ("inspect_huggingface_dataset", {
+                **inspected,
+                "selected_dataset": dict(inspected_selection),
+            }),
+            ("execute_dataset_code", {
+                "success": True,
+                "code": "data = {'train': [1], 'test': [2]}",
+                "output": "prepared both splits",
+                "selection": dict(trial_selection),
+                "artifacts": [],
+                "prepared_data_manifest": None,
+            }),
+        ]
+        ml_calls = []
+        verified_trials = []
+
+        def ml_turn(*args, **kwargs):
+            ml_calls.append(kwargs)
+            name, value = actions[len(ml_calls) - 1]
+            return SimpleNamespace(tool_name=name, value=value)
+
+        def sw_turn(*args, **kwargs):
+            verified_trial = kwargs.get("verified_trial")
+            verified_trials.append(verified_trial)
+            if verified_trial is not None:
+                return SimpleNamespace(
+                    tool_name="submit_dataset_code",
+                    value=dict(verified_trial),
+                )
+            return SimpleNamespace(
+                tool_name="send_dialogue",
+                value={"success": True, "message": "Continue."},
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = LaboratoryWorkflow(
+                ResearchState("query", "recording", "topic"),
+                "model",
+                "key",
+                directory,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
+            with patch.object(
+                workflow.ml_engineer,
+                "data_preparation_turn",
+                side_effect=ml_turn,
+            ), patch.object(
+                workflow.sw_engineer,
+                "data_preparation_turn",
+                side_effect=sw_turn,
+            ):
+                result_selection, submitted = workflow._prepare_dataset_collaboratively()
+
+        self.assertEqual(len(ml_calls), 3)
+        self.assertTrue(submitted["success"])
+        self.assertIsNone(result_selection["split"])
+        self.assertEqual(result_selection["revision"], "r2")
+        warnings = submitted["validation_warnings"]
+        self.assertTrue(any("explicit split" in warning for warning in warnings))
+        self.assertTrue(any("revision" in warning for warning in warnings))
+        self.assertTrue(all(trial is None for trial in verified_trials))
+
+    def test_workflow_submits_trial_that_succeeds_in_final_round(self):
+        import tempfile
+        from workflows.laboratory import LaboratoryWorkflow
+        from research_state import ResearchState
+
+        selection = {
+            "dataset_id": "owner/data",
+            "revision": "r1",
+            "config_name": "default",
+            "split": "train",
+        }
+        inspected = {
+            "success": True,
+            **selection,
+            "dataset_schema": {"columns": {"value": "int64"}},
+        }
+        ml_calls = []
+        sw_calls = []
+
+        def ml_turn(*args, **kwargs):
+            ml_calls.append(kwargs)
+            index = len(ml_calls) - 1
+            if index == 0:
+                return SimpleNamespace(
+                    tool_name="inspect_huggingface_dataset",
+                    value={**inspected, "selected_dataset": dict(selection)},
+                )
+            if index == 11:
+                return SimpleNamespace(
+                    tool_name="execute_dataset_code",
+                    value={
+                        "success": True,
+                        "code": "data = [1, 2]",
+                        "output": "prepared",
+                        "selection": dict(selection),
+                        "artifacts": [],
+                        "prepared_data_manifest": None,
+                    },
+                )
+            return SimpleNamespace(
+                tool_name="send_dialogue",
+                value={"success": True, "message": "Continue."},
+            )
+
+        def sw_turn(*args, **kwargs):
+            sw_calls.append(kwargs)
+            return SimpleNamespace(
+                tool_name="send_dialogue",
+                value={"success": True, "message": "Continue."},
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = LaboratoryWorkflow(
+                ResearchState("query", "recording", "topic"),
+                "model",
+                "key",
+                directory,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
+            with patch.object(
+                workflow.ml_engineer,
+                "data_preparation_turn",
+                side_effect=ml_turn,
+            ), patch.object(
+                workflow.sw_engineer,
+                "data_preparation_turn",
+                side_effect=sw_turn,
+            ):
+                result_selection, submitted = workflow._prepare_dataset_collaboratively()
+
+        self.assertEqual(len(ml_calls), 12)
+        self.assertEqual(len(sw_calls), 12)
+        self.assertEqual(result_selection["dataset_id"], "owner/data")
+        self.assertTrue(submitted["success"])
+        self.assertEqual(submitted["code"], "data = [1, 2]")
+
+    def test_workflow_keeps_original_diagnostic_after_duplicate_trial(self):
+        import tempfile
+        from workflows.laboratory import LaboratoryWorkflow
+        from research_state import ResearchState
+
+        selected = {
+            "dataset_id": "owner/data",
+            "revision": "r1",
+            "config_name": "default",
+            "split": "train",
+        }
+        inspected = {
+            "success": True,
+            **selected,
+            "dataset_schema": {"columns": {"value": "int64"}},
+        }
+        original_failure = {
+            "success": False,
+            "error_type": "validation_error",
+            "error": "Generated code is invalid Python: unexpected indent (line 2)",
+            "repair_hint": "Correct line 2 before retrying.",
+            "code": "first = 1\n second = 2",
+            "output": "",
+            "traceback": "",
+        }
+        actions = [
+            ("search_huggingface", {
+                "success": True,
+                "results": [],
+                "selected_dataset": dict(selected),
+            }),
+            ("inspect_huggingface_dataset", {
+                **inspected,
+                "selected_dataset": dict(selected),
+            }),
+            ("execute_dataset_code", original_failure),
+            ("execute_dataset_code", {
+                "success": False,
+                "error_type": "unchanged_failed_dataset_code",
+                "error": "This exact data-preparation code already failed.",
+                "original_error_type": original_failure["error_type"],
+                "original_error": original_failure["error"],
+                "original_repair_hint": original_failure["repair_hint"],
+                "repair_hint": "Correct the original failure before retrying.",
+                "code": original_failure["code"],
+                "output": "",
+                "traceback": "",
+            }),
+            ("execute_dataset_code", {
+                "success": True,
+                "code": "data = [1]",
+                "output": "prepared",
+                "selection": dict(selected),
+                "artifacts": [],
+                "prepared_data_manifest": None,
+            }),
+        ]
+        ml_calls = []
+
+        def ml_turn(*args, **kwargs):
+            ml_calls.append(kwargs)
+            name, value = actions[len(ml_calls) - 1]
+            return SimpleNamespace(tool_name=name, value=value)
+
+        def sw_turn(*args, **kwargs):
+            verified_trial = kwargs.get("verified_trial")
+            if verified_trial is not None:
+                return SimpleNamespace(
+                    tool_name="submit_dataset_code",
+                    value=dict(verified_trial),
+                )
+            return SimpleNamespace(
+                tool_name="send_dialogue",
+                value={"success": True, "message": "Continue."},
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = LaboratoryWorkflow(
+                ResearchState("query", "recording", "topic"),
+                "model",
+                "key",
+                directory,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
+            with patch.object(
+                workflow.ml_engineer,
+                "data_preparation_turn",
+                side_effect=ml_turn,
+            ), patch.object(
+                workflow.sw_engineer,
+                "data_preparation_turn",
+                side_effect=sw_turn,
+            ):
+                _, submitted = workflow._prepare_dataset_collaboratively()
+
+        self.assertTrue(submitted["success"])
+        self.assertEqual(
+            ml_calls[3]["latest_execution_failure"]["error"],
+            original_failure["error"],
+        )
+        self.assertEqual(
+            ml_calls[4]["latest_execution_failure"]["error"],
+            original_failure["error"],
+        )
+
+    def test_ml_selected_and_inspected_candidate_only_exposes_execution(self):
+        selected = {
+            "dataset_id": "owner/data",
+            "revision": "r1",
+            "config_name": "default",
+            "split": "train",
+        }
+        cases = (
+            (None, False, None, None),
+            ({"dataset_id": "owner/data"}, True, selected, {"execute_dataset_code"}),
+            ({"dataset_id": "owner/data"}, False, selected, {"execute_dataset_code"}),
+            ({"dataset_id": "owner/data"}, False, None, None),
+        )
+        for inspected, pending, selected_dataset, expected in cases:
+            with self.subTest(inspected=inspected, pending=pending, selected=selected_dataset), patch(
                 "agents.HFDataSearch"
             ), patch.object(AgentRuntime, "run", return_value=SimpleNamespace(value={})) as run:
                 MLEngineerAgent("model", "key").data_preparation_turn(
                     "topic", "plan", "review", "Please proceed",
-                    inspected_dataset=inspected, trial_pending=pending,
+                    inspected_dataset=inspected,
+                    trial_pending=pending,
+                    selected_dataset=selected_dataset,
                 )
                 args = run.call_args.kwargs
-                expected = {"execute_dataset_code"} if pending else args["registry"].names
-                self.assertEqual(args["tool_names_provider"](), expected)
+                self.assertEqual(
+                    args["tool_names_provider"](),
+                    expected if expected is not None else args["registry"].names,
+                )
 
-    def test_workflow_unlocks_ml_after_failed_trial_and_rearms_after_inspection(self):
+    def test_workflow_preserves_selected_dataset_after_failed_trial(self):
         import tempfile
-        from ai_lab_repo import LaboratoryWorkflow
+        from workflows.laboratory import LaboratoryWorkflow
         from research_state import ResearchState
         inspected = {
             "success": True, "dataset_id": "owner/data", "revision": "r1",
             "config_name": "default", "split": "train",
             "dataset_schema": {"columns": {"value": "int64"}},
         }
+        selected = {
+            "dataset_id": "owner/data", "revision": "r1",
+            "config_name": "default", "split": "train",
+        }
         actions = [
-            ("inspect_huggingface_dataset", inspected),
+            ("search_huggingface", {"success": True, "results": [], "selected_dataset": selected}),
+            ("inspect_huggingface_dataset", {**inspected, "selected_dataset": selected}),
             ("execute_dataset_code", {"success": False, "code": "", "error": "Provide Python code"}),
             ("execute_dataset_code", {"success": False, "code": "raise ValueError()", "error": "bad"}),
-            ("send_dialogue", {"success": True, "message": "Use a revised preparation method."}),
-            ("inspect_huggingface_dataset", {**inspected, "revision": "r2"}),
             ("execute_dataset_code", {"success": True, "code": "data = [1]", "output": "ok"}),
         ]
         observed = []
+        observed_selected = []
 
         def ml_turn(*args, **kwargs):
             observed.append(kwargs["trial_pending"])
+            observed_selected.append(kwargs["selected_dataset"])
             name, value = actions[len(observed) - 1]
             return SimpleNamespace(tool_name=name, value=value)
 
@@ -100,18 +511,22 @@ class AgentPromptTest(unittest.TestCase):
                 return SimpleNamespace(tool_name="send_dialogue", value={"success": True, "message": "Continue."})
             return SimpleNamespace(tool_name="submit_dataset_code", value={
                 "success": True, "code": "data = [1]", "output": "ok",
-                "selection": {key: value for key, value in inspected.items() if key != "success"} | {"revision": "r2"},
+                "selection": {key: value for key, value in inspected.items() if key != "success"},
             })
 
         with tempfile.TemporaryDirectory() as directory:
-            workflow = LaboratoryWorkflow(ResearchState("query", "recording", "topic"), "model", "key", directory)
+            workflow = LaboratoryWorkflow(
+                ResearchState("query", "recording", "topic"), "model", "key", directory,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
             with patch.object(workflow.ml_engineer, "data_preparation_turn", side_effect=ml_turn), patch.object(
                 workflow.sw_engineer, "data_preparation_turn", side_effect=sw_turn
             ):
                 selection, result = workflow._prepare_dataset_collaboratively()
-        self.assertEqual(observed, [False, True, True, False, False, True])
+        self.assertEqual(observed, [False, False, True, True, False])
+        self.assertEqual(observed_selected, [None, selected, selected, selected, selected])
         self.assertTrue(result["success"])
-        self.assertEqual(selection["revision"], "r2")
+        self.assertEqual(selection["revision"], "r1")
 
     def test_reconsider_prior_batch_and_exhausted_candidates(self):
         search = MagicMock()
@@ -131,17 +546,19 @@ class AgentPromptTest(unittest.TestCase):
         registry = run.call_args.kwargs["registry"]
         provider = run.call_args.kwargs["tool_names_provider"]
         registry.execute("search_arxiv", {"query": "first", "max_results": 2})
-        registry.execute("reject_arxiv_candidates", {"reason": "initial assessment"})
-        registry.execute("search_arxiv", {"query": "second", "max_results": 2})
-        self.assertEqual(search.find_papers.call_args.kwargs["excluded_ids"], {"A"})
+        self.assertEqual(provider(), {"read_arxiv_paper"})
         unknown = registry.execute("read_arxiv_paper", {"arxiv_id": "never-returned"})
         self.assertFalse(unknown["success"])
         search.retrieve_full_paper_text.assert_not_called()
         self.assertTrue(registry.execute("read_arxiv_paper", {"arxiv_id": "A"})["success"])
-        self.assertEqual(provider(), {"add_paper", "reject_paper"})
-        self.assertFalse(registry.execute("read_arxiv_paper", {"arxiv_id": "B"})["success"])
+        registry.execute("reject_paper", {"arxiv_id": "A", "reason": "initial assessment"})
+        registry.execute("search_arxiv", {"query": "second", "max_results": 2})
+        self.assertEqual(search.find_papers.call_args.kwargs["excluded_ids"], {"A"})
+        self.assertTrue(registry.execute("read_arxiv_paper", {"arxiv_id": "A"})["success"])
+        self.assertEqual(provider(), {"add_paper"})
         registry.execute("reject_paper", {"arxiv_id": "A", "reason": "set aside again"})
-        registry.execute("reject_arxiv_candidates", {"reason": "B unrelated"})
+        self.assertTrue(registry.execute("read_arxiv_paper", {"arxiv_id": "B"})["success"])
+        registry.execute("reject_paper", {"arxiv_id": "B", "reason": "B unrelated"})
         for query in ("third", "fourth"):
             result = registry.execute("search_arxiv", {"query": query, "max_results": 2})
         self.assertEqual(result["reconsiderable_paper_ids"], ["A", "B"])
@@ -212,10 +629,174 @@ class AgentPromptTest(unittest.TestCase):
 
         self.assertIn("not authoritative schema evidence", ml_prompt)
         self.assertIn("exact column names", ml_prompt)
+        self.assertIn("stored representation", ml_prompt)
+        self.assertIn("runtime evidence for Python access", ml_prompt)
+        self.assertIn("bracket and attribute access", ml_prompt)
         self.assertIn("complete candidate preparation program", ml_prompt)
         self.assertIn("not authoritative schema evidence", sw_prompt)
+        self.assertIn("stored representation", sw_prompt)
+        self.assertIn("runtime evidence", sw_prompt)
+        self.assertIn("bracket and attribute access", sw_prompt)
         self.assertIn("MUST NOT call submit_dataset_code", sw_prompt)
         self.assertIn("successful candidate execution", sw_prompt)
+        self.assertIn("framework selects the first such candidate", ml_prompt)
+        self.assertIn("do not request repeated searches", sw_prompt)
+        self.assertIn("must not instantiate, train, tune, predict with", ml_prompt)
+        self.assertIn("must not instantiate, train, tune, predict with", sw_prompt)
+        self.assertIn("full experimental plan is intentionally unavailable", ml_prompt)
+        self.assertIn("full experimental plan is intentionally unavailable", sw_prompt)
+        self.assertIn("analysis role for subgroup or per-group analysis", ml_prompt)
+        self.assertIn("analysis role for subgroup or per-group analysis", sw_prompt)
+        self.assertIn("explicitly import every module", ml_prompt)
+        self.assertIn("explicitly import every module", sw_prompt)
+
+    def test_data_preparation_prompts_do_not_receive_full_plan(self):
+        requirements = "DATA_REQUIREMENTS_SENTINEL"
+        full_plan = "FULL_PLAN_SENTINEL RandomForestClassifier metrics baselines"
+        completed = SimpleNamespace(value={})
+        with patch("agents.HFDataSearch"), patch.object(
+            AgentRuntime, "run", return_value=completed
+        ) as run:
+            MLEngineerAgent("model", "key").data_preparation_turn(
+                "topic", requirements, full_plan, "message"
+            )
+            ml_prompt = run.call_args.kwargs["user_prompt"]
+            SWEngineerAgent("model", "key").data_preparation_turn(
+                "topic", requirements, ".", literature_review=full_plan
+            )
+            sw_prompt = run.call_args.kwargs["user_prompt"]
+
+        for prompt in (ml_prompt, sw_prompt):
+            self.assertIn(requirements, prompt)
+            self.assertNotIn(full_plan, prompt)
+
+    def test_latest_execution_failure_replaces_stale_data_preparation_feedback(self):
+        latest_failure = {
+            "tool": "execute_dataset_code",
+            "success": False,
+            "error_type": "python_exception",
+            "error": "CURRENT_ERROR",
+            "traceback": "CURRENT_TRACEBACK",
+            "code": "CURRENT_CODE",
+            "output": "CURRENT_OUTPUT",
+            "repair_hint": "CURRENT_REPAIR_HINT",
+        }
+        stale_feedback = {
+            "tool": "execute_dataset_code",
+            "success": False,
+            "error": "OLD_ERROR",
+            "traceback": "OLD_TRACEBACK",
+        }
+        completed = SimpleNamespace(value={})
+        with patch("agents.HFDataSearch"), patch.object(
+            AgentRuntime, "run", return_value=completed
+        ) as run:
+            MLEngineerAgent("model", "key").data_preparation_turn(
+                "topic", "plan", "review", "OLD_SW_REPAIR_ADVICE",
+                feedback=stale_feedback,
+                latest_execution_failure=latest_failure,
+            )
+            ml_prompt = run.call_args.kwargs["user_prompt"]
+            SWEngineerAgent("model", "key").data_preparation_turn(
+                "topic", "plan", ".",
+                feedback={"message": "OLD_SW_RESULT"},
+                ml_result=stale_feedback,
+                latest_execution_failure=latest_failure,
+            )
+            sw_prompt = run.call_args.kwargs["user_prompt"]
+
+        for prompt in (ml_prompt, sw_prompt):
+            self.assertIn("CURRENT_ERROR", prompt)
+            self.assertIn("CURRENT_TRACEBACK", prompt)
+            self.assertIn("CURRENT_CODE", prompt)
+            self.assertIn("CURRENT_REPAIR_HINT", prompt)
+            self.assertNotIn("OLD_ERROR", prompt)
+            self.assertNotIn("OLD_TRACEBACK", prompt)
+        self.assertNotIn("OLD_SW_REPAIR_ADVICE", ml_prompt)
+        self.assertNotIn("OLD_SW_RESULT", sw_prompt)
+
+    def test_preparation_key_error_after_dataframe_transform_has_repair_hint(self):
+        code = (
+            "df = pd.get_dummies(df, columns=['group_label'])\n"
+            "value = df['group_label']\n"
+        )
+        execution = {
+            "success": False,
+            "output": "",
+            "error_type": "python_exception",
+            "error": "KeyError: 'group_label'",
+            "traceback": (
+                'Traceback\n  File "<string>", line 2, in <module>\n'
+                "KeyError: 'group_label'\n"
+            ),
+            "exit_code": 0,
+            "artifacts": [],
+            "replay_events": [],
+            "prepared_data_manifest": None,
+        }
+        inspected_dataset = {
+            "success": True,
+            "dataset_schema": {"columns": {"group_label": "string"}},
+        }
+        with patch("agents.execute_code", return_value=execution):
+            result = _run_preparation_code(
+                code,
+                ".",
+                inspected_dataset,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertIn("group_label", result["repair_hint"])
+        self.assertIn("inspected raw schema", result["repair_hint"])
+        self.assertIn("separate feature dataframe", result["repair_hint"])
+
+    def test_preparation_syntax_error_has_local_repair_hint(self):
+        code = "first = 1\n second = 2\nthird = 3\n"
+        execution = {
+            "success": False,
+            "output": "",
+            "error_type": "validation_error",
+            "error": "Generated code is invalid Python: unexpected indent",
+            "traceback": "",
+            "exit_code": None,
+            "artifacts": [],
+            "replay_events": [],
+            "prepared_data_manifest": None,
+        }
+        with patch("agents.execute_code", return_value=execution):
+            result = _run_preparation_code(code, ".")
+
+        self.assertFalse(result["success"])
+        self.assertIn("line 2", result["repair_hint"])
+        self.assertIn("2:  second = 2", result["repair_hint"])
+
+    def test_preparation_runtime_data_errors_have_specific_repair_hints(self):
+        errors = {
+            "ValueError: Input X contains infinity": "non_finite_numeric_input",
+            "ValueError: expected sequence of length 3 at dim 3 (got 4)": (
+                "ragged_array_input"
+            ),
+            "TypeError: list indices must be integers or slices, not str": (
+                "list_of_records_access_error"
+            ),
+        }
+        for error, category in errors.items():
+            with self.subTest(error=error):
+                details = {
+                    "success": False,
+                    "output": "",
+                    "error_type": "python_exception",
+                    "error": error,
+                    "traceback": "",
+                    "exit_code": 0,
+                    "artifacts": [],
+                    "replay_events": [],
+                    "prepared_data_manifest": None,
+                }
+                with patch("agents.execute_code", return_value=details):
+                    result = _run_preparation_code("print('trial')", ".")
+                self.assertEqual(result["failure_category"], category)
+                self.assertNotIn("Use the traceback", result["repair_hint"])
 
     def test_ml_engineer_exposes_structured_dataset_inspection(self):
         completed = SimpleNamespace(value={})
@@ -299,7 +880,7 @@ class AgentPromptTest(unittest.TestCase):
 
     def test_preparation_alternates_agents_and_only_sw_submission_finishes(self):
         from inference import ModelToolCall, ToolModelResponse
-        from ai_lab_repo import LaboratoryWorkflow
+        from workflows.laboratory import LaboratoryWorkflow
         from research_state import ResearchState
         import json
         import tempfile
@@ -309,27 +890,25 @@ class AgentPromptTest(unittest.TestCase):
                 "call", name, json.dumps(arguments)
             )])
 
-        bad = "raise ValueError('bad preparation')"
         fixed = "data = [1, 2]\nprint(len(data))"
         responses = [
             response("send_dialogue", {"message": "Find data for the plan."}),
             response("search_huggingface", {"query": "data", "max_results": 5}),
             response("send_dialogue", {"message": "Inspect the selected dataset."}),
-            response("inspect_huggingface_dataset", {
-                "dataset_id": "owner/data",
-                "revision": "r1",
-                "config_name": "default",
-                "split": "train",
-            }),
+            response("inspect_huggingface_dataset", {}),
             response("send_dialogue", {"message": "Test a preparation program."}),
             response("execute_dataset_code", {"code": fixed}),
-            response("submit_dataset_code", {"code": bad}),
-            response("send_dialogue", {"message": "Replace the failing code with data = [1, 2]."}),
-            response("submit_dataset_code", {"code": fixed}),
         ]
         calls = []
         search = MagicMock()
-        search.retrieve_ds.return_value = [{"id": "owner/data"}]
+        search.retrieve_ds.return_value = [{
+            "id": "owner/data",
+            "revision": "r1",
+            "snapshot_status": "complete",
+            "configs": ["default"],
+            "splits": ["train"],
+            "materialized": {"default": {"train": {"rows": 2}}},
+        }]
         search.inspect_dataset.return_value = {
             "dataset_id": "owner/data",
             "config_name": "default",
@@ -356,29 +935,33 @@ class AgentPromptTest(unittest.TestCase):
 
         def respond(**kwargs):
             calls.append(kwargs)
+            if len(calls) > len(responses):
+                raise AssertionError(
+                    "Unexpected LLM call with tools: "
+                    + repr([item["function"]["name"] for item in kwargs["tools"]])
+                )
             return responses[len(calls) - 1]
 
         with tempfile.TemporaryDirectory() as workdir, patch(
             "agents.HFDataSearch", return_value=search
         ), patch("agent_runtime.query_model_with_tools", side_effect=respond), patch(
             "agents.execute_code",
-            side_effect=[details, {"success": False, "output": "bad preparation",
-                                  "error_type": "python_exception", "error": "bad preparation",
-                                  "traceback": "", "exit_code": 0}, details],
+            return_value=details,
         ) as execute:
             workflow = LaboratoryWorkflow(
                 ResearchState("query_001", "recording", "topic", plan="plan"),
                 "model", "key", workdir,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
             )
             selection, submitted = workflow._prepare_dataset_collaboratively()
         self.assertEqual(submitted["code"], fixed)
         self.assertTrue(submitted["success"])
         self.assertEqual(selection["dataset_id"], "owner/data")
         self.assertEqual(selection["revision"], "r1")
-        self.assertEqual(execute.call_count, 3)
+        self.assertEqual(execute.call_count, 1)
         for call in execute.call_args_list:
             self.assertEqual(str(call.kwargs["workdir"]), workdir)
-            self.assertEqual(call.kwargs["timeout"], 600)
+            self.assertEqual(call.kwargs["timeout"], 900)
         expected_sw = {"send_dialogue", "submit_dataset_code"}
         expected_ml = {
             "search_huggingface",
@@ -386,17 +969,27 @@ class AgentPromptTest(unittest.TestCase):
             "execute_dataset_code",
             "send_dialogue",
         }
+        expected_tools = [
+            expected_sw,
+            expected_ml,
+            expected_sw,
+            {"inspect_huggingface_dataset"},
+            expected_sw,
+            {"execute_dataset_code"},
+        ]
+        self.assertEqual(len(calls), len(expected_tools))
         for index, call in enumerate(calls):
             names = {item["function"]["name"] for item in call["tools"]}
-            expected = expected_sw if index % 2 == 0 else expected_ml
-            if index == 5:
-                expected = {"execute_dataset_code"}
-            self.assertEqual(names, expected)
+            self.assertEqual(names, expected_tools[index])
+            if index == 3:
+                inspect_schema = next(
+                    item["function"]
+                    for item in call["tools"]
+                    if item["function"]["name"] == "inspect_huggingface_dataset"
+                )
+                self.assertEqual(inspect_schema["parameters"]["required"], [])
         self.assertIn("owner/data", calls[2]["messages"][1]["content"])
         self.assertIn("row_count", calls[4]["messages"][1]["content"])
-        self.assertIn(json.dumps(fixed)[1:-1], calls[6]["messages"][1]["content"])
-        self.assertIn("bad preparation", calls[7]["messages"][1]["content"])
-        self.assertIn("bad preparation", calls[8]["messages"][1]["content"])
 
     def test_ml_trial_failure_returns_to_workflow_without_internal_retry(self):
         from inference import ModelToolCall, ToolModelResponse
@@ -414,6 +1007,76 @@ class AgentPromptTest(unittest.TestCase):
         self.assertFalse(result.value["success"])
         self.assertEqual(result.value["code"], code)
         query.assert_called_once()
+
+    def test_ml_engineer_rejects_unchanged_failed_trial_without_execution(self):
+        from inference import ModelToolCall, ToolModelResponse
+
+        first_code = "raise RuntimeError('failure')\n"
+        repeated_code = "raise RuntimeError('failure')\n\n"
+        first_response = ToolModelResponse(
+            "",
+            [ModelToolCall(
+                "call",
+                "execute_dataset_code",
+                json.dumps({"code": first_code}),
+            )],
+        )
+        repeated_response = ToolModelResponse(
+            "",
+            [ModelToolCall(
+                "call",
+                "execute_dataset_code",
+                json.dumps({"code": repeated_code}),
+            )],
+        )
+        execution = {
+            "success": False,
+            "output": "failure output",
+            "error_type": "python_exception",
+            "error": "RuntimeError: failure",
+            "traceback": "Traceback: failure",
+            "exit_code": 0,
+            "artifacts": [],
+            "replay_events": [],
+            "prepared_data_manifest": None,
+        }
+        failed_failures = {}
+        with patch("agents.HFDataSearch"), patch(
+            "agents.execute_code",
+            return_value=execution,
+        ) as execute_code, patch(
+            "agent_runtime.query_model_with_tools",
+            side_effect=[first_response, repeated_response],
+        ):
+            first = MLEngineerAgent("model", "key").data_preparation_turn(
+                "topic",
+                "requirements",
+                "review",
+                "try code",
+                workdir=".",
+                failed_trial_code_failures=failed_failures,
+            )
+            repeated = MLEngineerAgent("model", "key").data_preparation_turn(
+                "topic",
+                "requirements",
+                "review",
+                "try code",
+                workdir=".",
+                failed_trial_code_failures=failed_failures,
+            )
+
+        self.assertFalse(first.value["success"])
+        self.assertEqual(execute_code.call_count, 1)
+        self.assertFalse(repeated.value["success"])
+        self.assertEqual(
+            repeated.value["error_type"],
+            "unchanged_failed_dataset_code",
+        )
+        self.assertIn("substantive code change", repeated.value["repair_hint"])
+        self.assertIn("RuntimeError: failure", repeated.value["repair_hint"])
+        self.assertEqual(repeated.value["original_error_type"], "python_exception")
+        self.assertEqual(repeated.value["original_error"], "RuntimeError: failure")
+        self.assertEqual(repeated.value["code"], repeated_code)
 
     def test_literature_prompt_restores_old_progression_guidance(self):
         search = MagicMock()
@@ -436,7 +1099,10 @@ class AgentPromptTest(unittest.TestCase):
         self.assertIn("reject_paper", prompt)
         self.assertIn("submit without further searches", prompt)
         self.assertIn("meaningful methodological background", prompt)
-        self.assertIn("need not use the same dataset", prompt)
+        self.assertIn("dataset identity is not a requirement", prompt)
+        self.assertIn("Do not reject it solely because these details differ", prompt)
+        self.assertIn("prefer adding it as methodological background", prompt)
+        self.assertIn("Reserve rejection for papers with no meaningful connection", prompt)
         self.assertIn("including rejected ones", prompt)
 
         registry = run.call_args.kwargs["registry"]
@@ -458,17 +1124,17 @@ class AgentPromptTest(unittest.TestCase):
             schemas["read_arxiv_paper"]["description"],
         )
         self.assertIn(
-            "meaningful methodological background",
+            "transferable methodological",
             schemas["add_paper"]["description"],
         )
         self.assertIn(
             "may be reconsidered later",
             schemas["reject_paper"]["description"],
         )
-        self.assertIn(
-            "Read uncertain candidates first",
-            schemas["reject_arxiv_candidates"]["description"],
-        )
+        self.assertNotIn("reject_arxiv_candidates", schemas)
+        self.assertNotIn("reject_arxiv_candidates", registry.names)
+        self.assertIn("dataset, domain, model, task", schemas["add_paper"]["description"])
+        self.assertIn("mismatch in dataset, domain, model, task", schemas["reject_paper"]["description"])
         registry.execute("search_arxiv", {"query": "short", "max_results": 10})
         search.find_papers.assert_called_once_with(
             "short",
@@ -477,7 +1143,7 @@ class AgentPromptTest(unittest.TestCase):
         )
         self.assertEqual(
             tool_names_provider(),
-            {"read_arxiv_paper", "reject_arxiv_candidates"},
+            {"read_arxiv_paper"},
         )
         search.retrieve_full_paper_text.return_value = "paper text"
         search.get_cached_full_paper_text.return_value = "paper text"
@@ -488,7 +1154,7 @@ class AgentPromptTest(unittest.TestCase):
         self.assertTrue(read["decision_required"])
         self.assertEqual(
             tool_names_provider(),
-            {"add_paper", "reject_paper"},
+            {"add_paper"},
         )
         added = registry.execute(
             "add_paper",
@@ -547,39 +1213,7 @@ class AgentPromptTest(unittest.TestCase):
             {"arxiv_id": "1234.5678"},
         )
         self.assertTrue(repeated_read["success"])
-        self.assertEqual(tool_names_provider(), {"add_paper", "reject_paper"})
-
-    def test_rejecting_arxiv_candidate_batch_reopens_search(self):
-        search = MagicMock()
-        search.find_papers.return_value = {
-            "text": "papers",
-            "candidate_ids": ["1234.5678", "2345.6789"],
-        }
-        agent = PhDStudentAgent("model", "key")
-        completed = SimpleNamespace(value={"review": "review", "papers": []})
-        with patch("agents.ArxivSearch", return_value=search), patch.object(
-            AgentRuntime, "run", return_value=completed
-        ) as run:
-            agent.conduct_literature_review("topic", required_papers=1)
-
-        registry = run.call_args.kwargs["registry"]
-        provider = run.call_args.kwargs["tool_names_provider"]
-        registry.execute(
-            "search_arxiv", {"query": "first", "max_results": 2}
-        )
-        rejected = registry.execute(
-            "reject_arxiv_candidates", {"reason": "The abstracts are off-topic."}
-        )
-
-        self.assertTrue(rejected["success"])
-        self.assertEqual(provider(), {"search_arxiv", "read_arxiv_paper"})
-        registry.execute(
-            "search_arxiv", {"query": "second", "max_results": 2}
-        )
-        self.assertEqual(
-            search.find_papers.call_args.kwargs["excluded_ids"],
-            {"1234.5678", "2345.6789"},
-        )
+        self.assertEqual(tool_names_provider(), {"add_paper"})
 
     def test_two_empty_arxiv_searches_browse_remaining_candidates(self):
         search = MagicMock()
@@ -610,7 +1244,7 @@ class AgentPromptTest(unittest.TestCase):
         self.assertEqual(second["candidate_ids"], ["3456.7890"])
         self.assertEqual(
             provider(),
-            {"read_arxiv_paper", "reject_arxiv_candidates"},
+            {"read_arxiv_paper"},
         )
         search.browse_remaining_papers.assert_called_once_with(
             N=3,
@@ -665,16 +1299,38 @@ class AgentPromptTest(unittest.TestCase):
         self.assertIn("minimum data capabilities", prompt)
         self.assertIn("only when needed for a valid answer", prompt)
         self.assertIn("Do not turn examples into hard requirements", prompt)
+        self.assertIn("operations explicitly requested by the topic", prompt)
+        self.assertIn("a method mentioned only in the literature", prompt)
+        self.assertIn("do not propose BERT", prompt)
+        self.assertIn("simplest method trainable from scratch", prompt)
         self.assertIn("baselines", prompt)
         self.assertIn("evaluation metrics", prompt)
         self.assertIn("reproducibility details", prompt)
         self.assertIn("Hugging Face dataset", prompt)
+        self.assertIn("subgroup, cohort, category, source, time-period", prompt)
         self.assertIn("consultation_required", user_prompt)
 
         registry = run.call_args.kwargs["registry"]
         schemas = {item["function"]["name"]: item["function"] for item in registry.schemas}
         self.assertIn("must be used before submit_plan", schemas["send_dialogue"]["description"])
         self.assertIn("after receiving", schemas["submit_plan"]["description"])
+        self.assertEqual(
+            schemas["submit_plan"]["parameters"]["required"],
+            ["plan", "data_requirements"],
+        )
+        self.assertIn("data-preparation requirements", schemas["submit_plan"]["description"])
+        self.assertFalse(
+            registry.execute(
+                "submit_plan",
+                {"plan": "full plan", "data_requirements": " "},
+            )["success"]
+        )
+        self.assertTrue(
+            registry.execute(
+                "submit_plan",
+                {"plan": "full plan", "data_requirements": "abstract requirements"},
+            )["success"]
+        )
 
     def test_postdoc_plan_prompt_marks_received_feedback(self):
         agent = PostdocAgent("model", "key")
@@ -700,6 +1356,10 @@ class AgentPromptTest(unittest.TestCase):
         self.assertIn("not an instruction to reproduce its algorithms", prompt)
         self.assertIn("approve it without inventing enhancements", prompt)
         self.assertIn("Remove out-of-scope requirements", prompt)
+        self.assertIn("one deterministic held-out evaluation", prompt)
+        self.assertIn("A method described in the literature is not", prompt)
+        self.assertIn("reject a plan that proposes BERT", prompt)
+        self.assertIn("local assets are explicitly supplied", prompt)
         self.assertIn("evaluation metrics", prompt)
         self.assertIn("exact experimental procedure", prompt)
         self.assertIn("Do not select or name a concrete dataset ID", prompt)
@@ -714,8 +1374,8 @@ class AgentPromptTest(unittest.TestCase):
             postdoc.interpretation_turn("topic", "plan", "code", "output", "")
             postdoc_prompt = run.call_args.kwargs["system_prompt"]
             postdoc_user = run.call_args.kwargs["user_prompt"]
-            self.assertIn("MUST call send_dialogue", postdoc_prompt)
-            self.assertIn("MUST NOT call submit_interpretation", postdoc_prompt)
+            self.assertIn("If PhD review is required, call send_dialogue", postdoc_prompt)
+            self.assertIn("follow the tool availability", postdoc_prompt)
             self.assertIn("review_required", postdoc_user)
             self.assertIn("Interpretation history:", postdoc_user)
             registry = run.call_args.kwargs["registry"]
@@ -737,7 +1397,6 @@ class AgentPromptTest(unittest.TestCase):
             self.assertEqual(
                 registry.names,
                 {
-                    "send_dialogue",
                     "request_supplementary_experiment",
                     "submit_interpretation",
                 },
@@ -754,6 +1413,30 @@ class AgentPromptTest(unittest.TestCase):
             self.assertTrue(request["success"])
             self.assertEqual(request["request"]["objective"], "check robustness")
 
+            postdoc.interpretation_turn(
+                "topic",
+                "plan",
+                "code",
+                "output",
+                "No further experiment is needed.",
+                phd_review_required=False,
+                supplement_required=False,
+            )
+            registry = run.call_args.kwargs["registry"]
+            self.assertEqual(registry.names, {"submit_interpretation"})
+
+            postdoc.interpretation_turn(
+                "topic",
+                "plan",
+                "code",
+                "output",
+                "One diagnostic is required.",
+                phd_review_required=False,
+                supplement_required=True,
+            )
+            registry = run.call_args.kwargs["registry"]
+            self.assertEqual(registry.names, {"request_supplementary_experiment"})
+
             phd.interpretation_feedback("topic", "plan", "output", "proposal")
             phd_prompt = run.call_args.kwargs["system_prompt"]
             phd_user = run.call_args.kwargs["user_prompt"]
@@ -761,6 +1444,12 @@ class AgentPromptTest(unittest.TestCase):
             self.assertIn("limitations", phd_prompt)
             self.assertIn("do not invent evidence", phd_prompt)
             self.assertIn("Interpretation history:", phd_user)
+            registry = run.call_args.kwargs["registry"]
+            feedback = registry.execute(
+                "send_dialogue",
+                {"message": "ready", "supplement_required": False},
+            )
+            self.assertFalse(feedback["supplement_required"])
 
 
 if __name__ == "__main__":

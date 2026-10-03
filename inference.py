@@ -1,5 +1,6 @@
 import contextlib
 import contextvars
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -12,6 +13,11 @@ from telemetry import traced_call
 
 _http_attempt_budget_var = contextvars.ContextVar(
     "agentlab_llm_http_attempt_budget",
+    default=None,
+)
+
+_llm_sampling_var = contextvars.ContextVar(
+    "agentlab_llm_sampling",
     default=None,
 )
 
@@ -74,6 +80,24 @@ def llm_http_attempt_budget_scope(limit):
 
 def current_llm_http_attempt_budget():
     return _http_attempt_budget_var.get()
+
+
+@contextlib.contextmanager
+def llm_sampling_scope(config):
+    """Apply a task's sampling parameters in its executing thread."""
+    token = _llm_sampling_var.set(config)
+    try:
+        yield config
+    finally:
+        _llm_sampling_var.reset(token)
+
+
+def _effective_llm_sampling(temperature, max_tokens):
+    config = _llm_sampling_var.get()
+    if config is not None:
+        # Task configuration takes precedence over per-agent token limits.
+        return config.copy()
+    return {"temperature": temperature, "max_tokens": max_tokens}
 
 
 @dataclass
@@ -153,6 +177,10 @@ def _tool_query_metadata(args, kwargs):
         "sdk_max_retries": 0,
         "tool_choice": _single_tool_choice(tools),
         "workflow_http_attempt_budget": budget.snapshot() if budget else None,
+        "llm_sampling": _effective_llm_sampling(
+            kwargs.get("temperature", args[7] if len(args) > 7 else 0.2),
+            kwargs.get("max_tokens", args[8] if len(args) > 8 else 8192),
+        ),
     }
 
 
@@ -194,7 +222,7 @@ def query_model_with_tools(
     openai_api_key=None,
     tries=3,
     request_timeout=1800.0,
-    retry_delay=15.0,
+    retry_delay=50.0,
     temperature=0.2,
     max_tokens=8192 ,
     return_on_no_tool_call=False,
@@ -202,6 +230,7 @@ def query_model_with_tools(
     api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
     effective_model = os.getenv("OPENAI_MODEL") or model_str
     base_url = os.getenv("OPENAI_BASE_URL") or None
+    sampling = _effective_llm_sampling(temperature, max_tokens)
     logger = current_run_logger()
     last_error = None
     tool_choice = _single_tool_choice(tools)
@@ -226,7 +255,8 @@ def query_model_with_tools(
         )
         logger.info(
             f"[LLM HTTP][attempt={attempt}/{tries}] BEGIN "
-            f"model={effective_model} timeout={request_timeout}s{budget_suffix}"
+            f"model={effective_model} timeout={request_timeout}s{budget_suffix} "
+            f"llm_sampling={json.dumps(sampling, sort_keys=True)}"
         )
         try:
             client_kwargs = {
@@ -243,8 +273,7 @@ def query_model_with_tools(
                 tools=tools,
                 tool_choice=tool_choice,
                 parallel_tool_calls=False,  # 要求模型不要并行调用多个工具，尽量一次返回一个
-                temperature=temperature,
-                max_tokens=max_tokens,
+                **sampling,
                 extra_body={"enable_thinking": False},
             )
             choice = completion.choices[0]  # 代码只读取第一个候选答案

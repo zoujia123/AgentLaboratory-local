@@ -13,7 +13,17 @@ class ConfigTest(unittest.TestCase):
         config_file = tempfile.NamedTemporaryFile(
             mode="w", suffix=".yaml", encoding="utf-8", delete=False
         )
-        config_file.write(content)
+        config_file.write(
+            "llm_sampling:\n"
+            "  temperature: 0.1\n"
+            "  top_p: 1\n"
+            "  max_tokens: 8192\n"
+            "collaboration_rounds:\n"
+            "  plan_max_rounds: 8\n"
+            "  data_preparation_max_rounds: 12\n"
+            "  interpretation_max_phd_reviews: 8\n"
+            + content
+        )
         config_file.close()
         self.addCleanup(os.remove, config_file.name)
         return config_file.name
@@ -21,6 +31,7 @@ class ConfigTest(unittest.TestCase):
     def test_batch_config_uses_latest_recording_by_default(self):
         config = parse_yaml(self.write_config(
             "material-root: D:/materials\n"
+            "output-root: D:/results\n"
             "max-concurrent-queries: 8\n"
             "queries:\n"
             "  - query-id: query_001\n"
@@ -35,6 +46,7 @@ class ConfigTest(unittest.TestCase):
     def test_parses_console_log_flag(self):
         config = parse_yaml(self.write_config(
             "material-root: D:/materials\n"
+            "output-root: D:/results\n"
             "console-log: true\n"
             "queries:\n"
             "  - query-id: query_001\n"
@@ -65,6 +77,7 @@ class ConfigTest(unittest.TestCase):
     def test_parses_llm_http_attempt_limit(self):
         config = parse_yaml(self.write_config(
             "material-root: D:/materials\n"
+            "output-root: D:/results\n"
             "max-llm-http-attempts-per-query: 75\n"
             "queries:\n"
             "  - query-id: query_001\n"
@@ -74,6 +87,7 @@ class ConfigTest(unittest.TestCase):
     def test_llm_http_attempt_limit_must_be_positive(self):
         path = self.write_config(
             "material-root: D:/materials\n"
+            "output-root: D:/results\n"
             "max-llm-http-attempts-per-query: 0\n"
             "queries:\n"
             "  - query-id: query_001\n"
@@ -84,6 +98,7 @@ class ConfigTest(unittest.TestCase):
     def test_concurrency_is_limited_to_ten(self):
         path = self.write_config(
             "material-root: D:/materials\n"
+            "output-root: D:/results\n"
             "max-concurrent-queries: 11\n"
             "queries:\n"
             "  - query-id: query_001\n"
@@ -94,6 +109,7 @@ class ConfigTest(unittest.TestCase):
     def test_parses_fixed_numerical_seeds(self):
         config = parse_yaml(self.write_config(
             "material-root: D:/materials\n"
+            "output-root: D:/results\n"
             "queries:\n"
             "  - query-id: query_001\n"
             "seeds:\n"
@@ -129,6 +145,7 @@ class ConfigTest(unittest.TestCase):
             with self.subTest(seed_yaml=seed_yaml):
                 path = self.write_config(
                     "material-root: D:/materials\n"
+                    "output-root: D:/results\n"
                     "queries:\n"
                     "  - query-id: query_001\n"
                     "seeds:\n"
@@ -140,6 +157,7 @@ class ConfigTest(unittest.TestCase):
     def test_legacy_fields_are_rejected(self):
         path = self.write_config(
             "material-root: D:/materials\n"
+            "output-root: D:/results\n"
             "research-topic: Test topic\n"
             "copilot-mode: false\n"
             "queries:\n"

@@ -7,17 +7,9 @@ import re
 from collections import Counter
 
 from agent_runtime import AgentRuntime, ToolRegistry
+from execution_diagnostics import classify_runtime_data_failure, runtime_data_repair_hint
 from local_replay import current_local_replay
-from prompts import (
-    literature_review_prompt,
-    ml_dataset_selection_prompt,
-    phd_interpretation_feedback_prompt,
-    phd_plan_feedback_prompt,
-    postdoc_interpretation_prompt,
-    postdoc_plan_prompt,
-    professor_readme_prompt,
-    sw_data_preparation_prompt,
-)
+from prompts import literature_review_prompt, ml_dataset_selection_prompt, phd_interpretation_feedback_prompt, phd_plan_feedback_prompt, postdoc_interpretation_prompt, postdoc_plan_prompt, professor_readme_prompt,sw_data_preparation_prompt
 from tools import ArxivSearch, HFDataSearch, execute_code, execution_capabilities
 
 
@@ -39,7 +31,9 @@ def _execution_capabilities():
 
 
 def _code_hash(code):
-    return hashlib.sha256(str(code).encode("utf-8")).hexdigest()
+    # A trailing newline or spaces do not make a failed program a new repair.
+    canonical_code = str(code).rstrip(" \t\r\n")
+    return hashlib.sha256(canonical_code.encode("utf-8")).hexdigest()
 
 
 
@@ -167,38 +161,6 @@ def _hf_dataset_column_misuse(tree):
         ):
             return "multi_column_index", node.lineno
     return None, None
-
-
-
-
-DATASET_CODE_MAX_LINES = 100
-DATASET_CODE_MAX_LINE_CHARS = 1000
-DATASET_CODE_MAX_CHARS = 30000
-DATASET_CODE_LIMIT_GUARD = DATASET_CODE_MAX_CHARS
-DATASET_CODE_MAX_IMPORT_ITEMS = 40
-DATASET_CODE_MAX_REPEATED_IMPORT = 5
-DATASET_TASK_TYPES = (
-    "classification",
-    "regression",
-    "text_classification",
-    "image_classification",
-    "time_series_forecasting",
-    "retrieval",
-    "clustering",
-    "other",
-)
-FEATURE_REPRESENTATIONS = (
-    "numeric_matrix",
-    "text",
-    "image",
-    "sequence",
-    "multi_table",
-    "other",
-)
-PREPARED_SPLITS = ("train", "validation", "test")
-ARTIFACT_LAYOUTS = ("split_aligned", "role_based")
-ROLE_SOURCE_TYPES = ("column", "resource_membership", "derived")
-ROLE_ALIGNMENTS = ("sample", "independent")
 
 
 
@@ -437,13 +399,14 @@ class PhDStudentAgent(BaseResearchAgent):
 
     def conduct_literature_review(self, topic, required_papers=1):
         search = ArxivSearch()
-        papers = []
-        pending_read = {"arxiv_id": None}
-        rejected_papers = set()
-        seen_paper_ids = set()
-        candidate_batch = {"query": None, "ids": []}
-        empty_search_count = {"value": 0}
-        paper_pool_exhausted = {"value": False}
+
+        papers = [] # 保存已纳入综述的论文：arxiv_id、摘要、全文。达到 required_papers 后才可提交。
+        pending_read = {"arxiv_id": None}   # 记录“刚读完、但尚未决定添加还是拒绝”的论文 ID。
+        rejected_papers = set() # 保存暂时拒绝的论文，避免下一次普通搜索又返回它；重新阅读并添加时会移除。
+        seen_paper_ids = set()  # 保存本轮所有搜索曾返回过的 ID，允许从较早搜索批次重新阅读。
+        candidate_batch = {"query": None, "ids": []}    # ids 是最新一次搜索中尚待处理的候选；决定当前应继续读还是继续搜索。
+        empty_search_count = {"value": 0}   # 连续两次搜索无候选时，转为浏览剩余本地候选。
+        paper_pool_exhausted = {"value": False} # 标记本地候选是否已真正耗尽，只有耗尽后才能report_
 
         def unavailable_paper_ids():
             return rejected_papers | {
@@ -486,7 +449,8 @@ class PhDStudentAgent(BaseResearchAgent):
                 "decision_required": bool(candidate_batch["ids"]),
                 "reconsiderable_paper_ids": sorted(rejected_papers),
                 "next_action_hint": (
-                    "Read one returned paper or reject the current candidate batch."
+                    "Read one returned paper. After reading it, add it or reject it "
+                    "with the matching arXiv ID."
                     if candidate_batch["ids"]
                     else (
                         "No new candidates remain. Reconsider a previously returned paper "
@@ -519,7 +483,7 @@ class PhDStudentAgent(BaseResearchAgent):
                         "reject_paper before reading another paper"
                     ),
                 }
-            full_text = search.retrieve_full_paper_text(arxiv_id, MAX_LEN=2000)
+            full_text = search.retrieve_full_paper_text(arxiv_id, MAX_LEN=4000)
             pending_read["arxiv_id"] = arxiv_id
             return {
                 "success": True,
@@ -603,28 +567,6 @@ class PhDStudentAgent(BaseResearchAgent):
                 ),
             }
 
-        def reject_arxiv_candidates(reason):
-            if not candidate_batch["ids"]:
-                return {
-                    "success": False,
-                    "error": "There is no current arXiv candidate batch to reject",
-                }
-            rejected_ids = list(candidate_batch["ids"])
-            rejected_papers.update(rejected_ids)
-            rejected_query = candidate_batch["query"]
-            candidate_batch["query"] = None
-            candidate_batch["ids"] = []
-            return {
-                "success": True,
-                "reason": reason,
-                "rejected_query": rejected_query,
-                "rejected_candidate_ids": rejected_ids,
-                "next_action_hint": (
-                    "Search with a different query, or read a previously returned "
-                    "paper if reconsidering its relevance."
-                ),
-            }
-
         def submit_literature_review(review):
             if len(papers) < required_papers:
                 return {
@@ -651,14 +593,14 @@ class PhDStudentAgent(BaseResearchAgent):
 
         def available_tools():
             if pending_read["arxiv_id"] is not None:
-                return {"add_paper", "reject_paper"}
+                return {"add_paper"}
             if len(papers) >= required_papers:
                 return {"submit_literature_review"}
             readable = seen_paper_ids - {item["arxiv_id"] for item in papers}
             if paper_pool_exhausted["value"]:
                 return {"report_no_local_paper"} | ({"read_arxiv_paper"} if readable else set())
             if candidate_batch["ids"]:
-                return {"read_arxiv_paper", "reject_arxiv_candidates"}
+                return {"read_arxiv_paper"}
             return {"search_arxiv"} | ({"read_arxiv_paper"} if readable else set())
 
         registry = ToolRegistry()
@@ -680,18 +622,6 @@ class PhDStudentAgent(BaseResearchAgent):
             ),
             search_arxiv,
         ).register(
-            "reject_arxiv_candidates",
-            (
-                "Set aside the current batch only if none offers direct evidence or "
-                "useful methodological background. Read uncertain candidates first; "
-                "set-aside papers remain readable."
-            ),
-            _object_schema(
-                {"reason": _string("Why none of the current candidates are suitable")},
-                ["reason"],
-            ),
-            reject_arxiv_candidates,
-        ).register(
             "read_arxiv_paper",
             (
                 "Read a paper returned by any search in this review, including a "
@@ -706,9 +636,11 @@ class PhDStudentAgent(BaseResearchAgent):
         ).register(
             "add_paper",
             (
-                "Include the currently read paper as direct evidence or meaningful "
-                "methodological background. Summarize its findings, relevance and "
-                "limitations using the same arXiv ID."
+                "Include the currently read paper when it either directly supports the "
+                "study or provides transferable methodological, comparative, evaluative "
+                "or conceptual background. The dataset, domain, model, task and exact "
+                "research question need not match. Summarize what transfers, findings, "
+                "relevance and limitations using the same arXiv ID."
             ),
             _object_schema(
                 {
@@ -721,9 +653,12 @@ class PhDStudentAgent(BaseResearchAgent):
         ).register(
             "reject_paper",
             (
-                "Set aside the currently read paper if it offers no useful evidence "
-                "or methodological connection. Give a concise reason for the same "
-                "arXiv ID; the paper may be reconsidered later."
+                "Set aside the currently read paper only when its full text has no "
+                "substantive connection after considering transferable methods, "
+                "comparisons, evaluations or concepts. A mismatch in dataset, domain, "
+                "model, task, wording or exact research question alone is never enough. "
+                "Give a concise reason for the same arXiv ID; the paper may be "
+                "reconsidered later."
             ),
             _object_schema(
                 {
@@ -792,12 +727,29 @@ class PhDStudentAgent(BaseResearchAgent):
     def interpretation_feedback(self,topic,plan,experiment_output,postdoc_message,experiment_code="",literature_review="",supplementary_experiments=None,interpretation_history=None,):
         registry = ToolRegistry().register(
             "send_dialogue",
-            "Send results-analysis feedback to the PostdocAgent.",
-            _object_schema(
-                {"message": _string("Evidence-based interpretation feedback")},
-                ["message"],
+            (
+                "Send results-analysis feedback to the PostdocAgent and state "
+                "whether one bounded, executable supplementary experiment is "
+                "necessary before final interpretation."
             ),
-            lambda message: {"success": True, "message": message},
+            _object_schema(
+                {
+                    "message": _string("Evidence-based interpretation feedback"),
+                    "supplement_required": {
+                        "type": "boolean",
+                        "description": (
+                            "True only when one specific bounded executable "
+                            "supplement is necessary before final interpretation"
+                        ),
+                    },
+                },
+                ["message", "supplement_required"],
+            ),
+            lambda message, supplement_required: {
+                "success": True,
+                "message": message,
+                "supplement_required": supplement_required,
+            },
         )
         return self.runtime("results interpretation", max_tool_steps=1).run_one(
             system_prompt=phd_interpretation_feedback_prompt(),
@@ -813,13 +765,25 @@ class PhDStudentAgent(BaseResearchAgent):
                 f"Postdoc message: {postdoc_message}"
             ),
             registry=registry,
-        ).value["message"]
+        ).value
 
 
 class PostdocAgent(BaseResearchAgent):
     role = "computer science postdoctoral researcher"
 
     def plan_turn(self, topic, literature_review, dialogue):
+        def submit_plan(plan, data_requirements):
+            if not str(plan).strip() or not str(data_requirements).strip():
+                return {
+                    "success": False,
+                    "error": "Both plan and data_requirements must be non-empty",
+                }
+            return {
+                "success": True,
+                "plan": plan,
+                "data_requirements": data_requirements,
+            }
+
         registry = ToolRegistry().register(
             "send_dialogue",
             (
@@ -835,13 +799,20 @@ class PostdocAgent(BaseResearchAgent):
             "submit_plan",
             (
                 "Submit the final experimental plan after receiving and incorporating "
-                "PhDStudentAgent feedback, without choosing a concrete dataset."
+                "PhDStudentAgent feedback, together with a separate concise abstract "
+                "data-preparation requirements brief. Do not choose a concrete dataset."
             ),
             _object_schema(
-                {"plan": _string("Complete English experimental plan")},
-                ["plan"],
+                {
+                    "plan": _string("Complete English experimental plan for MLESolver"),
+                    "data_requirements": _string(
+                        "Concise abstract data requirements for SWEngineerAgent and "
+                        "MLEngineerAgent before schema inspection"
+                    ),
+                },
+                ["plan", "data_requirements"],
             ),
-            lambda plan: {"success": True, "plan": plan},
+            submit_plan,
         )
         return self.runtime("plan formulation", max_tool_steps=1).run_one(
             system_prompt=postdoc_plan_prompt(),
@@ -854,7 +825,7 @@ class PostdocAgent(BaseResearchAgent):
             registry=registry,
         )
 
-    def interpretation_turn(self,topic,plan,code,output,dialogue,literature_review="",supplementary_experiments=None,interpretation_history=None,phd_review_required=None,workflow_notice="",):
+    def interpretation_turn(self,topic,plan,code,output,dialogue,literature_review="",supplementary_experiments=None,interpretation_history=None,phd_review_required=None,supplement_required=None,force_submit=False,workflow_notice="",):
         if phd_review_required is None:
             phd_review_required = not bool(dialogue)
 
@@ -869,63 +840,88 @@ class PostdocAgent(BaseResearchAgent):
                 },
             }
 
-        registry = ToolRegistry()
-        registry.register(
-            "send_dialogue",
-            (
-                "Ask the PhDStudentAgent for focused interpretation feedback. This must "
-                "be used before submit_interpretation when no PhD feedback exists."
-            ),
-            _object_schema(
-                {"message": _string("Question or proposed interpretation")},
-                ["message"],
-            ),
-            lambda message: {"success": True, "message": message},
+        request_schema = _object_schema(
+            {
+                "objective": _string("One specific evidence gap to resolve"),
+                "reason": _string("Why interpretation is unsafe without it"),
+                "required_outputs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Exact metrics, comparisons, or diagnostics needed",
+                },
+                "constraints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Boundaries preserving the original experiment",
+                },
+            },
+            ["objective", "reason", "required_outputs", "constraints"],
         )
-        if not phd_review_required:
+        submit_schema = _object_schema(
+            {"interpretation": _string("Final English interpretation")},
+            ["interpretation"],
+        )
+        submit_handler = lambda interpretation: {
+            "success": True,
+            "interpretation": interpretation,
+        }
+        registry = ToolRegistry()
+        if phd_review_required:
+            registry.register(
+                "send_dialogue",
+                (
+                    "Ask the PhDStudentAgent for focused interpretation feedback. This "
+                    "must be used before any final interpretation decision."
+                ),
+                _object_schema(
+                    {"message": _string("Question or proposed interpretation")},
+                    ["message"],
+                ),
+                lambda message: {"success": True, "message": message},
+            )
+        elif supplement_required is True and not force_submit:
             registry.register(
                 "request_supplementary_experiment",
                 (
-                    "Request one bounded additional experiment from MLESolverAgent "
-                    "after PhD feedback, without replacing or editing the original "
-                    "experiment."
+                    "Request the one bounded, concrete supplementary experiment "
+                    "identified as necessary by PhD review. It must preserve the "
+                    "original experiment and cannot replace or edit it."
                 ),
-                _object_schema(
-                    {
-                        "objective": _string("One specific evidence gap to resolve"),
-                        "reason": _string("Why interpretation is unsafe without it"),
-                        "required_outputs": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": (
-                                "Exact metrics, comparisons, or diagnostics needed"
-                            ),
-                        },
-                        "constraints": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": (
-                                "Boundaries preserving the original experiment"
-                            ),
-                        },
-                    },
-                    ["objective", "reason", "required_outputs", "constraints"],
+                request_schema,
+                request_supplementary_experiment,
+            )
+        elif supplement_required is None and not force_submit:
+            registry.register(
+                "request_supplementary_experiment",
+                (
+                    "Request one bounded, materially new supplementary experiment "
+                    "only when it is necessary for a sound interpretation. It must "
+                    "preserve the original experiment and cannot replace or edit it."
                 ),
+                request_schema,
                 request_supplementary_experiment,
             ).register(
                 "submit_interpretation",
                 (
                     "Submit the final evidence-based result interpretation after "
-                    "receiving and incorporating PhDStudentAgent feedback."
+                    "receiving and incorporating PhDStudentAgent feedback. State "
+                    "unresolved evidence gaps as limitations rather than repeating "
+                    "dialogue or replacing the original experiment."
                 ),
-                _object_schema(
-                    {"interpretation": _string("Final English interpretation")},
-                    ["interpretation"],
+                submit_schema,
+                submit_handler,
+            )
+        else:
+            registry.register(
+                "submit_interpretation",
+                (
+                    "Submit the final evidence-based result interpretation after "
+                    "receiving and incorporating PhDStudentAgent feedback. State "
+                    "unresolved evidence gaps as limitations rather than repeating "
+                    "dialogue or replacing the original experiment."
                 ),
-                lambda interpretation: {
-                    "success": True,
-                    "interpretation": interpretation,
-                },
+                submit_schema,
+                submit_handler,
             )
         return self.runtime("results interpretation", max_tool_steps=1).run_one(
             system_prompt=postdoc_interpretation_prompt(),
@@ -940,18 +936,247 @@ class PostdocAgent(BaseResearchAgent):
                 f"{json.dumps(interpretation_history or [], ensure_ascii=True)}\n"
                 f"Latest evidence review status: "
                 f"{'review_required' if phd_review_required else 'review_complete'}\n"
+                f"Supplement decision from PhD review: "
+                f"{'required' if supplement_required is True else ('not_required' if supplement_required is False else 'undecided')}\n"
+                f"Final submission required: {bool(force_submit)}\n"
                 f"Latest PhD feedback: {dialogue or 'None'}\n"
                 f"Workflow notice: {workflow_notice or 'None'}"
             ),
             registry=registry,
         )
 
+_DATA_PREPARATION_FORBIDDEN_MODULE_PREFIXES = (
+    "sklearn.ensemble",
+    "sklearn.linear_model",
+    "sklearn.tree",
+    "sklearn.svm",
+    "sklearn.neighbors",
+    "sklearn.neural_network",
+    "sklearn.cluster",
+    "sklearn.naive_bayes",
+    "sklearn.discriminant_analysis",
+    "sklearn.gaussian_process",
+    "sklearn.metrics",
+    "xgboost",
+    "lightgbm",
+    "catboost",
+    "tensorflow",
+    "keras",
+    "torch.nn",
+    "torch.optim",
+)
 
-def _run_preparation_code(code, workdir):
+_DATA_PREPARATION_FORBIDDEN_METHODS = {
+    "predict",
+    "predict_proba",
+    "predict_log_proba",
+    "fit_predict",
+    "score",
+    "evaluate",
+    "backward",
+}
+
+_DATA_PREPARATION_FORBIDDEN_CALLS = {
+    "GridSearchCV",
+    "RandomizedSearchCV",
+    "cross_val_score",
+    "cross_validate",
+    "learning_curve",
+    "validation_curve",
+}
+
+_DATA_PREPARATION_FORBIDDEN_METRIC_CALLS = {
+    "accuracy_score",
+    "balanced_accuracy_score",
+    "classification_report",
+    "confusion_matrix",
+    "f1_score",
+    "mean_absolute_error",
+    "mean_squared_error",
+    "precision_score",
+    "r2_score",
+    "recall_score",
+    "roc_auc_score",
+}
+
+_DATA_PREPARATION_FORBIDDEN_NAMESPACE_IMPORTS = {
+    "sklearn": {
+        "cluster",
+        "discriminant_analysis",
+        "ensemble",
+        "gaussian_process",
+        "linear_model",
+        "metrics",
+        "naive_bayes",
+        "neighbors",
+        "neural_network",
+        "svm",
+        "tree",
+    },
+    "torch": {"nn", "optim"},
+}
+
+
+def _dotted_ast_name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _dotted_ast_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    return ""
+
+
+def _is_data_preparation_forbidden_module(module_name):
+    return any(
+        module_name == prefix or module_name.startswith(prefix + ".")
+        for prefix in _DATA_PREPARATION_FORBIDDEN_MODULE_PREFIXES
+    )
+
+
+def _data_preparation_scope_violations(code):
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        # The execution layer already returns a precise syntax diagnostic.
+        return []
+
+    violations = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if _is_data_preparation_forbidden_module(alias.name):
+                    violations.add(f"import {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            module_name = node.module or ""
+            if _is_data_preparation_forbidden_module(module_name):
+                violations.add(f"import from {module_name}")
+            elif module_name in _DATA_PREPARATION_FORBIDDEN_NAMESPACE_IMPORTS:
+                for alias in node.names:
+                    if alias.name in _DATA_PREPARATION_FORBIDDEN_NAMESPACE_IMPORTS[module_name]:
+                        violations.add(f"import {module_name}.{alias.name}")
+        elif isinstance(node, ast.Call):
+            dotted_name = _dotted_ast_name(node.func)
+            call_name = dotted_name.rsplit(".", 1)[-1]
+            if _is_data_preparation_forbidden_module(dotted_name):
+                violations.add(f"call {dotted_name}()")
+            if call_name in _DATA_PREPARATION_FORBIDDEN_METHODS:
+                violations.add(f"call .{call_name}()")
+            if call_name in _DATA_PREPARATION_FORBIDDEN_CALLS:
+                violations.add(f"call {call_name}()")
+            if call_name in _DATA_PREPARATION_FORBIDDEN_METRIC_CALLS:
+                violations.add(f"call {call_name}()")
+            if call_name.endswith(("Classifier", "Regressor")):
+                violations.add(f"construct {call_name}()")
+    return sorted(violations)
+
+
+_KEY_ERROR_COLUMN_RE = re.compile(r"KeyError:\s*['\"]([^'\"]+)['\"]")
+_GENERATED_CODE_LINE_RE = re.compile(r'File "<string>", line (\d+)')
+_DATAFRAME_TRANSFORMATION_MARKERS = (
+    ("pd.get_dummies", "one-hot encoding"),
+    (".drop(", "column removal"),
+    (".rename(", "column renaming"),
+    (".set_index(", "index restructuring"),
+    (".reset_index(", "index restructuring"),
+    (".merge(", "dataframe merge"),
+    (".join(", "dataframe join"),
+    (".pivot(", "dataframe pivot"),
+    (".melt(", "dataframe reshape"),
+)
+
+
+def _data_preparation_syntax_repair_hint(code):
+    """Point a repair attempt at the local syntax error and its nearby code."""
+    try:
+        ast.parse(str(code))
+    except SyntaxError as exc:
+        if not exc.lineno:
+            return None
+        code_lines = str(code).splitlines()
+        start = max(0, exc.lineno - 3)
+        end = min(len(code_lines), exc.lineno + 2)
+        context = "\n".join(
+            f"{index + 1}: {code_lines[index]}"
+            for index in range(start, end)
+        )
+        return (
+            f"Python syntax validation failed at line {exc.lineno}: {exc.msg}. "
+            "Correct the shown line and its surrounding indentation, parentheses, "
+            "or commas before retrying.\nRelevant code:\n"
+            + context
+        )
+    return None
+
+
+def _data_preparation_key_error_repair_hint(
+    code,
+    error,
+    traceback_text,
+    inspected_dataset,
+):
+    match = _KEY_ERROR_COLUMN_RE.search(str(error or ""))
+    if match is None:
+        match = _KEY_ERROR_COLUMN_RE.search(str(traceback_text or ""))
+    if match is None:
+        return None
+    missing_column = match.group(1)
+    schema = (
+        inspected_dataset.get("dataset_schema", {})
+        if isinstance(inspected_dataset, dict)
+        else {}
+    )
+    columns = schema.get("columns", {}) if isinstance(schema, dict) else {}
+    if missing_column not in columns:
+        return None
+
+    code_lines = str(code).splitlines()
+    generated_lines = _GENERATED_CODE_LINE_RE.findall(str(traceback_text or ""))
+    if generated_lines:
+        failure_line = int(generated_lines[-1])
+        relevant_code = "\n".join(code_lines[:max(0, failure_line - 1)])
+    else:
+        relevant_code = str(code)
+    transformations = [
+        label
+        for marker, label in _DATAFRAME_TRANSFORMATION_MARKERS
+        if marker in relevant_code
+    ]
+    if not transformations:
+        return None
+    transformation_summary = ", ".join(dict.fromkeys(transformations))
+    return (
+        f"The missing column {missing_column!r} exists in the inspected raw schema. "
+        "The KeyError occurred after a dataframe transformation "
+        f"({transformation_summary}), so do not re-inspect the raw schema. "
+        "Trace the transformed dataframe, preserve target and analysis-role columns "
+        "before feature transformations, encode a separate feature dataframe, and "
+        "do not access original role columns from the transformed dataframe."
+    )
+
+
+def _run_preparation_code(code, workdir, inspected_dataset=None):
     """Shared execution for ML trials and SW final submissions."""
     if not code.strip():
         return {"success": False, "code": code, "output": "", "error": "Provide Python code"}
-    execution = execute_code(code, timeout=600, workdir=workdir, return_details=True)
+    violations = _data_preparation_scope_violations(code)
+    if violations:
+        return {
+            "success": False,
+            "error_type": "data_preparation_scope_violation",
+            "error": (
+                "Data preparation code may only prepare reusable data. Move model "
+                "training, prediction, and final evaluation to MLESolver: "
+                + ", ".join(violations)
+            ),
+            "traceback": "",
+            "exit_code": None,
+            "code": code,
+            "output": "",
+            "selection": {},
+            "artifacts": [],
+            "prepared_data_manifest": None,
+        }
+    execution = execute_code(code, timeout=900, workdir=workdir, return_details=True)
     details = execution
     output = details["output"]
     selection = {}
@@ -965,7 +1190,7 @@ def _run_preparation_code(code, workdir):
                 "revision": event.get("object_revision") or request.get("revision"),
             }
             break
-    return {
+    result = {
         "success": details["success"],
         "error_type": details["error_type"],
         "error": details["error"],
@@ -977,6 +1202,25 @@ def _run_preparation_code(code, workdir):
         "artifacts": list(details.get("artifacts", [])),
         "prepared_data_manifest": details.get("prepared_data_manifest"),
     }
+    if result["success"] is False:
+        category = classify_runtime_data_failure(
+            result["error"], result["traceback"]
+        )
+        if category is not None:
+            result["failure_category"] = category
+            repair_hint = runtime_data_repair_hint(category)
+        else:
+            repair_hint = _data_preparation_syntax_repair_hint(code)
+        if repair_hint is None:
+            repair_hint = _data_preparation_key_error_repair_hint(
+                code,
+                result["error"],
+                result["traceback"],
+                inspected_dataset,
+            )
+        if repair_hint:
+            result["repair_hint"] = repair_hint
+    return result
 
 
 def _inspection_feedback_for_prompt(feedback, inspected_dataset):
@@ -1004,42 +1248,204 @@ def _inspection_feedback_for_prompt(feedback, inspected_dataset):
     }
 
 
+def _authoritative_execution_failure(value):
+    if not isinstance(value, dict) or value.get("success") is not False:
+        return None
+    return dict(value)
+
+
+def _stale_diagnostic_marker():
+    return {
+        "message": (
+            "A newer execution failure is supplied below as the authoritative "
+            "diagnostic. Do not rely on older error analysis or repair advice."
+        )
+    }
+
+
 class MLEngineerAgent(BaseResearchAgent):
     role = "machine learning engineer"
 
+    @staticmethod
+    def _select_first_complete_dataset(results):
+        """Choose the first locally materialized candidate without using query-specific rules."""
+        for item in results or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("snapshot_status") not in (None, "complete"):
+                continue
+            dataset_id = item.get("dataset_id") or item.get("id")
+            revision = item.get("revision")
+            if not dataset_id or not revision:
+                continue
+
+            config_name = None
+            split = None
+            materialized = item.get("materialized") or {}
+            if isinstance(materialized, dict):
+                for candidate_config, split_map in materialized.items():
+                    if not isinstance(split_map, dict) or not split_map:
+                        continue
+                    config_name = str(candidate_config)
+                    split = str(next(iter(split_map)))
+                    break
+            if config_name is None:
+                configs = item.get("configs") or []
+                splits = item.get("splits") or []
+                if configs and splits:
+                    config_name = str(configs[0])
+                    split = str(splits[0])
+            if not config_name or not split:
+                continue
+            return {
+                "dataset_id": str(dataset_id),
+                "revision": str(revision),
+                "config_name": config_name,
+                "split": split,
+                "selection_reason": "first complete local candidate returned by search",
+            }
+        return None
+
     def data_preparation_turn(
-        self, topic, plan, literature_review, sw_message,
+        self, topic, data_requirements, literature_review, sw_message,
         conversation_history="", workdir=None, feedback=None,
         inspected_dataset=None,
         trial_pending=False,
+        selected_dataset=None,
+        latest_execution_failure=None,
+        failed_trial_code_failures=None,
     ):
         search = HFDataSearch()
         must_execute = bool(inspected_dataset) and trial_pending
+        if isinstance(selected_dataset, dict):
+            selected_dataset = dict(selected_dataset)
+        elif isinstance(feedback, dict) and isinstance(feedback.get("selected_dataset"), dict):
+            selected_dataset = dict(feedback["selected_dataset"])
+        else:
+            selected_dataset = None
+        latest_execution_failure = _authoritative_execution_failure(
+            latest_execution_failure
+        )
+        if failed_trial_code_failures is None:
+            failed_trial_code_failures = {}
 
         def search_huggingface(query, max_results):
             results = search.retrieve_ds(query, N=max(1, min(int(max_results), 10)))
-            return {"success": True, "results": results}
+            selected = self._select_first_complete_dataset(results)
+            return {
+                "success": True,
+                "results": results,
+                "selected_dataset": selected,
+                "next_action_hint": (
+                    "A complete local candidate was selected. Call "
+                    "inspect_huggingface_dataset for that candidate; do not search again."
+                    if selected
+                    else "No complete local candidate was returned. Search with a different query."
+                ),
+            }
 
         def inspect_huggingface_dataset(
-            dataset_id,
-            revision,
-            config_name,
-            split,
+            dataset_id=None,
+            revision=None,
+            config_name=None,
+            split=None,
         ):
+            if selected_dataset:
+                dataset_id = selected_dataset["dataset_id"]
+                revision = selected_dataset["revision"]
+                config_name = selected_dataset["config_name"]
+                split = selected_dataset["split"]
+            elif not all((dataset_id, revision, config_name, split)):
+                return {
+                    "success": False,
+                    "error_type": "missing_dataset_selection",
+                    "error": "Provide a complete dataset selection before inspection",
+                }
             inspected = search.inspect_dataset(
                 dataset_id,
                 revision,
                 config_name,
                 split,
             )
-            return {"success": True, **inspected}
+            return {
+                "success": True,
+                **inspected,
+                "selected_dataset": selected_dataset,
+            }
 
         def execute_dataset_code(code):
-            return _run_preparation_code(code, workdir)
+            fingerprint = _code_hash(code)
+            if fingerprint in failed_trial_code_failures:
+                prior_failure = dict(
+                    failed_trial_code_failures.get(fingerprint) or {}
+                )
+                original_error = prior_failure.get("error") or "the prior failure"
+                return {
+                    "success": False,
+                    "error_type": "unchanged_failed_dataset_code",
+                    "error": (
+                        "This exact data-preparation code already failed. It was not "
+                        "executed again."
+                    ),
+                    "repair_hint": (
+                        "Make a substantive code change that resolves the original "
+                        f"failure before retrying: {original_error}"
+                    ),
+                    "original_error_type": prior_failure.get("error_type"),
+                    "original_error": prior_failure.get("error"),
+                    "original_repair_hint": prior_failure.get("repair_hint"),
+                    "code": code,
+                    "code_hash": fingerprint,
+                    "output": "",
+                    "traceback": "",
+                    "exit_code": None,
+                    "selection": {},
+                    "artifacts": [],
+                    "prepared_data_manifest": None,
+                    "selected_dataset": selected_dataset,
+                }
+            result = {
+                **_run_preparation_code(code, workdir, inspected_dataset),
+                "code_hash": fingerprint,
+                "selected_dataset": selected_dataset,
+            }
+            if result.get("success") is False:
+                failed_trial_code_failures[fingerprint] = {
+                    key: result.get(key)
+                    for key in ("error_type", "error", "repair_hint")
+                    if result.get(key)
+                }
+            return result
 
+        selection_pending = bool(selected_dataset) and not inspected_dataset
+        selected_and_inspected = bool(selected_dataset) and bool(inspected_dataset)
+        inspection_schema = (
+            _object_schema({}, [])
+            if selection_pending
+            else _object_schema({
+                "dataset_id": _string("Exact dataset ID returned by search_huggingface"),
+                "revision": _string("Exact materialized revision returned by search"),
+                "config_name": _string("Exact materialized configuration name"),
+                "split": _string("Exact materialized split name"),
+            }, ["dataset_id", "revision", "config_name", "split"])
+        )
+        inspection_description = (
+            "Inspect the automatically selected complete local dataset. No arguments "
+            "are needed; the framework supplies the dataset identity."
+            if selection_pending
+            else (
+                "Read the authoritative schema of one exact local Hugging Face "
+                "dataset revision, configuration, and split. Use this after search "
+                "and before writing schema-dependent preparation code."
+            )
+        )
         registry = ToolRegistry().register(
             "search_huggingface",
-            "Search the current query's local Hugging Face datasets.",
+            (
+                "Search the current query's local Hugging Face datasets. When a "
+                "complete candidate is returned, the framework selects the first one "
+                "and exposes only inspect_huggingface_dataset next."
+            ),
             _object_schema({
                 "query": _string("Dataset search query"),
                 "max_results": {"type": "integer", "description": "Number of results, 1 to 10"},
@@ -1047,17 +1453,8 @@ class MLEngineerAgent(BaseResearchAgent):
             search_huggingface,
         ).register(
             "inspect_huggingface_dataset",
-            (
-                "Read the authoritative schema of one exact local Hugging Face "
-                "dataset revision, configuration, and split. Use this after search "
-                "and before writing schema-dependent preparation code."
-            ),
-            _object_schema({
-                "dataset_id": _string("Exact dataset ID returned by search_huggingface"),
-                "revision": _string("Exact materialized revision returned by search"),
-                "config_name": _string("Exact materialized configuration name"),
-                "split": _string("Exact materialized split name"),
-            }, ["dataset_id", "revision", "config_name", "split"]),
+            inspection_description,
+            inspection_schema,
             inspect_huggingface_dataset,
         ).register(
             "execute_dataset_code",
@@ -1074,20 +1471,31 @@ class MLEngineerAgent(BaseResearchAgent):
         return self.runtime("data preparation collaboration", max_tool_steps=1).run(
             system_prompt=ml_dataset_selection_prompt(),
             user_prompt=(
-                f"Topic: {topic}\nPlan: {plan}\nLiterature review: {literature_review}\n"
-                f"Latest SWEngineer message: {sw_message}\n"
+                f"Topic: {topic}\n"
+                f"Data preparation requirements: {data_requirements}\n"
+                f"Latest SWEngineer message: "
+                f"{'Repair the authoritative latest execution failure below.' if latest_execution_failure else sw_message}\n"
                 f"Previous ML command result: "
-                f"{json.dumps(_inspection_feedback_for_prompt(feedback, inspected_dataset), ensure_ascii=True, default=str)}\n"
+                f"{json.dumps(_stale_diagnostic_marker() if latest_execution_failure else _inspection_feedback_for_prompt(feedback, inspected_dataset), ensure_ascii=True, default=str)}\n"
+                f"Authoritative latest execution failure: "
+                f"{json.dumps(latest_execution_failure, ensure_ascii=True, default=str)}\n"
                 f"Authoritative inspected dataset: "
                 f"{json.dumps(inspected_dataset, ensure_ascii=True, default=str)}\n"
-                f"Next action: {'Execute the complete preparation code now; schema inspection has succeeded.' if must_execute else 'Choose the next useful action from the available tools.'}\n"
+                f"Automatically selected local dataset: "
+                f"{json.dumps(selected_dataset, ensure_ascii=True, default=str)}\n"
+                f"Next action: "
+                f"{'Execute the complete preparation code now; schema inspection has succeeded.' if must_execute else ('Inspect the automatically selected local candidate; do not search again.' if selection_pending else ('Repair and execute preparation code for the selected, inspected dataset.' if selected_and_inspected else 'Choose the next useful action from the available tools.'))}\n"
                 f"Conversation so far:\n{conversation_history or 'None'}\n"
                 f"Execution environment: {json.dumps(_execution_capabilities(), ensure_ascii=True)}"
             ),
             registry=registry,
             terminal_tools=registry.names,
             return_after_tool=True,
-            tool_names_provider=lambda: {"execute_dataset_code"} if must_execute else registry.names,
+            tool_names_provider=(
+                lambda: {"execute_dataset_code"}
+                if must_execute or selected_and_inspected
+                else ({"inspect_huggingface_dataset"} if selection_pending else registry.names)
+            ),
         )
 
 
@@ -1095,9 +1503,11 @@ class SWEngineerAgent(BaseResearchAgent):
     role = "software engineer"
 
     def data_preparation_turn(
-        self, topic, plan, workdir, literature_review="",
+        self, topic, data_requirements, workdir, literature_review="",
         conversation_history="", feedback=None, ml_result=None,
         inspected_dataset=None,
+        latest_execution_failure=None,
+        verified_trial=None,
     ):
         def submit_dataset_code(code):
             if not inspected_dataset:
@@ -1111,35 +1521,61 @@ class SWEngineerAgent(BaseResearchAgent):
                     "code": code,
                     "output": "",
                 }
-            return _run_preparation_code(code, workdir)
+            return _run_preparation_code(code, workdir, inspected_dataset)
 
-        registry = ToolRegistry().register(
-            "send_dialogue",
-            "Direct or consult the MLEngineerAgent about dataset search and preparation code.",
-            _object_schema({"message": _string("Message to the ML engineer")}, ["message"]),
-            lambda message: {"success": True, "message": message},
-        ).register(
-            "submit_dataset_code",
-            "Execute the complete final data-preparation code. Successful execution "
-            "submits it; on failure the error returns to the collaboration.",
-            _object_schema({"code": _string("Complete final Python data-preparation code")}, ["code"]),
-            submit_dataset_code,
-        )
+        def submit_verified_dataset_code():
+            if not isinstance(verified_trial, dict):
+                return {
+                    "success": False,
+                    "error": "No verified MLE trial is available for submission",
+                }
+            return dict(verified_trial)
+
+        if isinstance(verified_trial, dict):
+            registry = ToolRegistry().register(
+                "submit_dataset_code",
+                (
+                    "Promote the exact successful MLE trial code and execution result. "
+                    "No arguments are accepted and the code is not executed again."
+                ),
+                _object_schema({}, []),
+                submit_verified_dataset_code,
+            )
+        else:
+            registry = ToolRegistry().register(
+                "send_dialogue",
+                "Direct or consult the MLEngineerAgent about dataset search and preparation code.",
+                _object_schema({"message": _string("Message to the ML engineer")}, ["message"]),
+                lambda message: {"success": True, "message": message},
+            ).register(
+                "submit_dataset_code",
+                "Execute the complete final data-preparation code. Successful execution "
+                "submits it; on failure the error returns to the collaboration.",
+                _object_schema({"code": _string("Complete final Python data-preparation code")}, ["code"]),
+                submit_dataset_code,
+            )
         return self.runtime("data preparation collaboration", max_tool_steps=1).run(
             system_prompt=sw_data_preparation_prompt(),
             user_prompt=(
-                f"Topic: {topic}\nPlan: {plan}\nLiterature review: {literature_review}\n"
-                f"Previous SW command result: {json.dumps(feedback, ensure_ascii=True, default=str)}\n"
+                f"Topic: {topic}\n"
+                f"Data preparation requirements: {data_requirements}\n"
+                f"Previous SW command result: "
+                f"{json.dumps(_stale_diagnostic_marker() if _authoritative_execution_failure(latest_execution_failure) else feedback, ensure_ascii=True, default=str)}\n"
                 f"Latest ML command result: "
-                f"{json.dumps(_inspection_feedback_for_prompt(ml_result, inspected_dataset), ensure_ascii=True, default=str)}\n"
+                f"{json.dumps(_stale_diagnostic_marker() if _authoritative_execution_failure(latest_execution_failure) else _inspection_feedback_for_prompt(ml_result, inspected_dataset), ensure_ascii=True, default=str)}\n"
+                f"Authoritative latest execution failure: "
+                f"{json.dumps(_authoritative_execution_failure(latest_execution_failure), ensure_ascii=True, default=str)}\n"
                 f"Authoritative inspected dataset: "
                 f"{json.dumps(inspected_dataset, ensure_ascii=True, default=str)}\n"
+                f"Verified MLE trial ready for direct submission: "
+                f"{isinstance(verified_trial, dict)}\n"
                 f"Conversation so far:\n{conversation_history or 'None'}\n"
                 f"Execution environment: {json.dumps(_execution_capabilities(), ensure_ascii=True)}"
             ),
             registry=registry,
             terminal_tools=registry.names,
             return_after_tool=True,
+            automatic_tools={"submit_dataset_code"} if isinstance(verified_trial, dict) else set(),
         )
 
 

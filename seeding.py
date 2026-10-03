@@ -96,8 +96,9 @@ def seed_prompt_text(config=None):
         "The execution environment provides fixed constants "
         f"PYTHON_SEED={seeds.python}, NUMPY_SEED={seeds.numpy}, "
         f"SKLEARN_SEED={seeds.sklearn}, and PYTORCH_SEED={seeds.pytorch}. "
-        "Use SKLEARN_SEED for every scikit-learn random_state argument and pass "
-        "NUMPY_SEED to np.random.default_rng. Do not replace these constants with "
+        "Use SKLEARN_SEED for every scikit-learn random_state argument and for "
+        "datasets.Dataset.train_test_split(seed=...). Pass NUMPY_SEED to "
+        "np.random.default_rng. Do not replace these constants with "
         "other seed values. Python random, legacy NumPy random, and PyTorch are "
         "also initialized by the execution framework."
     )
@@ -172,7 +173,6 @@ SKLEARN_RANDOM_CALLS = {
     "SGDClassifier",
     "SGDRegressor",
     "SpectralClustering",
-    "train_test_split",
 }
 
 
@@ -182,6 +182,50 @@ def _call_name(node):
     if isinstance(node.func, ast.Attribute):
         return node.func.attr
     return None
+
+
+def _dotted_name(node):
+    """Return a best-effort dotted name for a direct or attribute expression."""
+    pieces = []
+    while isinstance(node, ast.Attribute):
+        pieces.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    pieces.append(node.id)
+    return ".".join(reversed(pieces))
+
+
+def _sklearn_train_test_split_bindings(tree):
+    """Find direct and module aliases for sklearn.model_selection."""
+    direct_names = {"train_test_split"}
+    module_aliases = {"model_selection"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                if item.name == "sklearn.model_selection" and item.asname:
+                    module_aliases.add(item.asname)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "sklearn.model_selection":
+                for item in node.names:
+                    if item.name == "train_test_split":
+                        direct_names.add(item.asname or item.name)
+            elif node.module == "sklearn":
+                for item in node.names:
+                    if item.name == "model_selection":
+                        module_aliases.add(item.asname or item.name)
+    return direct_names, module_aliases
+
+
+def _is_sklearn_train_test_split_call(node, direct_names, module_aliases):
+    if isinstance(node.func, ast.Name):
+        return node.func.id in direct_names
+    path = _dotted_name(node.func)
+    if path is None:
+        return False
+    if path.endswith(".model_selection.train_test_split"):
+        return True
+    return any(path == f"{alias}.train_test_split" for alias in module_aliases)
 
 
 def _matches_seed_expression(node, constant_name, expected_value, mapping_key):
@@ -200,12 +244,56 @@ def _matches_seed_expression(node, constant_name, expected_value, mapping_key):
 def validate_seed_usage(tree, config=None):
     seeds = SeedConfig.from_mapping(config or current_seed_config())
     violations = []
+    sklearn_split_names, sklearn_module_aliases = _sklearn_train_test_split_bindings(
+        tree
+    )
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         name = _call_name(node)
         keywords = {item.arg: item.value for item in node.keywords if item.arg}
         random_state = keywords.get("random_state")
+        is_sklearn_split = _is_sklearn_train_test_split_call(
+            node, sklearn_split_names, sklearn_module_aliases
+        )
+        if name == "train_test_split" or is_sklearn_split:
+            if is_sklearn_split:
+                if random_state is None:
+                    violations.append(
+                        "train_test_split() is missing random_state=SKLEARN_SEED"
+                    )
+                elif not _matches_seed_expression(
+                    random_state,
+                    "SKLEARN_SEED",
+                    seeds.sklearn,
+                    "sklearn",
+                ):
+                    violations.append(
+                        "train_test_split() must use random_state=SKLEARN_SEED"
+                    )
+            else:
+                seed = keywords.get("seed")
+                if random_state is not None:
+                    violations.append(
+                        "datasets.Dataset.train_test_split() must use "
+                        "seed=SKLEARN_SEED, not random_state"
+                    )
+                elif seed is None:
+                    violations.append(
+                        "datasets.Dataset.train_test_split() is missing "
+                        "seed=SKLEARN_SEED"
+                    )
+                elif not _matches_seed_expression(
+                    seed,
+                    "SKLEARN_SEED",
+                    seeds.sklearn,
+                    "sklearn",
+                ):
+                    violations.append(
+                        "datasets.Dataset.train_test_split() must use "
+                        "seed=SKLEARN_SEED"
+                    )
+            continue
         if name in SKLEARN_RANDOM_CALLS and random_state is None:
             violations.append(f"{name}() is missing random_state=SKLEARN_SEED")
         elif random_state is not None and not _matches_seed_expression(

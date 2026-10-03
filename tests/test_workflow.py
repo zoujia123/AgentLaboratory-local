@@ -8,14 +8,21 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from agent_runtime import AgentRunResult
-from ai_lab_repo import (
-    LaboratoryWorkflow,
+from workflows.collaboration import (
     _compact_collaboration_result,
     _render_collaboration_history,
     _render_sw_collaboration_history,
 )
+from workflows.laboratory import LaboratoryWorkflow
 from research_state import ResearchState
 from run_logging import PromptRecorder, RunLogger, run_log_scope
+
+
+COLLABORATION_ROUNDS = {
+    "plan_max_rounds": 8,
+    "data_preparation_max_rounds": 12,
+    "interpretation_max_phd_reviews": 8,
+}
 
 
 def result(tool_name, value):
@@ -150,6 +157,23 @@ class SWHistoryTest(unittest.TestCase):
         self.assertIn("OLD_FAILED_CODE", history)
         self.assertIn("OLD_TRACEBACK", history)
 
+    def test_latest_execution_failure_hides_prior_failure_history(self):
+        latest_failure = {
+            "tool": "execute_dataset_code",
+            "success": False,
+            "error": "CURRENT_ERROR",
+        }
+        history = _render_sw_collaboration_history(
+            self.conversation,
+            {**self.trial, "success": False},
+            self.inspected,
+            latest_execution_failure=latest_failure,
+        )
+        self.assertNotIn("OLD_FAILED_CODE", history)
+        self.assertNotIn("OLD_TRACEBACK", history)
+        self.assertNotIn("OLD_EXECUTION_OUTPUT", history)
+        self.assertEqual(history, "")
+
 
 class WorkflowTest(unittest.TestCase):
     def test_compacts_code_and_diagnostics_for_collaboration_history(self):
@@ -206,7 +230,10 @@ class WorkflowTest(unittest.TestCase):
             state = ResearchState("query_001", "recording_001", "topic")
             state.plan = "plan"
             state.literature_review = "review"
-            workflow = LaboratoryWorkflow(state, "model", "key", temp_dir)
+            workflow = LaboratoryWorkflow(
+                state, "model", "key", temp_dir,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
             workflow.sw_engineer.data_preparation_turn = MagicMock(return_value=result(
                 "unknown_command",
                 {"success": True, "message": "Please select a dataset."},
@@ -234,7 +261,10 @@ class WorkflowTest(unittest.TestCase):
             state = ResearchState("query_001", "recording_001", "topic")
             state.plan = "plan"
             state.literature_review = "review"
-            workflow = LaboratoryWorkflow(state, "model", "key", temp_dir)
+            workflow = LaboratoryWorkflow(
+                state, "model", "key", temp_dir,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
             selection = {"dataset_id": "owner/data", "revision": "revision"}
             observed_sw_calls = []
 
@@ -273,34 +303,44 @@ class WorkflowTest(unittest.TestCase):
                     workflow._prepare_dataset_collaboratively()
             logger.close()
 
-            self.assertEqual(len(observed_sw_calls), 8)
+            self.assertEqual(len(observed_sw_calls), 12)
             latest_history = observed_sw_calls[-1]["conversation_history"]
             self.assertLessEqual(
                 len(latest_history.splitlines()),
                 6,
             )
             self.assertNotIn("sw-message-0", latest_history)
-            self.assertIn("ml-message-5", latest_history)
-            self.assertNotIn("ml-message-6", latest_history)
+            self.assertIn("ml-message-9", latest_history)
+            self.assertNotIn("ml-message-10", latest_history)
             self.assertEqual(
                 observed_sw_calls[-1]["feedback"]["message"],
-                "sw-message-6",
+                "sw-message-10",
             )
             self.assertEqual(
                 observed_sw_calls[-1]["ml_result"]["message"],
-                "ml-message-6",
+                "ml-message-10",
             )
 
     def test_runs_fixed_agent_flow_and_serial_reviewers(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state = ResearchState("query_001", "recording_001", "topic")
-            workflow = LaboratoryWorkflow(state, "model", "key", temp_dir)
+            workflow = LaboratoryWorkflow(
+                state, "model", "key", temp_dir,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
             workflow.phd.conduct_literature_review = MagicMock(return_value={
                 "review": "review",
                 "papers": [{"arxiv_id": "1", "summary": "paper", "full_text": "text"}],
             })
             workflow.postdoc.plan_turn = MagicMock(
-                return_value=result("submit_plan", {"success": True, "plan": "plan"})
+                return_value=result(
+                    "submit_plan",
+                    {
+                        "success": True,
+                        "plan": "plan",
+                        "data_requirements": "requirements",
+                    },
+                )
             )
             selection = {
                 "dataset_id": "owner/data",
@@ -390,6 +430,7 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(review_order, [1, 2, 3])
             self.assertEqual(completed.paper, "paper")
             self.assertEqual(completed.readme, "readme")
+            self.assertEqual(completed.data_requirements, "requirements")
             self.assertEqual(
                 completed.dataset_selection["dataset_id"],
                 selection["dataset_id"],
@@ -454,7 +495,10 @@ class WorkflowTest(unittest.TestCase):
                 experiment_code="original_code",
                 experiment_output="original_output",
             )
-            workflow = LaboratoryWorkflow(state, "model", "key", temp_dir)
+            workflow = LaboratoryWorkflow(
+                state, "model", "key", temp_dir,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
             request = {
                 "objective": "check robustness",
                 "reason": "one split is insufficient",
@@ -576,7 +620,10 @@ class WorkflowTest(unittest.TestCase):
                     "output": "supplement_output",
                 }],
             )
-            workflow = LaboratoryWorkflow(state, "model", "key", temp_dir)
+            workflow = LaboratoryWorkflow(
+                state, "model", "key", temp_dir,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
             workflow.postdoc.interpretation_turn = MagicMock(side_effect=[
                 result(
                     "send_dialogue",
@@ -610,31 +657,69 @@ class WorkflowTest(unittest.TestCase):
             )
             final_turn = workflow.postdoc.interpretation_turn.call_args_list[2]
             self.assertFalse(final_turn.kwargs["phd_review_required"])
+            self.assertTrue(final_turn.kwargs["force_submit"])
             self.assertIn(
                 "Duplicate supplementary request rejected",
                 final_turn.kwargs["workflow_notice"],
             )
 
-    def test_interpretation_has_eight_postdoc_turn_budget(self):
+    def test_interpretation_rejects_repeated_dialogue_after_phd_review(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state = ResearchState("query_001", "recording_001", "topic")
-            workflow = LaboratoryWorkflow(state, "model", "key", temp_dir)
-            workflow.postdoc.interpretation_turn = MagicMock(
-                return_value=result(
-                    "send_dialogue",
-                    {"success": True, "message": "continue"},
-                )
+            workflow = LaboratoryWorkflow(
+                state, "model", "key", temp_dir,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
             )
-            workflow.phd.interpretation_feedback = MagicMock(return_value="feedback")
+            workflow.postdoc.interpretation_turn = MagicMock(side_effect=[
+                result("send_dialogue", {"success": True, "message": "review"}),
+                result("send_dialogue", {"success": True, "message": "repeat"}),
+            ])
+            workflow.phd.interpretation_feedback = MagicMock(return_value={
+                "message": "No supplement is needed.",
+                "supplement_required": False,
+            })
 
             with self.assertRaisesRegex(
                 RuntimeError,
-                "exceeded its dialogue budget",
+                "must submit the interpretation",
             ):
                 workflow._interpret_results()
 
-            self.assertEqual(workflow.postdoc.interpretation_turn.call_count, 8)
-            self.assertEqual(workflow.phd.interpretation_feedback.call_count, 8)
+            self.assertEqual(workflow.postdoc.interpretation_turn.call_count, 2)
+            self.assertEqual(workflow.phd.interpretation_feedback.call_count, 1)
+
+    def test_interpretation_reserves_final_submit_after_review_budget(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = ResearchState("query_001", "recording_001", "topic")
+            workflow = LaboratoryWorkflow(
+                state, "model", "key", temp_dir,
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            )
+            workflow.collaboration_rounds = {
+                **workflow.collaboration_rounds,
+                "interpretation_max_phd_reviews": 1,
+            }
+            workflow.postdoc.interpretation_turn = MagicMock(side_effect=[
+                result("send_dialogue", {"success": True, "message": "review"}),
+                result(
+                    "submit_interpretation",
+                    {"success": True, "interpretation": "cautious final result"},
+                ),
+            ])
+            workflow.phd.interpretation_feedback = MagicMock(return_value={
+                "message": "One more diagnostic would be useful.",
+                "supplement_required": True,
+            })
+
+            interpretation = workflow._interpret_results()
+
+            self.assertEqual(interpretation, "cautious final result")
+            final_turn = workflow.postdoc.interpretation_turn.call_args_list[1]
+            self.assertTrue(final_turn.kwargs["force_submit"])
+            self.assertEqual(
+                final_turn.kwargs["supplement_required"],
+                True,
+            )
 
 
 if __name__ == "__main__":

@@ -1,11 +1,73 @@
 {
-  "success_count": 0,
-  "failure_count": 1,
-  "results": [],
-  "failures": [
+  "success_count": 1,
+  "failure_count": 0,
+  "results": [
     {
-      "query_id": "query_001",
-      "error": "Tool-calling model request failed after 3 attempts: Error code: 429 - {'code': 50609, 'message': 'Request was rejected due to rate limiting. Details: System is too busy now.', 'data': None}"
+      "job_id": "20261003T004839326691Z_1f3164a4",
+      "query_id": "query_014",
+      "recording_id": "20260916T085948441634Z_6dae6be0",
+      "topic": "In the Beans dataset, after resizing images to 32x32 pixels, does grayscale conversion lower validation accuracy of a fixed logistic-regression classifier compared with color images?",
+      "seeds": {
+        "strategy": "fixed",
+        "python": 2001,
+        "numpy": 3001,
+        "sklearn": 4001,
+        "pytorch": 5001,
+        "pytorch-deterministic": true
+      },
+      "llm_sampling": {
+        "temperature": 0.1,
+        "top_p": 1,
+        "max_tokens": 8192
+      },
+      "collaboration_rounds": {
+        "plan_max_rounds": 8,
+        "data_preparation_max_rounds": 12,
+        "interpretation_max_phd_reviews": 8
+      },
+      "console_log": false,
+      "success": true,
+      "error": null,
+      "workdir": "D:\\work\\HUST\\specKV\\20260806 tool_sort_by_idleness\\AgentLaboratory-main\\AgentLaboratory-main-local\\research_runs_v2\\query_014\\20261003T004839326691Z_1f3164a4",
+      "workflow_log": "D:\\work\\HUST\\specKV\\20260806 tool_sort_by_idleness\\AgentLaboratory-main\\AgentLaboratory-main-local\\research_runs_v2\\query_014\\20261003T004839326691Z_1f3164a4\\workflow.log",
+      "prompt_log": "D:\\work\\HUST\\specKV\\20260806 tool_sort_by_idleness\\AgentLaboratory-main\\AgentLaboratory-main-local\\research_runs_v2\\query_014\\20261003T004839326691Z_1f3164a4\\prompts.jsonl",
+      "llm_http_attempt_budget": {
+        "limit": 100,
+        "used": 44,
+        "remaining": 56,
+        "limit_reached": false,
+        "request_blocked": false
+      },
+      "trace": {
+        "run_id": "20261003T004839333271Z_af8fdbf5",
+        "started_at": "2026-10-03T00:48:39.333271+00:00",
+        "ended_at": "2026-10-03T01:18:36.998499+00:00",
+        "workflow_elapsed_ms": 1797665.255,
+        "event_count": 73,
+        "tool_call_count": 16,
+        "llm_call_count": 44,
+        "tool_inclusive_duration_ms": 1269939.241,
+        "llm_duration_ms": 524945.963,
+        "note": "Tool durations are inclusive; use parent_call_id to avoid double-counting nested calls."
+      },
+      "replay": {
+        "query_id": "query_014",
+        "recording_id": "20260916T085948441634Z_6dae6be0",
+        "material_root": "D:\\work\\HUST\\MASLab_v2",
+        "event_count": 12,
+        "match_counts": {
+          "local_bm25": 2,
+          "object_direct": 10
+        },
+        "strict_offline": true,
+        "latency_mode": "recorded",
+        "latency_scale": 1.0,
+        "unused_calls": {
+          "arxiv.search": 0,
+          "huggingface.search": 2
+        }
+      }
     }
-  ]
+  ],
+  "failures": []
 }

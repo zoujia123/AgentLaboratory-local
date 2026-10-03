@@ -10,6 +10,13 @@ from unittest.mock import patch
 from ai_lab_repo import BatchConfig, QueryJob, main, run_batch
 
 
+COLLABORATION_ROUNDS = {
+    "plan_max_rounds": 8,
+    "data_preparation_max_rounds": 12,
+    "interpretation_max_phd_reviews": 8,
+}
+
+
 class BatchRunnerTest(unittest.TestCase):
     def test_limits_concurrency_while_running_all_queries(self):
         jobs = tuple(QueryJob(f"query_{index:03d}") for index in range(6))
@@ -36,6 +43,7 @@ class BatchRunnerTest(unittest.TestCase):
                 3,
                 jobs,
                 output_root=str(Path(temp_dir, "runs")),
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
             )
             summary = run_batch(config, "model", "key")
 
@@ -61,6 +69,7 @@ class BatchRunnerTest(unittest.TestCase):
                 2,
                 jobs,
                 output_root=str(output_root),
+                collaboration_rounds=COLLABORATION_ROUNDS.copy(),
             )
             summary = run_batch(config, "model", "key")
             saved_summary = json.loads(
@@ -83,6 +92,7 @@ class BatchRunnerTest(unittest.TestCase):
             1,
             (QueryJob("query_001"),),
             output_root="D:/results",
+            collaboration_rounds=COLLABORATION_ROUNDS.copy(),
         )
         summary = {
             "success_count": 0,

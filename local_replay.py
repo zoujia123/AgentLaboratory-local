@@ -15,8 +15,6 @@ from pathlib import Path
 from telemetry import current_trace_context, record_trace_event
 
 
-DEFAULT_REPLAY_ROOT = r"D:\work\HUST\MASLab_v2"
-
 _session_var = contextvars.ContextVar("agentlab_local_replay", default=None)
 
 
@@ -41,6 +39,27 @@ def _safe_name(value):
     return value or "unknown"
 
 
+def _runtime_sample_types(parquet_file, arrow_schema):
+    """Probe one decoded Dataset row without changing the materialized data."""
+    if not parquet_file.metadata.num_rows:
+        return {}, None
+    try:
+        import pyarrow as arrow
+        from datasets import Dataset
+
+        batch = next(parquet_file.iter_batches(batch_size=1), None)
+        if batch is None:
+            return {}, None
+        sample_table = arrow.Table.from_batches([batch], schema=arrow_schema)
+        sample = Dataset(sample_table)[0]
+        return {
+            name: type(sample.get(name)).__name__
+            for name in arrow_schema.names
+        }, None
+    except Exception as exc:  # Inspection should remain useful if decoding is unavailable.
+        return {}, f"{type(exc).__name__}: {exc}"
+
+
 def _arxiv_base_id(value):
     return re.sub(r"v\d+$", "", str(value).strip(), flags=re.IGNORECASE)
 
@@ -60,13 +79,10 @@ def _load_records(directory):
         return records
     for path in directory.glob("*.json"):
         payload = _json_file(path)
-        payload["_source_path"] = str(path)
         records.append(payload)
     records.sort(key=lambda item: (
         item.get("call_index") is None,
         item.get("call_index", 0),
-        item.get("recorded_at", ""),
-        item.get("_source_path", ""),
     ))
     for index, record in enumerate(records, start=1):
         record["_sequence_index"] = index
@@ -110,11 +126,8 @@ class LocalReplaySession:
         self.recording_id = str(recording_id)
         self.latency_mode = self.config.get("latency-mode", "recorded")
         self.latency_scale = float(self.config.get("latency-scale", 1.0))
-        self.arxiv_search_mode = self.config.get("arxiv-search-mode", "local-bm25")
 
-        self.recording_dir = (
-            self.root / "queries" / self.query_id / "recordings" / self.recording_id
-        )
+        self.recording_dir = (self.root / "queries" / self.query_id / "recordings" / self.recording_id)
         self.manifest_path = self.recording_dir / "recording_manifest.json"
         self.manifest = _json_file(self.manifest_path)
         self.user_query = str(self.manifest.get("user_query") or "").strip()
@@ -123,18 +136,15 @@ class LocalReplaySession:
             "arxiv.search": _load_records(self.recording_dir / "arxiv" / "searches"),
             "huggingface.search": _load_records(self.recording_dir / "huggingface" / "searches"),
         }
-        self._consumed = {
-            name: [False] * len(records)
-            for name, records in self.records.items()
-        }
-        self._match_lock = threading.Lock()
-        self._event_lock = threading.Lock()
-        self.events = []
-        self._reservation_counters = Counter()
+        self._consumed = {name: [False] * len(records) for name, records in self.records.items()} # 为每一种记录建立“是否已使用”的标记列表。这样同一条录制搜索不会被重复拿来模拟延迟或顺序
+        self._match_lock = threading.Lock() # 锁保证多个线程同时请求 arXiv/HF 回放时，不会同时看到同一个 False，然后重复拿到同一条录制记录。
+        self._event_lock = threading.Lock() # 这个锁避免多个线程同时 append() 或写 trace 时导致事件顺序、内容混乱。
+        self.events = []    # 这是本次运行产生的“回放事件日志”，不是原始录制数据。
+        self._reservation_counters = Counter()  # 表示“这是当前回放运行中的第几次请求”
 
         # 构建本地搜索索引
-        self.arxiv_documents = {}
-        self.arxiv_excluded = set()
+        self.arxiv_documents = {}   # arXiv 文档索引，键为 arxiv_id，值为文档内容（标题，作者，摘要，url等）。建索引、返回搜索结果、读取摘要
+        self.arxiv_excluded = set() # 构造不可用论文黑名单 arxiv_excluded。比如读取论文显示404
         self.hf_excluded = set()
         self.hf_candidates = set()
         excluded_dir = self.recording_dir / "arxiv" / "excluded"
@@ -152,8 +162,8 @@ class LocalReplaySession:
                     and arxiv_id not in self.arxiv_documents
                 ):
                     self.arxiv_documents[arxiv_id] = copy.deepcopy(result)
-        self.arxiv_candidates = set(self.arxiv_documents)
-        self._initialize_arxiv_search()
+        self.arxiv_candidates = set(self.arxiv_documents)   # 过滤、去重，构造可用论文库 arxiv_documents为arxiv_candidates。arxiv_candidates只有iD，用于快速判断某篇论文是否属于当前 query 的允许候选池
+        self._initialize_arxiv_search() # 建立一个“内存中的全文检索数据库”，用于快速检索 arXiv 文档。
 
         hf_excluded_dir = self.recording_dir / "huggingface" / "excluded"
         for path in hf_excluded_dir.glob("*.json"):
@@ -162,13 +172,12 @@ class LocalReplaySession:
             if dataset_id:
                 self.hf_excluded.add(str(dataset_id))
         for record in self.records["huggingface.search"]:
-            self.hf_candidates.update(
+            self.hf_candidates.update(  # 先把录制搜索中出现过、且没有被排除的数据集 ID 汇总成候选池
                 result.get("id")
                 for result in record.get("results", [])
                 if result.get("id") and result.get("id") not in self.hf_excluded
-            )
-        self._load_event_candidates()
-        self._initialize_hf_search()
+            )   
+        self._initialize_hf_search()    # 建立一个只搜索本地候选数据集的内存全文索引
 
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["HF_DATASETS_OFFLINE"] = "1"
@@ -178,20 +187,16 @@ class LocalReplaySession:
         query_id = config.get("query-id")
         recording_id = config.get("recording-id")
 
-        root = config.get("root", DEFAULT_REPLAY_ROOT)
+        root = config["root"]
         if recording_id == "latest":
             recording_id = cls.latest_complete_recording(root, query_id)
-        return cls(
-            root=root,
-            query_id=query_id,
-            recording_id=recording_id,
-            config=config,
-        )
+        return cls(root=root, query_id=query_id, recording_id=recording_id, config=config,) # 实例化一个LocalReplay对象
 
+    # 获取最新的完整录制记录ID
     @staticmethod
     def latest_complete_recording(root, query_id):
         recordings_dir = Path(root).resolve() / "queries" / str(query_id) / "recordings"
-        candidates = []
+        candidates = [] # 用于存储所有完整录制记录的ID
         for manifest_path in recordings_dir.glob("*/recording_manifest.json"):
             manifest = _json_file(manifest_path)
             if manifest.get("status") != "complete":
@@ -200,31 +205,12 @@ class LocalReplaySession:
                 str(manifest.get("ended_at") or manifest.get("workflow_ended_at") or ""),
                 manifest_path.parent.name,
             ))
-        return max(candidates)[1]
-
-    def _load_event_candidates(self):
-        events_path = self.recording_dir / "events.jsonl"
-        if not events_path.exists():
-            return
-        try:
-            with open(events_path, "r", encoding="utf-8") as source:
-                for line in source:
-                    event = json.loads(line)
-                    if event.get("event_type") != "huggingface.candidate":
-                        continue
-                    candidate = event.get("candidate") or {}
-                    if candidate.get("source") == "tool_index":
-                        continue
-                    dataset_id = candidate.get("id")
-                    if dataset_id and dataset_id not in self.hf_excluded:
-                        self.hf_candidates.add(dataset_id)
-        except (OSError, ValueError) as exc:
-            raise LocalReplayIntegrityError(f"Cannot read {events_path}: {exc}") from exc
+        return max(candidates)[1]   # 返回candidates中最新的完整录制记录ID
 
     def _initialize_arxiv_search(self):
-        self._arxiv_db_lock = threading.Lock()
-        self._arxiv_db = sqlite3.connect(":memory:", check_same_thread=False)
-        try:
+        self._arxiv_db_lock = threading.Lock()  # 给 SQLite 查询加锁。因为后续可能有多个线程同时调用本地 arXiv 搜索
+        self._arxiv_db = sqlite3.connect(":memory:", check_same_thread=False)   # 创建 SQLite 数据库连接。memory表示数据库只存在内存中，不会生成 .db 文件。LocalReplaySession 结束后它就消失。
+        try: # 创建一个 SQLite FTS5 全文搜索虚拟表，表逻辑上类似arxivid,abstract.abstract是检索字段。使用 Porter 英文词干分析器
             self._arxiv_db.execute(
                 "CREATE VIRTUAL TABLE arxiv_abstracts USING "
                 "fts5(arxiv_id UNINDEXED, abstract, tokenize=porter)"
@@ -237,31 +223,31 @@ class LocalReplaySession:
             (arxiv_id, str(document.get("abstract") or ""))
             for arxiv_id, document in sorted(self.arxiv_documents.items())
         ]
-        self._arxiv_db.executemany(
+        self._arxiv_db.executemany( # 批量插入所有论文摘要。
             "INSERT INTO arxiv_abstracts(arxiv_id, abstract) VALUES (?, ?)", rows
-        )
-        self._arxiv_db.commit()
+        ) # 更具query的关键词，匹配absetract，找到对应的论文。
+        self._arxiv_db.commit() # 提交本次插入事务。提交后，后续代码就能执行 FTS5 的：SELECT操作。phd调用 search_arxiv(query=检索词)。在 arxiv_abstracts 里做本地 FTS5/BM25 检索。
 
     def _initialize_hf_search(self):
-        details = {}
-        for record in self.records["huggingface.search"]:
+        details = {}    # 用于汇总每个候选数据集的元数据。
+        for record in self.records["huggingface.search"]:   # 遍历历史录制的 Hugging Face 搜索记录。每条 record 内有若干搜索候选 result。
             for result in record.get("results", []):
                 dataset_id = result.get("id")
-                if dataset_id and dataset_id in self.hf_candidates:
+                if dataset_id and dataset_id in self.hf_candidates: # 只保留当前 query 被允许使用的本地候选，避免搜索到别的 query 的数据集。
                     details.setdefault(dataset_id, {}).update(copy.deepcopy(result))
-        for dataset_id in sorted(self.hf_candidates):
+        for dataset_id in sorted(self.hf_candidates):   # 遍历全部候选 ID。
             entry = details.setdefault(dataset_id, {"id": dataset_id})
-            dataset_dir = self.root / "objects" / "huggingface" / _safe_name(dataset_id)
-            manifests = []
+            dataset_dir = self.root / "objects" / "huggingface" / _safe_name(dataset_id)    # 定位本地已物化的数据集对象目录
+            manifests = []  # 遍历该数据集各 revision 的本地 manifest
             for path in dataset_dir.glob("*/manifest.json"):
                 manifest = _json_file(path)
-                if manifest.get("snapshot_status") == "complete":
+                if manifest.get("snapshot_status") == "complete":   # 只保留完整物化成功的 snapshot。
                     manifests.append(manifest)
             if manifests:
                 manifest = min(
                     manifests,
                     key=lambda item: str(item.get("revision") or ""),
-                )
+                )   # 从多个完整 revision 中选择 revision 字符串字典序最小的一个。
                 entry.setdefault("revision", manifest.get("revision"))
                 materialized = manifest.get("materialized") or {}
                 entry.setdefault("configs", sorted(materialized))
@@ -713,6 +699,13 @@ class LocalReplaySession:
             if _safe_name(item["config_name"]) == config_key
             and item["split"] == split
         )
+        primary_manifest = materialized[config_key][split]
+        primary_path = (self.root / primary_manifest["path"]).resolve()
+        primary_file = parquet.ParquetFile(str(primary_path))
+        runtime_sample_types, runtime_sample_type_error = _runtime_sample_types(
+            primary_file,
+            primary_file.schema_arrow,
+        )
         schema_keys = {}
         materialized_schemas = {}
         compact_resources = []
@@ -730,7 +723,7 @@ class LocalReplaySession:
                 "row_count": resource["dataset_schema"]["row_count"],
                 "schema_key": schema_key,
             })
-        return {
+        result = {
             "dataset_id": dataset_id,
             "config_name": config_name,
             "split": split,
@@ -738,9 +731,16 @@ class LocalReplaySession:
             "available_configs": sorted(materialized),
             "available_splits": sorted(materialized[config_key]),
             "dataset_schema": primary["dataset_schema"],
+            # Keep the existing field for compatibility while naming the storage
+            # representation explicitly for models that also receive runtime types.
+            "stored_schema": primary["dataset_schema"],
+            "runtime_sample_types": runtime_sample_types,
             "materialized_resources": compact_resources,
             "materialized_schemas": materialized_schemas,
         }
+        if runtime_sample_type_error:
+            result["runtime_sample_type_error"] = runtime_sample_type_error
+        return result
 
     def record_worker_events(self, events):
         trace_context = current_trace_context()
@@ -821,7 +821,7 @@ class WorkerDatasetReplay:
     def __init__(self, context, original_load_dataset):
         self.context = context or {}
         self.original_load_dataset = original_load_dataset
-        self.root = Path(self.context.get("root") or DEFAULT_REPLAY_ROOT).resolve()
+        self.root = Path(self.context["root"]).resolve()
         self.events = []
 
     def _event(self, **event):

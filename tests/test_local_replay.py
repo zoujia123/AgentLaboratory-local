@@ -1,15 +1,18 @@
 import json
+import io
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from datasets import Dataset
+from datasets import Dataset, Features, Image as HFImage, Value
+from PIL import Image as PILImage
 
 from local_replay import (
     LocalReplayMismatch,
     LocalReplaySession,
+    _runtime_sample_types,
     local_replay_scope,
 )
 from tools import ArxivSearch, HFDataSearch, execute_code
@@ -101,7 +104,7 @@ class LocalReplayTest(unittest.TestCase):
                 "schema_version": 1,
                 "call_index": 1,
                 "query": "small dataset",
-                "max_results": 1,
+                "max_results": 2,
                 "latency_ms": 15.0,
                 "success": True,
                 "results": [{
@@ -115,21 +118,14 @@ class LocalReplayTest(unittest.TestCase):
                     "test_element_size": None,
                     "train_download_size": "1 KiB",
                     "train_element_size": 2,
+                }, {
+                    "id": "owner/fallback",
+                    "description": "auxiliary records",
                 }],
             },
         )
         self._write_hf_object("owner/recorded", "revision-one", [1, 2])
         self._write_hf_object("owner/fallback", "revision-two", [3, 4, 5])
-        events = [{
-            "event_type": "huggingface.candidate",
-            "candidate": {"id": "owner/fallback", "source": "generated_code"},
-        }, {
-            "event_type": "huggingface.candidate",
-            "candidate": {"id": "owner/tool-index", "source": "tool_index"},
-        }]
-        (self.recording_dir / "events.jsonl").write_text(
-            "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
-        )
 
     def _write_arxiv_object(self, arxiv_id, text):
         object_dir = self.root / "objects" / "arxiv" / arxiv_id
@@ -313,15 +309,15 @@ class LocalReplayTest(unittest.TestCase):
         with self.assertRaisesRegex(LocalReplayMismatch, "was excluded"):
             session.select_hf_dataset("owner/recorded", "default", "train")
 
-    def test_hf_search_uses_query_candidates_without_recorded_search_calls(self):
+    def test_hf_search_has_no_candidates_without_recorded_search_calls(self):
         search_dir = self.recording_dir / "huggingface" / "searches"
         for path in search_dir.glob("*.json"):
             path.unlink()
         session = self.make_session()
         with local_replay_scope(session):
             results = HFDataSearch().retrieve_ds("fallback", N=2)
-        self.assertEqual(results[0]["id"], "owner/fallback")
-        self.assertNotIn("owner/tool-index", session.hf_candidates)
+        self.assertEqual(results, [])
+        self.assertEqual(session.hf_candidates, set())
         self.assertEqual(session.events[-1]["latency_match_kind"], "synthetic_median")
 
     def test_generated_code_loads_candidate_objects_directly(self):
@@ -463,6 +459,8 @@ print(len(recorded), len(fallback), sum(recorded['value']), sum(fallback['value'
             selection["dataset_schema"],
             {"row_count": 1, "columns": {"value": "int64"}},
         )
+        self.assertEqual(selection["stored_schema"], selection["dataset_schema"])
+        self.assertEqual(selection["runtime_sample_types"], {"value": "int"})
         with local_replay_scope(session):
             output = execute_code(
                 "from datasets import load_dataset\n"
@@ -483,6 +481,78 @@ print(len(recorded), len(fallback), sum(recorded['value']), sum(fallback['value'
             pinned["dataset_schema"],
             {"row_count": 2, "columns": {"value": "int64"}},
         )
+        self.assertEqual(pinned["runtime_sample_types"], {"value": "int"})
+
+    def test_hf_inspection_reports_decoded_image_runtime_type(self):
+        object_dir = (
+            self.root
+            / "objects"
+            / "huggingface"
+            / "owner--image"
+            / "revision-image"
+        )
+        parquet_path = object_dir / "materialized" / "default" / "train.parquet"
+        parquet_path.parent.mkdir(parents=True, exist_ok=True)
+        image_bytes = io.BytesIO()
+        PILImage.new("RGB", (2, 2), (1, 2, 3)).save(image_bytes, format="PNG")
+        dataset = Dataset.from_dict(
+            {
+                "img": [{"bytes": image_bytes.getvalue(), "path": "sample.png"}],
+                "label": [1],
+            },
+            features=Features({"img": HFImage(), "label": Value("int64")}),
+        )
+        dataset.to_parquet(str(parquet_path))
+        self._write_json(
+            object_dir / "manifest.json",
+            {
+                "dataset_id": "owner/image",
+                "revision": "revision-image",
+                "snapshot_status": "complete",
+                "materialized": {
+                    "default": {
+                        "train": {
+                            "path": str(parquet_path.relative_to(self.root)),
+                            "rows": 1,
+                        }
+                    }
+                },
+            },
+        )
+        session = self.make_session()
+        session.hf_candidates.add("owner/image")
+        selection = session.select_hf_dataset(
+            "owner/image",
+            "default",
+            "train",
+            revision="revision-image",
+        )
+        self.assertEqual(
+            selection["runtime_sample_types"],
+            {"img": "PngImageFile", "label": "int"},
+        )
+
+    def test_runtime_sample_probe_handles_empty_and_broken_inputs(self):
+        class EmptyParquet:
+            class Metadata:
+                num_rows = 0
+
+            metadata = Metadata()
+
+        self.assertEqual(_runtime_sample_types(EmptyParquet(), None), ({}, None))
+
+        class BrokenParquet:
+            class Metadata:
+                num_rows = 1
+
+            metadata = Metadata()
+
+            def iter_batches(self, **kwargs):
+                raise RuntimeError("probe failed")
+
+        types, error = _runtime_sample_types(BrokenParquet(), None)
+        self.assertEqual(types, {})
+        self.assertEqual(error, "RuntimeError: probe failed")
 
     def test_generated_code_loads_additional_materialized_config(self):
         object_dir = (

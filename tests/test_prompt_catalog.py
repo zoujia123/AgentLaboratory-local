@@ -33,17 +33,26 @@ class PromptCatalogTest(unittest.TestCase):
         for prompt in (ml, sw):
             self.assertNotIn("configure_dataset_contract", prompt)
             self.assertIn("seed", prompt.lower())
+            self.assertIn("Runtime object discipline", prompt)
+            self.assertIn("Dataset.map(batched=True)", prompt)
+            self.assertIn("runtime_sample_types", prompt)
+            self.assertIn("stored_schema", prompt)
 
     def test_experiment_prompts_preserve_old_solver_quality_constraints(self):
         prompt = experiment_solver_prompt()
         self.assertIn("Implement every experiment", prompt)
         self.assertIn("literature review", prompt)
         self.assertIn("dataset code is automatically prepended", prompt)
+        self.assertIn("do not choose BERT", prompt)
+        self.assertIn("scikit-learn-compatible model trainable from scratch", prompt)
+        self.assertIn("comparing input representations", prompt)
         self.assertIn("Figure_1.png", prompt)
         self.assertIn("Figure_2.png", prompt)
         self.assertIn("0% accuracy", prompt)
         self.assertIn("explain what the metric", prompt)
         self.assertIn("reflect on errors", prompt)
+        self.assertIn("PIL.Image.Image", prompt)
+        self.assertIn("list of records", prompt)
 
         supplement = supplementary_experiment_solver_prompt("supplement_01")
         self.assertIn("supplementary experiment", supplement)
@@ -51,6 +60,7 @@ class PromptCatalogTest(unittest.TestCase):
         self.assertIn("never replace", supplement)
         self.assertIn("supplement_01_figure.png", supplement)
         self.assertIn("Never fabricate", supplement)
+        self.assertIn("Runtime object discipline", supplement)
 
         reward = experiment_reward_prompt()
         self.assertIn("research plan", reward)

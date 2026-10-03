@@ -13,10 +13,19 @@ seeds:
   pytorch: 5001
   pytorch-deterministic: true
 
+
+llm_sampling:
+  temperature: 0.1
+  top_p: 1
+  max_tokens: 8192
+
+collaboration_rounds:
+  plan_max_rounds: 8
+  data_preparation_max_rounds: 12
+  interpretation_max_phd_reviews: 8
+
 queries:
-
-
-  - query-id: query_001
-    recording-id: latest 
+  - query-id: query_018
+    recording-id: latest
 
 

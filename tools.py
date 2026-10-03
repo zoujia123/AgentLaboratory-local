@@ -40,9 +40,10 @@ def execution_capabilities():
         "torch",
         "torchvision",
         "transformers",
-    )
+    )   # 要检查的模块名单
     available = []
     unavailable = []
+    # find_spec() 检查当前执行环境是否包含指定的模块
     for module in modules:
         target = (
             available
@@ -50,6 +51,7 @@ def execution_capabilities():
             else unavailable
         )
         target.append(module)
+    # 真正 import datasets。因为后面需要读取版本号。
     datasets_module = (
         importlib.import_module("datasets")
         if "datasets" in available
@@ -59,10 +61,10 @@ def execution_capabilities():
         "available_modules": available,
         "unavailable_modules": unavailable,
         "datasets_version": getattr(datasets_module, "__version__", None),
-        "required_dataset_loader": "datasets.load_dataset",
-        "pretrained_model_assets": [],
-        "pretrained_model_loading": False,
-        "network": False,
+        "required_dataset_loader": "datasets.load_dataset",         # 必须用 datasets.load_dataset
+        "pretrained_model_assets": [],  
+        "pretrained_model_loading": False,  # 没有预训练权重
+        "network": False,   # 禁止网络和安装包。
         "package_installation": False,
     }
 
@@ -110,8 +112,8 @@ class HFDataSearch:
 
 class ArxivSearch:
     def __init__(self):
-        self.replay = current_local_replay(required=True)
-        self._full_text_cache = {}
+        self.replay = current_local_replay(required=True)   # 当前 query 的本地回放会话对象，一个 LocalReplaySession 对象
+        self._full_text_cache = {}  # 本轮文献综述期间临时保存“已读取论文全文”的内存字典。
 
     @staticmethod
     def _paper_cache_keys(query):

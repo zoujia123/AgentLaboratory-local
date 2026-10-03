@@ -457,6 +457,58 @@ class AgentRuntimeTest(unittest.TestCase):
         self.assertEqual(recovery["repair_attempt"], 1)
         self.assertEqual(recovery["executed_tools"], [])
 
+    def test_coalesces_registered_atomic_edit_calls(self):
+        actions = []
+
+        def coalesce_edits(argument_batches):
+            edits = []
+            for arguments in argument_batches:
+                if set(arguments) != {"edits"}:
+                    return None
+                edits.extend(arguments["edits"])
+            return {"edits": edits} if len(edits) <= 6 else None
+
+        registry = ToolRegistry().register(
+            "edit",
+            "Atomically edit code",
+            schema({"edits": {"type": "array"}}, ["edits"]),
+            lambda edits: actions.append(edits) or {"success": True},
+            batch_coalescer=coalesce_edits,
+        )
+        response = ToolModelResponse(
+            "",
+            [
+                ModelToolCall(
+                    f"call-{index}",
+                    "edit",
+                    json.dumps({"edits": [{
+                        "old_text": f"old-{index}",
+                        "new_text": f"new-{index}",
+                    }]}),
+                )
+                for index in range(1, 6)
+            ],
+        )
+        recorder = MagicMock()
+        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        with patch(
+            "agent_runtime.query_model_with_tools",
+            return_value=response,
+        ), patch("agent_runtime.current_prompt_recorder", return_value=recorder):
+            result = runtime.run("system", "user", registry, {"edit"})
+
+        self.assertTrue(result.value["success"])
+        self.assertEqual(result.tool_name, "edit")
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(
+            [edit["old_text"] for edit in actions[0]],
+            [f"old-{index}" for index in range(1, 6)],
+        )
+        events = [call.args[0] for call in recorder.record.call_args_list]
+        coalesced = next(event for event in events if event["event"] == "tool_calls_coalesced")
+        self.assertEqual(coalesced["source_call_count"], 5)
+        self.assertFalse(any(event["event"] == "tool_protocol_recovery" for event in events))
+
     def test_repeated_non_batchable_batches_exhaust_protocol_repair_budget(self):
         actions = []
         registry = ToolRegistry().register(

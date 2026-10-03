@@ -1,3 +1,0 @@
-agent,phase,name,trigger,count,success_count,failure_count,total_ms,avg_ms,p50_ms,p95_ms,max_ms
-LaboratoryWorkflow,workflow,arxiv.full_text,framework_automatic,3,3,0,56231.998,18743.999,4432.716,49236.507,49236.507
-LaboratoryWorkflow,workflow,arxiv.search,framework_automatic,3,3,0,11197.416,3732.472,3304.223,4722.873,4722.873

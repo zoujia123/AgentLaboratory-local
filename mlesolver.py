@@ -5,6 +5,10 @@ import re
 from pathlib import Path
 
 from agent_runtime import AgentRuntime, ToolRegistry
+from execution_diagnostics import (
+    classify_runtime_data_failure,
+    runtime_data_repair_hint,
+)
 from prompts import (
     experiment_reward_prompt,
     experiment_solver_prompt,
@@ -12,6 +16,9 @@ from prompts import (
 )
 from tools import execute_code, execution_capabilities
 from run_logging import current_prompt_recorder, current_run_logger
+
+
+EXPERIMENT_EXECUTION_TIMEOUT_SECONDS = 2000
 
 
 def _compact_solver_traceback(traceback_text):
@@ -81,6 +88,82 @@ def _solver_execution_feedback(result, phase):
     return {**result, "traceback": compact}
 
 
+def _bounded_solver_diagnostic(value, limit=4000):
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    head = max(1, int(limit * 0.75))
+    tail = max(1, limit - head)
+    return text[:head] + "\n...[truncated]...\n" + text[-tail:]
+
+
+def _latest_execution_diagnostic(execution_result):
+    return {
+        "error_type": execution_result.get("error_type"),
+        "error": _bounded_solver_diagnostic(execution_result.get("error")),
+        "traceback": _bounded_solver_diagnostic(
+            execution_result.get("traceback"),
+            limit=6000,
+        ),
+        "failure_category": execution_result.get("failure_category"),
+        "repair_hint": execution_result.get("repair_hint"),
+        "same_category_count": execution_result.get("same_category_count"),
+        "full_replacement_required": execution_result.get(
+            "full_replacement_required"
+        ),
+        "code_hash": execution_result.get("code_hash"),
+    }
+
+
+def _latest_experiment_failure_messages(
+    system_prompt,
+    base_user_prompt,
+    current_code,
+    execution_result,
+    action_rejection=None,
+):
+    diagnostic = _latest_execution_diagnostic(execution_result)
+    rejection_text = ""
+    if action_rejection:
+        rejection = {
+            "error_type": action_rejection.get("error_type"),
+            "error": action_rejection.get("error"),
+            "repair_hint": action_rejection.get("repair_hint"),
+            "original_error_type": action_rejection.get("original_error_type"),
+            "original_error": action_rejection.get("original_error"),
+            "original_failure_category": action_rejection.get(
+                "original_failure_category"
+            ),
+            "original_repair_hint": action_rejection.get("original_repair_hint"),
+            "code_hash": action_rejection.get("code_hash"),
+        }
+        if action_rejection.get("original_execution_diagnostic"):
+            rejection["original_execution_diagnostic"] = action_rejection[
+                "original_execution_diagnostic"
+            ]
+        rejection_text = (
+            "\n\nLatest code action rejection:\n"
+            + json.dumps(rejection, ensure_ascii=True, default=str)
+        )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": base_user_prompt},
+        {
+            "role": "user",
+            "content": (
+                "Authoritative experiment recovery state:\n"
+                "Earlier execution failures are superseded by this diagnostic. "
+                "Do not rely on earlier errors.\n\n"
+                "Current experiment code:\n```python\n"
+                + str(current_code)
+                + "\n```\n\nLatest execution diagnostic:\n"
+                + json.dumps(diagnostic, ensure_ascii=True, default=str)
+                + rejection_text
+            ),
+        },
+    ]
+
+
 def _schema(properties, required):
     return {
         "type": "object",
@@ -94,12 +177,80 @@ def _string(description):
     return {"type": "string", "description": description}
 
 
+def _coalesce_experiment_edit_batches(argument_batches):
+    """Safely flatten repeated atomic edit calls into one edit request."""
+    edits = []
+    seen_old_text = set()
+    for arguments in argument_batches:
+        if not isinstance(arguments, dict) or set(arguments) != {"edits"}:
+            return None
+        batch = arguments.get("edits")
+        if not isinstance(batch, list) or not batch:
+            return None
+        for edit in batch:
+            if not isinstance(edit, dict) or set(edit) != {"old_text", "new_text"}:
+                return None
+            old_text = edit.get("old_text")
+            new_text = edit.get("new_text")
+            if (
+                not isinstance(old_text, str)
+                or not old_text
+                or not isinstance(new_text, str)
+                or old_text in seen_old_text
+            ):
+                return None
+            seen_old_text.add(old_text)
+            edits.append(edit)
+    if not 1 <= len(edits) <= 6:
+        return None
+    return {"edits": edits}
+
+
 # 提前检测 LLM 生成的实验代码有没有语法问题
+_SYNTAX_CONTEXT_RADIUS = 2
+_SYNTAX_CONTEXT_LINE_LIMIT = 180
+
+
+def _syntax_error_context(source, error):
+    """Return a small, line-numbered source window for a syntax repair."""
+    line_number = getattr(error, "lineno", None)
+    if not isinstance(line_number, int) or line_number < 1:
+        return ""
+
+    lines = str(source).splitlines()
+    if line_number > len(lines):
+        return ""
+
+    error_index = line_number - 1
+    start = max(0, error_index - _SYNTAX_CONTEXT_RADIUS)
+    end = min(len(lines), error_index + _SYNTAX_CONTEXT_RADIUS + 1)
+    rendered = []
+    offset = getattr(error, "offset", None)
+
+    for index in range(start, end):
+        text = lines[index].expandtabs(4)
+        if len(text) > _SYNTAX_CONTEXT_LINE_LIMIT:
+            text = text[:_SYNTAX_CONTEXT_LINE_LIMIT] + "..."
+        marker = "->" if index == error_index else "  "
+        prefix = f"{marker} {index + 1}: "
+        rendered.append(prefix + text)
+        if index == error_index and isinstance(offset, int) and offset > 0:
+            caret_column = min(offset - 1, len(text))
+            rendered.append(" " * len(prefix) + " " * caret_column + "^")
+
+    return "\n".join(rendered)
+
+
 def _python_syntax_error(code):
+    source = str(code)
     try:
-        ast.parse(str(code))
+        ast.parse(source)
     except SyntaxError as exc:
-        return f"Generated experiment code is invalid Python: {exc}"
+        context = _syntax_error_context(source, exc)
+        message = f"Generated experiment code is invalid Python: {exc}"
+        if context:
+            message += "\nSyntax source context:\n" + context
+        return message
     return None
 
 
@@ -109,11 +260,21 @@ def _code_hash(code):
 
 def _execution_failure_category(output):
     text = str(output or "").casefold()
+    runtime_data_category = classify_runtime_data_failure(text)
+    if runtime_data_category is not None:
+        return runtime_data_category
     patterns = (
         ("non_numeric_model_input", ("could not convert string to float",)),
         ("tensor_shape_mismatch", ("shapes cannot be multiplied", "size mismatch")),
         ("resource_exhaustion", ("not enough memory", "out of memory")),
         ("data_representation_error", ("cannot handle this data type",)),
+        (
+            "evaluation_subset_alignment",
+            (
+                "inconsistent numbers of samples",
+                "found input variables with inconsistent numbers of samples",
+            ),
+        ),
         ("unavailable_model_asset", ("from_pretrained", "can't load tokenizer")),
         ("unavailable_dependency", ("no module named", "cannot import name")),
         ("seed_policy", ("seed policy violations",)),
@@ -126,6 +287,9 @@ def _execution_failure_category(output):
 
 
 def _failure_repair_hint(category):
+    runtime_data_hint = runtime_data_repair_hint(category)
+    if runtime_data_hint is not None:
+        return runtime_data_hint
     return {
         "non_numeric_model_input": (
             "Build one consistent numeric feature representation for every required "
@@ -143,6 +307,12 @@ def _failure_repair_hint(category):
         "data_representation_error": (
             "Inspect the actual array layout and dtype, then rebuild the complete "
             "conversion pipeline consistently."
+        ),
+        "evaluation_subset_alignment": (
+            "Build one boolean mask from the evaluation split and use that same mask "
+            "to subset y_true, y_pred, and every aligned group label. Verify equal "
+            "lengths before computing metrics; do not use an indexer derived from "
+            "the full split to index a group-filtered subset."
         ),
         "unavailable_model_asset": (
             "Use a model trained from scratch with available local modules; no "
@@ -182,14 +352,23 @@ def _record_execution_result(
         "process_exit", "missing_result", "invalid_result", "result_transport_error",
         "execution_environment_error", "worker_setup_error", "result_collection_error",
     }
-    if not infrastructure_error:
-        current["failed_hashes"].add(fingerprint)
     diagnostic_text = "\n".join(text for text in (error, traceback_text) if text)
     category = (
         "execution_infrastructure_error" if infrastructure_error
         else "timeout" if error_type == "timeout"
         else _execution_failure_category(diagnostic_text)
     )
+    repair_hint = _failure_repair_hint(category)
+    if not infrastructure_error:
+        current["failed_hashes"].add(fingerprint)
+        current.setdefault("failed_failures", {})[fingerprint] = {
+            "success": False,
+            "error_type": error_type,
+            "error": error,
+            "traceback": _compact_solver_traceback(str(traceback_text or "")),
+            "failure_category": category,
+            "repair_hint": repair_hint,
+        }
     if category == current.get("last_failure_category"):
         count = current.get("consecutive_failure_category_count", 0) + 1
     else:
@@ -201,7 +380,7 @@ def _record_execution_result(
             "code_execution_error", "execution_infrastructure_error",
         },
     )
-    return category, _failure_repair_hint(category)
+    return category, repair_hint
 
 
 class MLESolverAgent:
@@ -216,28 +395,66 @@ class MLESolverAgent:
             "success": None,
             "code_hash": None,
             "failed_hashes": set(),
+            "failed_failures": {},
             "last_failure_category": None,
             "consecutive_failure_category_count": 0,
             "force_replace": False,
+            "latest_execution_failure": None,
         }
+
+        def rejected_experiment_code(fingerprint, action):
+            previously_failed = fingerprint in current["failed_hashes"]
+            latest_failure = current.get("latest_execution_failure")
+            if previously_failed:
+                original_failure = dict(
+                    current.get("failed_failures", {}).get(fingerprint) or {}
+                )
+                original_error = original_failure.get("error") or "the original failure"
+                result = {
+                    "success": False,
+                    "error_type": "unchanged_failed_experiment_code",
+                    "error": (
+                        "This exact experiment code previously failed and was not "
+                        "executed again."
+                    ),
+                    "repair_hint": (
+                        "Do not submit this code hash again. Apply atomic edits or "
+                        "write a materially different replacement that resolves the "
+                        f"original failure: {original_error}"
+                    ),
+                    "original_error_type": original_failure.get("error_type"),
+                    "original_error": original_failure.get("error"),
+                    "original_failure_category": original_failure.get(
+                        "failure_category"
+                    ),
+                    "original_repair_hint": original_failure.get("repair_hint"),
+                    "code_hash": fingerprint,
+                    "action": action,
+                }
+                if original_failure:
+                    result["original_execution_diagnostic"] = original_failure
+                if latest_failure:
+                    result["latest_execution_diagnostic"] = dict(latest_failure)
+                return result
+            return {
+                "success": False,
+                "error_type": "unchanged_current_experiment_code",
+                "error": "The proposed experiment code is unchanged from the current draft.",
+                "repair_hint": "Make a substantive code change before retrying.",
+                "code_hash": fingerprint,
+                "action": action,
+            }
 
         def execute_current_experiment():
             if not current["code"]:
                 return {"success": False, "error": "Create experiment code first"}
             fingerprint = _code_hash(current["code"])
             if fingerprint in current["failed_hashes"]:
-                return {
-                    "success": False,
-                    "error": (
-                        "Experiment code is unchanged since its previous failed "
-                        "execution. Edit or replace it before retrying."
-                    ),
-                    "code_hash": fingerprint,
-                }
+                return rejected_experiment_code(fingerprint, "execute_experiment_code")
             combined = state.dataset_code + "\n\n" + current["code"]
             execution = execute_code(
                 combined,
-                timeout=600,
+                timeout=EXPERIMENT_EXECUTION_TIMEOUT_SECONDS,
                 workdir=workdir,
                 return_details=True,
             )
@@ -252,7 +469,7 @@ class MLESolverAgent:
                 error=execution["error"],
                 traceback_text=execution["traceback"],
             )
-            return _solver_execution_feedback({
+            feedback = _solver_execution_feedback({
                 "success": success,
                 "error_type": execution["error_type"],
                 "error": execution["error"],
@@ -267,23 +484,30 @@ class MLESolverAgent:
                 ],
                 "full_replacement_required": current["force_replace"],
             }, "running experiments")
+            if success:
+                current["latest_execution_failure"] = None
+            else:
+                current["latest_execution_failure"] = _latest_execution_diagnostic(
+                    feedback
+                )
+            return feedback
 
         def replace_experiment_code(code):
             syntax_error = _python_syntax_error(code)
             if syntax_error:
-                return {"success": False, "error": syntax_error}
+                return {
+                    "success": False,
+                    "error_type": "syntax_error",
+                    "error": syntax_error,
+                }
             fingerprint = _code_hash(code)
             if fingerprint in {
                 current.get("code_hash"),
             } or fingerprint in current["failed_hashes"]:
-                return {
-                    "success": False,
-                    "error": (
-                        "Replacement experiment code is unchanged from the current "
-                        "or previously failed draft. Make a substantive correction."
-                    ),
-                    "code_hash": fingerprint,
-                }
+                return rejected_experiment_code(
+                    fingerprint,
+                    "replace_experiment_code",
+                )
             current.update(
                 code=code,
                 output="",
@@ -297,31 +521,87 @@ class MLESolverAgent:
                 "code_hash": fingerprint,
             }
 
-        def edit_experiment_code(old_text, new_text):
+        def edit_experiment_code(edits):
             if not current["code"]:
                 return {"success": False, "error": "Create experiment code first"}
-            occurrences = current["code"].count(old_text)
-            if occurrences != 1:
+            if not isinstance(edits, list) or not edits:
                 return {
                     "success": False,
-                    "error": f"old_text must match exactly once; matched {occurrences}",
+                    "error": "edits must contain at least one edit object",
                 }
-            edited = current["code"].replace(old_text, new_text, 1)
+            if len(edits) > 6:
+                return {
+                    "success": False,
+                    "error": "edits may contain at most 6 changes",
+                }
+
+            source = current["code"]
+            seen_old_text = set()
+            planned_edits = []
+            for index, edit in enumerate(edits, start=1):
+                if not isinstance(edit, dict) or set(edit) != {"old_text", "new_text"}:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"edit {index} must contain only old_text and new_text"
+                        ),
+                    }
+                old_text = edit["old_text"]
+                new_text = edit["new_text"]
+                if not isinstance(old_text, str) or not isinstance(new_text, str):
+                    return {
+                        "success": False,
+                        "error": f"edit {index} old_text and new_text must be strings",
+                    }
+                if not old_text:
+                    return {
+                        "success": False,
+                        "error": f"edit {index} old_text must not be empty",
+                    }
+                if old_text in seen_old_text:
+                    return {
+                        "success": False,
+                        "error": "Each edit old_text must be unique within one batch",
+                    }
+                seen_old_text.add(old_text)
+                occurrences = source.count(old_text)
+                if occurrences != 1:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"edit {index} old_text must match exactly once; "
+                            f"matched {occurrences}"
+                        ),
+                    }
+                start = source.index(old_text)
+                planned_edits.append((start, start + len(old_text), new_text))
+
+            planned_edits.sort(key=lambda item: item[0])
+            for previous, following in zip(planned_edits, planned_edits[1:]):
+                if following[0] < previous[1]:
+                    return {
+                        "success": False,
+                        "error": "Batch edits overlap in the current experiment code",
+                    }
+
+            edited = source
+            for start, end, new_text in reversed(planned_edits):
+                edited = edited[:start] + new_text + edited[end:]
             syntax_error = _python_syntax_error(edited)
             if syntax_error:
-                return {"success": False, "error": syntax_error}
+                return {
+                    "success": False,
+                    "error_type": "syntax_error",
+                    "error": syntax_error,
+                }
             fingerprint = _code_hash(edited)
             if fingerprint in {
                 current.get("code_hash"),
             } or fingerprint in current["failed_hashes"]:
-                return {
-                    "success": False,
-                    "error": (
-                        "The edited experiment code matches the current or a "
-                        "previously failed version"
-                    ),
-                    "code_hash": fingerprint,
-                }
+                return rejected_experiment_code(
+                    fingerprint,
+                    "edit_experiment_code",
+                )
             current.update(
                 code=edited,
                 output="",
@@ -330,8 +610,12 @@ class MLESolverAgent:
             )
             return {
                 "success": True,
-                "message": "Experiment code edited; automatic execution is next",
+                "message": (
+                    f"Applied {len(planned_edits)} experiment edits atomically; "
+                    "automatic execution is next"
+                ),
                 "code_hash": fingerprint,
+                "edit_count": len(planned_edits),
             }
 
         def execute_experiment_code():
@@ -380,18 +664,37 @@ class MLESolverAgent:
         ).register(
             "edit_experiment_code",
             (
-                "Replace one exact fragment in the current experiment code. The "
-                "framework automatically executes a valid edit and returns its real "
-                "execution result in the same tool response."
+                "Atomically replace one to six independent exact fragments in the "
+                "current experiment code. Put all coordinated changes in one edits "
+                "array. The framework validates the whole batch, applies all changes "
+                "or none, then automatically executes the resulting code."
             ),
             _schema(
                 {
-                    "old_text": _string("Exact unique code fragment to replace"),
-                    "new_text": _string("Replacement code fragment"),
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": _string(
+                                    "Exact unique code fragment to replace"
+                                ),
+                                "new_text": _string(
+                                    "Replacement code fragment"
+                                ),
+                            },
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": False,
+                        },
+                    },
                 },
-                ["old_text", "new_text"],
+                ["edits"],
             ),
             edit_experiment_code,
+            allow_multiple=False,
+            batch_coalescer=_coalesce_experiment_edit_batches,
         ).register(
             "execute_experiment_code",
             (
@@ -411,28 +714,64 @@ class MLESolverAgent:
             api_key=self.api_key,
             agent_name="MLESolverAgent",
             phase="running experiments",
-            max_tool_steps=20,
+            max_tool_steps=30,
         )
+        system_prompt = experiment_solver_prompt()
+        user_prompt = (
+            f"Topic: {state.topic}\nPlan: {state.plan}\n"
+            f"Selected dataset: {state.dataset_selection}\n"
+            f"Fixed numerical seeds: "
+            f"{json.dumps(getattr(state, 'seeds', {}), sort_keys=True)}\n"
+            f"Execution environment: "
+            f"{json.dumps(execution_capabilities(), ensure_ascii=True)}\n"
+            f"Prepared dataset manifest: "
+            f"{json.dumps(getattr(state, 'dataset_manifest', {}), ensure_ascii=True)}\n"
+            f"Dataset validation warnings: "
+            f"{json.dumps(getattr(state, 'dataset_validation_warnings', []), ensure_ascii=True)}\n"
+            f"Dataset code: {state.dataset_code}\n"
+            f"Literature review: {state.literature_review}"
+        )
+
+        def compact_experiment_failure(*, tool_call, arguments, value):
+            del arguments
+            if not current.get("code"):
+                return None
+            if tool_call.name == "execute_experiment_code":
+                diagnostic = current.get("latest_execution_failure") or value
+                return _latest_experiment_failure_messages(
+                    system_prompt,
+                    user_prompt,
+                    current["code"],
+                    diagnostic,
+                )
+            if tool_call.name not in {
+                "replace_experiment_code",
+                "edit_experiment_code",
+            }:
+                return None
+            diagnostic = (
+                value.get("original_execution_diagnostic")
+                or value.get("latest_execution_diagnostic")
+                or current.get("latest_execution_failure")
+            )
+            if not diagnostic:
+                return None
+            return _latest_experiment_failure_messages(
+                system_prompt,
+                user_prompt,
+                current["code"],
+                diagnostic,
+                action_rejection=value,
+            )
+
         result = runtime.run(
-            system_prompt=experiment_solver_prompt(),
-            user_prompt=(
-                f"Topic: {state.topic}\nPlan: {state.plan}\n"
-                f"Selected dataset: {state.dataset_selection}\n"
-                f"Fixed numerical seeds: "
-                f"{json.dumps(getattr(state, 'seeds', {}), sort_keys=True)}\n"
-                f"Execution environment: "
-                f"{json.dumps(execution_capabilities(), ensure_ascii=True)}\n"
-                f"Prepared dataset manifest: "
-                f"{json.dumps(getattr(state, 'dataset_manifest', {}), ensure_ascii=True)}\n"
-                f"Dataset validation warnings: "
-                f"{json.dumps(getattr(state, 'dataset_validation_warnings', []), ensure_ascii=True)}\n"
-                f"Dataset code: {state.dataset_code}\n"
-                f"Literature review: {state.literature_review}"
-            ),
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             registry=registry,
             terminal_tools={"submit_experiment"},
             tool_names_provider=available_tools,
             automatic_tools={"execute_experiment_code", "submit_experiment"},
+            failure_history_compactor=compact_experiment_failure,
         )
         return result.value
 
@@ -446,28 +785,54 @@ class MLESolverAgent:
             "success": None,
             "code_hash": None,
             "failed_hashes": set(),
+            "failed_failures": {},
             "last_failure_category": None,
             "consecutive_failure_category_count": 0,
             "force_replace": False,
         }
+
+        def rejected_supplement_code(fingerprint, action):
+            original_failure = dict(
+                current.get("failed_failures", {}).get(fingerprint) or {}
+            )
+            original_error = original_failure.get("error") or "the original failure"
+            result = {
+                "success": False,
+                "error_type": "unchanged_failed_supplement_code",
+                "error": (
+                    "This exact supplement code previously failed and was not "
+                    "executed again."
+                ),
+                "repair_hint": (
+                    "Do not submit this code hash again. Make a substantive "
+                    f"change that resolves the original failure: {original_error}"
+                ),
+                "original_error_type": original_failure.get("error_type"),
+                "original_error": original_failure.get("error"),
+                "original_failure_category": original_failure.get(
+                    "failure_category"
+                ),
+                "original_repair_hint": original_failure.get("repair_hint"),
+                "code_hash": fingerprint,
+                "action": action,
+            }
+            if original_failure:
+                result["original_execution_diagnostic"] = original_failure
+            return result
 
         def execute_current_supplement():
             if not current["code"]:
                 return {"success": False, "error": "Create supplement code first"}
             fingerprint = _code_hash(current["code"])
             if fingerprint in current["failed_hashes"]:
-                return {
-                    "success": False,
-                    "error": (
-                        "Supplement code is unchanged since its previous failed "
-                        "execution. Edit or replace it before retrying."
-                    ),
-                    "code_hash": fingerprint,
-                }
+                return rejected_supplement_code(
+                    fingerprint,
+                    "execute_supplement_code",
+                )
             combined = state.dataset_code + "\n\n" + current["code"]
             execution = execute_code(
                 combined,
-                timeout=600,
+                timeout=EXPERIMENT_EXECUTION_TIMEOUT_SECONDS,
                 workdir=str(supplement_workdir),
                 return_details=True,
             )
@@ -501,17 +866,23 @@ class MLESolverAgent:
         def replace_supplement_code(code):
             syntax_error = _python_syntax_error(code)
             if syntax_error:
-                return {"success": False, "error": syntax_error}
-            fingerprint = _code_hash(code)
-            if fingerprint in {
-                current.get("code_hash"),
-            } or fingerprint in current["failed_hashes"]:
                 return {
                     "success": False,
-                    "error": (
-                        "Replacement supplement code is unchanged from the current "
-                        "or previously failed draft. Make a substantive correction."
-                    ),
+                    "error_type": "syntax_error",
+                    "error": syntax_error,
+                }
+            fingerprint = _code_hash(code)
+            if fingerprint in current["failed_hashes"]:
+                return rejected_supplement_code(
+                    fingerprint,
+                    "replace_supplement_code",
+                )
+            if fingerprint == current.get("code_hash"):
+                return {
+                    "success": False,
+                    "error_type": "unchanged_current_supplement_code",
+                    "error": "Replacement supplement code is unchanged from the current draft.",
+                    "repair_hint": "Make a substantive code change before retrying.",
                     "code_hash": fingerprint,
                 }
             current.update(
@@ -539,17 +910,23 @@ class MLESolverAgent:
             edited = current["code"].replace(old_text, new_text, 1)
             syntax_error = _python_syntax_error(edited)
             if syntax_error:
-                return {"success": False, "error": syntax_error}
-            fingerprint = _code_hash(edited)
-            if fingerprint in {
-                current.get("code_hash"),
-            } or fingerprint in current["failed_hashes"]:
                 return {
                     "success": False,
-                    "error": (
-                        "The edited supplement code matches the current or a "
-                        "previously failed version"
-                    ),
+                    "error_type": "syntax_error",
+                    "error": syntax_error,
+                }
+            fingerprint = _code_hash(edited)
+            if fingerprint in current["failed_hashes"]:
+                return rejected_supplement_code(
+                    fingerprint,
+                    "edit_supplement_code",
+                )
+            if fingerprint == current.get("code_hash"):
+                return {
+                    "success": False,
+                    "error_type": "unchanged_current_supplement_code",
+                    "error": "The edited supplement code is unchanged from the current draft.",
+                    "repair_hint": "Make a substantive code change before retrying.",
                     "code_hash": fingerprint,
                 }
             current.update(

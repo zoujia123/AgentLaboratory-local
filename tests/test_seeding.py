@@ -46,6 +46,41 @@ class SeedPolicyTest(unittest.TestCase):
         )
         validate_offline_code(code, self.seeds)
 
+    def test_distinguishes_datasets_and_sklearn_train_test_split_seeds(self):
+        datasets_code = (
+            "from datasets import Dataset\n"
+            "dataset = Dataset.from_dict({'text': ['a', 'b', 'c']})\n"
+            "parts = dataset.train_test_split(test_size=0.2, seed=SKLEARN_SEED)\n"
+        )
+        sklearn_alias_code = (
+            "from sklearn.model_selection import train_test_split as split\n"
+            "split([1, 2, 3], random_state=SKLEARN_SEED)\n"
+        )
+        validate_offline_code(datasets_code, self.seeds)
+        validate_offline_code(sklearn_alias_code, self.seeds)
+
+        with self.assertRaisesRegex(OfflineExecutionError, "missing random_state"):
+            validate_offline_code(
+                "from sklearn.model_selection import train_test_split as split\n"
+                "split([1, 2, 3])\n",
+                self.seeds,
+            )
+
+        with self.assertRaisesRegex(OfflineExecutionError, "must use seed"):
+            validate_offline_code(
+                "from datasets import Dataset\n"
+                "dataset = Dataset.from_dict({'text': ['a', 'b', 'c']})\n"
+                "dataset.train_test_split(test_size=0.2, random_state=SKLEARN_SEED)\n",
+                self.seeds,
+            )
+        with self.assertRaisesRegex(OfflineExecutionError, "missing seed"):
+            validate_offline_code(
+                "from datasets import Dataset\n"
+                "dataset = Dataset.from_dict({'text': ['a', 'b', 'c']})\n"
+                "dataset.train_test_split(test_size=0.2)\n",
+                self.seeds,
+            )
+
     def test_requires_numpy_seed_for_default_rng(self):
         with self.assertRaisesRegex(OfflineExecutionError, "default_rng"):
             validate_offline_code(
@@ -123,6 +158,12 @@ class SeedPolicyTest(unittest.TestCase):
                 material_root=temp_dir,
                 max_concurrent_queries=1,
                 queries=(QueryJob("query_001", "recording_001"),),
+                output_root=temp_dir,
+                collaboration_rounds={
+                    "plan_max_rounds": 8,
+                    "data_preparation_max_rounds": 12,
+                    "interpretation_max_phd_reviews": 8,
+                },
                 seeds=self.seeds,
             )
             workflow = MagicMock()
