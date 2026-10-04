@@ -771,11 +771,13 @@ class AgentRuntime:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]   # messages会保存完整执行上下文,这里是初始化对话历史
+
         step = 0    # 已经执行的工具轮次
         round_index = 0    # 已经发起的LLM轮次，包括协议纠错轮次
         protocol_repairs = 0    # LLM违反多工具调用规则协议后，已经修复几次
         last_failed_call_signature = None   # 用于检测模型是否反复调用同一个失败工具
         identical_failed_call_count = 0
+        
         terminal_tools = set(terminal_tools)
         automatic_tools = set(automatic_tools)
         unknown_automatic_tools = automatic_tools - registry.names

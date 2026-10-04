@@ -397,45 +397,23 @@ class BaseResearchAgent:
 class PhDStudentAgent(BaseResearchAgent):
     role = "computer science PhD student"
 
-    def conduct_literature_review(self, topic, required_papers=1):
+    def conduct_literature_review(self, topic):
         search = ArxivSearch()
 
-        papers = [] # 保存已纳入综述的论文：arxiv_id、摘要、全文。达到 required_papers 后才可提交。
+        papers = [] # 保存已纳入综述的论文：arxiv_id、摘要、全文。纳入一篇后即可提交。
         pending_read = {"arxiv_id": None}   # 记录“刚读完、但尚未决定添加还是拒绝”的论文 ID。
         rejected_papers = set() # 保存暂时拒绝的论文，避免下一次普通搜索又返回它；重新阅读并添加时会移除。
         seen_paper_ids = set()  # 保存本轮所有搜索曾返回过的 ID，允许从较早搜索批次重新阅读。
         candidate_batch = {"query": None, "ids": []}    # ids 是最新一次搜索中尚待处理的候选；决定当前应继续读还是继续搜索。
-        empty_search_count = {"value": 0}   # 连续两次搜索无候选时，转为浏览剩余本地候选。
-        paper_pool_exhausted = {"value": False} # 标记本地候选是否已真正耗尽，只有耗尽后才能report_
 
         def unavailable_paper_ids():
-            return rejected_papers | {
-                item["arxiv_id"]
-                for item in papers
-            }
+            return rejected_papers | {item["arxiv_id"] for item in papers}
 
-        def search_arxiv(query, max_results=5):
-            result_limit = max(1, min(int(max_results), 5))
+        def search_arxiv(query):
             details = search.find_papers(
                 query,
-                N=result_limit,
                 excluded_ids=unavailable_paper_ids(),
             )
-            fallback_used = False
-            if details["candidate_ids"]:
-                empty_search_count["value"] = 0
-            else:
-                empty_search_count["value"] += 1
-                if empty_search_count["value"] >= 2:
-                    details = search.browse_remaining_papers(
-                        N=result_limit,
-                        excluded_ids=unavailable_paper_ids(),
-                    )
-                    fallback_used = True
-                    if details["candidate_ids"]:
-                        empty_search_count["value"] = 0
-                    else:
-                        paper_pool_exhausted["value"] = True
             candidate_batch["query"] = query
             candidate_batch["ids"] = list(details["candidate_ids"])
             seen_paper_ids.update(candidate_batch["ids"])
@@ -444,20 +422,13 @@ class PhDStudentAgent(BaseResearchAgent):
                 "results": details["text"],
                 "candidate_ids": list(candidate_batch["ids"]),
                 "candidate_count": len(candidate_batch["ids"]),
-                "fallback_used": fallback_used,
-                "consecutive_empty_searches": empty_search_count["value"],
                 "decision_required": bool(candidate_batch["ids"]),
                 "reconsiderable_paper_ids": sorted(rejected_papers),
                 "next_action_hint": (
                     "Read one returned paper. After reading it, add it or reject it "
                     "with the matching arXiv ID."
                     if candidate_batch["ids"]
-                    else (
-                        "No new candidates remain. Reconsider a previously returned paper "
-                        "or report that none is suitable."
-                        if paper_pool_exhausted["value"]
-                        else "No candidates were returned. Search once more with a new query."
-                    )
+                    else "No candidates were returned. Search once more with a new query."
                 ),
             }
 
@@ -467,7 +438,7 @@ class PhDStudentAgent(BaseResearchAgent):
                     "success": False,
                     "error": f"Paper {arxiv_id!r} is already included in the review",
                 }
-            if arxiv_id not in seen_paper_ids:
+            if arxiv_id not in seen_paper_ids:  # 它要求模型只能阅读：本轮文献综述中，之前由 search_arxiv 返回过的论文
                 return {
                     "success": False,
                     "error": (
@@ -522,24 +493,15 @@ class PhDStudentAgent(BaseResearchAgent):
             candidate_batch["ids"] = [
                 item for item in candidate_batch["ids"] if item != arxiv_id
             ]
-            paper_count = len(papers)
-            review_ready = paper_count >= required_papers
-            if review_ready:
-                next_action_hint = (
-                    "The required paper count is satisfied. "
-                    "Call submit_literature_review next."
-                )
-            else:
-                next_action_hint = (
-                    f"Add {required_papers - paper_count} more reviewed paper(s) "
-                    "before calling submit_literature_review."
-                )
             return {
                 "success": True,
-                "paper_count": paper_count,
-                "required_papers": required_papers,
-                "review_ready": review_ready,
-                "next_action_hint": next_action_hint,
+                "paper_count": len(papers),
+                "required_papers": 1,
+                "review_ready": True,
+                "next_action_hint": (
+                    "The required paper count is satisfied. "
+                    "Call submit_literature_review next."
+                ),
             }
 
         def reject_paper(arxiv_id, reason):
@@ -568,10 +530,10 @@ class PhDStudentAgent(BaseResearchAgent):
             }
 
         def submit_literature_review(review):
-            if len(papers) < required_papers:
+            if not papers:
                 return {
                     "success": False,
-                    "error": f"Add at least {required_papers} reviewed paper(s) first",
+                    "error": "Add at least 1 reviewed paper(s) first",
                 }
             return {
                 "success": True,
@@ -579,26 +541,12 @@ class PhDStudentAgent(BaseResearchAgent):
                 "papers": papers,
             }
 
-        def report_no_local_paper(reason):
-            if not paper_pool_exhausted["value"]:
-                return {
-                    "success": False,
-                    "error": "Unreviewed local arXiv candidates still remain",
-                }
-            return {
-                "success": True,
-                "reason": reason,
-                "rejected_paper_ids": sorted(rejected_papers),
-            }
-
         def available_tools():
             if pending_read["arxiv_id"] is not None:
-                return {"add_paper"}
-            if len(papers) >= required_papers:
+                return {"add_paper", "reject_paper"}
+            if papers:
                 return {"submit_literature_review"}
-            readable = seen_paper_ids - {item["arxiv_id"] for item in papers}
-            if paper_pool_exhausted["value"]:
-                return {"report_no_local_paper"} | ({"read_arxiv_paper"} if readable else set())
+            readable = seen_paper_ids - {item["arxiv_id"] for item in papers}   # 系统允许模型之后有新理由时重新阅读曾 reject 的论文，而不是永久禁止它。
             if candidate_batch["ids"]:
                 return {"read_arxiv_paper"}
             return {"search_arxiv"} | ({"read_arxiv_paper"} if readable else set())
@@ -613,12 +561,8 @@ class PhDStudentAgent(BaseResearchAgent):
             _object_schema(
                 {
                     "query": _string("Short English paper search query"),
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Number of results from 1 to 5",
-                    },
                 },
-                ["query", "max_results"],
+                ["query"],
             ),
             search_arxiv,
         ).register(
@@ -669,17 +613,6 @@ class PhDStudentAgent(BaseResearchAgent):
             ),
             reject_paper,
         ).register(
-            "report_no_local_paper",
-            (
-                "Report that every local arXiv candidate has been reviewed or "
-                "rejected and no paper can satisfy the literature review."
-            ),
-            _object_schema(
-                {"reason": _string("Why the local candidate pool cannot satisfy the review")},
-                ["reason"],
-            ),
-            report_no_local_paper,
-        ).register(
             "submit_literature_review",
             "Submit the completed literature review.",
             _object_schema(
@@ -689,20 +622,15 @@ class PhDStudentAgent(BaseResearchAgent):
             submit_literature_review,
         )
         result = self.runtime("literature review", max_tool_steps=20).run(
-            system_prompt=literature_review_prompt(required_papers),
+            system_prompt=literature_review_prompt(),
             user_prompt=(
                 f"Research topic: {topic}\n"
-                f"Required papers for this review: {required_papers}."
+                "Required papers for this review: 1."
             ),
             registry=registry,
-            terminal_tools={"submit_literature_review", "report_no_local_paper"},
+            terminal_tools={"submit_literature_review"},
             tool_names_provider=available_tools,
         )
-        if getattr(result, "tool_name", None) == "report_no_local_paper":
-            raise RuntimeError(
-                "No suitable local arXiv paper remains: "
-                + json.dumps(result.value, ensure_ascii=True, default=str)
-            )
         return result.value
 
     def plan_feedback(self, topic, literature_review, postdoc_message):
@@ -1509,7 +1437,9 @@ class SWEngineerAgent(BaseResearchAgent):
         latest_execution_failure=None,
         verified_trial=None,
     ):
-        def submit_dataset_code(code):
+        def submit_dataset_code(code=None):
+            if isinstance(verified_trial, dict):
+                return dict(verified_trial)
             if not inspected_dataset:
                 return {
                     "success": False,
@@ -1523,15 +1453,8 @@ class SWEngineerAgent(BaseResearchAgent):
                 }
             return _run_preparation_code(code, workdir, inspected_dataset)
 
-        def submit_verified_dataset_code():
-            if not isinstance(verified_trial, dict):
-                return {
-                    "success": False,
-                    "error": "No verified MLE trial is available for submission",
-                }
-            return dict(verified_trial)
-
-        if isinstance(verified_trial, dict):
+        # 据 verified_trial 是否存在，注册不同版本的工具。
+        if isinstance(verified_trial, dict):    # MLE 已经验证成功,不传任何参数
             registry = ToolRegistry().register(
                 "submit_dataset_code",
                 (
@@ -1539,9 +1462,9 @@ class SWEngineerAgent(BaseResearchAgent):
                     "No arguments are accepted and the code is not executed again."
                 ),
                 _object_schema({}, []),
-                submit_verified_dataset_code,
+                submit_dataset_code,
             )
-        else:
+        else:   # 还没有验证成功,一整段新的数据准备代码
             registry = ToolRegistry().register(
                 "send_dialogue",
                 "Direct or consult the MLEngineerAgent about dataset search and preparation code.",
@@ -1574,8 +1497,9 @@ class SWEngineerAgent(BaseResearchAgent):
             ),
             registry=registry,
             terminal_tools=registry.names,
-            return_after_tool=True,
-            automatic_tools={"submit_dataset_code"} if isinstance(verified_trial, dict) else set(),
+            return_after_tool=True, # 无论成功还是失败，只要执行过一个工具，就把控制权交回外层协作流程
+            automatic_tools={"submit_dataset_code"} if isinstance(verified_trial, dict) else set(), # 框架要不要跳过模型，自己直接调用工具.
+            # 若 verified_trial 存在：直接submit_dataset_code()，不会请求大模型。若不存在，automatic_tools = set()，需要调用模型让模型选择
         )
 
 

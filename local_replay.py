@@ -360,24 +360,17 @@ class LocalReplaySession:
             metadata=payload,
         )
 
-    def replay_arxiv_search(
-        self,
-        query,
-        max_results,
-        processed_query=None,
-        excluded_ids=None,
-        return_details=False,
-    ):
+    def replay_arxiv_search(self, query, max_results, processed_query=None, excluded_ids=None,return_details=False,):
         started = time.perf_counter_ns()
         try:
             latency_record, latency_kind, reservation_index = self._reserve_latency(
                 "arxiv.search", purpose=f"query={query!r}, max_results={max_results}"
-            )
+            )   # 模拟耗时
             ranked = self._search_arxiv_abstracts(
                 processed_query or query,
                 int(max_results),
                 excluded_ids=excluded_ids,
-            )
+            )   # 搜索
         except Exception as exc:
             self._record_event(
                 tool="arxiv.search", match_kind="mismatch", success=False,
@@ -447,35 +440,6 @@ class LocalReplaySession:
             for arxiv_id, score in rows
             if arxiv_id not in excluded_ids
         ][:max_results]
-
-    def replay_remaining_arxiv_candidates(self, max_results, excluded_ids=None):
-        started = time.perf_counter_ns()
-        excluded_ids = {str(item) for item in (excluded_ids or [])}
-        documents = [
-            copy.deepcopy(document)
-            for arxiv_id, document in self.arxiv_documents.items()
-            if arxiv_id not in excluded_ids
-        ][:max(0, int(max_results))]
-        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
-        candidate_ids = [
-            document.get("arxiv_id")
-            for document in documents
-            if document.get("arxiv_id")
-        ]
-        self._record_event(
-            tool="arxiv.candidate_browse",
-            match_kind="local_candidate_browse",
-            success=True,
-            actual_duration_ms=round(elapsed_ms, 3),
-            candidate_ids=candidate_ids,
-            excluded_count=len(excluded_ids),
-            request={"max_results": max_results},
-            error=None,
-        )
-        return {
-            "text": self._format_arxiv_results(documents),
-            "candidate_ids": candidate_ids,
-        }
 
     @staticmethod
     def _format_arxiv_results(results):

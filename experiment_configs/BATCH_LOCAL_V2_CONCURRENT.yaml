@@ -1,5 +1,5 @@
 material-root: "D:/work/HUST/MASLab_v2"
-output-root: "research_runs_v2"
+output-root: "research_runs_v3"
 max-concurrent-queries: 1
 max-llm-http-attempts-per-query: 100
 console-log: false
@@ -25,7 +25,11 @@ collaboration_rounds:
   interpretation_max_phd_reviews: 8
 
 queries:
-  - query-id: query_018
-    recording-id: latest
+queries: 
+
+  - query-id: query_005
+    recording-id: latest   
+
+
 
 

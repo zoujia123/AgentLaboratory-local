@@ -2,7 +2,7 @@ import json
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from agent_runtime import AgentRuntime
 from agents import (
@@ -14,6 +14,7 @@ from agents import (
     _run_preparation_code,
 )
 from prompts import ml_dataset_selection_prompt, sw_data_preparation_prompt
+from tools import ArxivSearch
 
 
 COLLABORATION_ROUNDS = {
@@ -528,7 +529,7 @@ class AgentPromptTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(selection["revision"], "r1")
 
-    def test_reconsider_prior_batch_and_exhausted_candidates(self):
+    def test_reconsider_prior_batch_after_empty_searches(self):
         search = MagicMock()
         search.find_papers.side_effect = [
             {"text": "paper A", "candidate_ids": ["A"]},
@@ -536,7 +537,6 @@ class AgentPromptTest(unittest.TestCase):
             {"text": "", "candidate_ids": []},
             {"text": "", "candidate_ids": []},
         ]
-        search.browse_remaining_papers.return_value = {"text": "", "candidate_ids": []}
         search.retrieve_full_paper_text.return_value = "paper text"
         search.get_cached_full_paper_text.return_value = "paper text"
         with patch("agents.ArxivSearch", return_value=search), patch.object(
@@ -545,24 +545,24 @@ class AgentPromptTest(unittest.TestCase):
             PhDStudentAgent("model", "key").conduct_literature_review("topic")
         registry = run.call_args.kwargs["registry"]
         provider = run.call_args.kwargs["tool_names_provider"]
-        registry.execute("search_arxiv", {"query": "first", "max_results": 2})
+        registry.execute("search_arxiv", {"query": "first"})
         self.assertEqual(provider(), {"read_arxiv_paper"})
         unknown = registry.execute("read_arxiv_paper", {"arxiv_id": "never-returned"})
         self.assertFalse(unknown["success"])
         search.retrieve_full_paper_text.assert_not_called()
         self.assertTrue(registry.execute("read_arxiv_paper", {"arxiv_id": "A"})["success"])
         registry.execute("reject_paper", {"arxiv_id": "A", "reason": "initial assessment"})
-        registry.execute("search_arxiv", {"query": "second", "max_results": 2})
+        registry.execute("search_arxiv", {"query": "second"})
         self.assertEqual(search.find_papers.call_args.kwargs["excluded_ids"], {"A"})
         self.assertTrue(registry.execute("read_arxiv_paper", {"arxiv_id": "A"})["success"])
-        self.assertEqual(provider(), {"add_paper"})
+        self.assertEqual(provider(), {"add_paper", "reject_paper"})
         registry.execute("reject_paper", {"arxiv_id": "A", "reason": "set aside again"})
         self.assertTrue(registry.execute("read_arxiv_paper", {"arxiv_id": "B"})["success"])
         registry.execute("reject_paper", {"arxiv_id": "B", "reason": "B unrelated"})
         for query in ("third", "fourth"):
-            result = registry.execute("search_arxiv", {"query": query, "max_results": 2})
+            result = registry.execute("search_arxiv", {"query": query})
         self.assertEqual(result["reconsiderable_paper_ids"], ["A", "B"])
-        self.assertEqual(provider(), {"read_arxiv_paper", "report_no_local_paper"})
+        self.assertEqual(provider(), {"search_arxiv", "read_arxiv_paper"})
         self.assertTrue(registry.execute("read_arxiv_paper", {"arxiv_id": "A"})["success"])
         added = registry.execute("add_paper", {"arxiv_id": "A", "summary": "useful background"})
         self.assertTrue(added["review_ready"])
@@ -1090,7 +1090,7 @@ class AgentPromptTest(unittest.TestCase):
         with patch("agents.ArxivSearch", return_value=search), patch.object(
             AgentRuntime, "run", return_value=completed
         ) as run:
-            agent.conduct_literature_review("topic", required_papers=1)
+            agent.conduct_literature_review("topic")
 
         prompt = run.call_args.kwargs["system_prompt"]
         self.assertIn("exactly 1 relevant paper", prompt)
@@ -1103,6 +1103,10 @@ class AgentPromptTest(unittest.TestCase):
         self.assertIn("Do not reject it solely because these details differ", prompt)
         self.assertIn("prefer adding it as methodological background", prompt)
         self.assertIn("Reserve rejection for papers with no meaningful connection", prompt)
+        self.assertIn("Reading a paper does not imply acceptance", prompt)
+        self.assertIn("Never add a paper merely to satisfy the required paper count", prompt)
+        self.assertIn("return exactly one tool call total", prompt)
+        self.assertIn("currently read arXiv ID only", prompt)
         self.assertIn("including rejected ones", prompt)
 
         registry = run.call_args.kwargs["registry"]
@@ -1118,6 +1122,14 @@ class AgentPromptTest(unittest.TestCase):
         self.assertIn(
             "local arXiv",
             schemas["search_arxiv"]["description"],
+        )
+        self.assertEqual(
+            set(schemas["search_arxiv"]["parameters"]["properties"]),
+            {"query"},
+        )
+        self.assertEqual(
+            schemas["search_arxiv"]["parameters"]["required"],
+            ["query"],
         )
         self.assertIn(
             "add_paper or reject_paper",
@@ -1135,10 +1147,11 @@ class AgentPromptTest(unittest.TestCase):
         self.assertNotIn("reject_arxiv_candidates", registry.names)
         self.assertIn("dataset, domain, model, task", schemas["add_paper"]["description"])
         self.assertIn("mismatch in dataset, domain, model, task", schemas["reject_paper"]["description"])
-        registry.execute("search_arxiv", {"query": "short", "max_results": 10})
+        premature = registry.execute("submit_literature_review", {"review": "review"})
+        self.assertFalse(premature["success"])
+        registry.execute("search_arxiv", {"query": "short"})
         search.find_papers.assert_called_once_with(
             "short",
-            N=5,
             excluded_ids=set(),
         )
         self.assertEqual(
@@ -1154,7 +1167,7 @@ class AgentPromptTest(unittest.TestCase):
         self.assertTrue(read["decision_required"])
         self.assertEqual(
             tool_names_provider(),
-            {"add_paper"},
+            {"add_paper", "reject_paper"},
         )
         added = registry.execute(
             "add_paper",
@@ -1173,6 +1186,56 @@ class AgentPromptTest(unittest.TestCase):
             {"submit_literature_review"},
         )
 
+    def test_literature_runtime_submits_after_one_paper(self):
+        from inference import ModelToolCall, ToolModelResponse
+
+        search = MagicMock(spec=ArxivSearch)
+        search.find_papers.return_value = {
+            "text": "matching paper",
+            "candidate_ids": ["1234.5678"],
+        }
+        search.retrieve_full_paper_text.return_value = "paper text"
+        search.get_cached_full_paper_text.return_value = "paper text"
+        actions = [
+            ("search_arxiv", {"query": "topic"}),
+            ("read_arxiv_paper", {"arxiv_id": "1234.5678"}),
+            ("add_paper", {"arxiv_id": "1234.5678", "summary": "summary"}),
+            ("submit_literature_review", {"review": "review"}),
+        ]
+        responses = [
+            ToolModelResponse("", [ModelToolCall(
+                f"call_{index}", name, json.dumps(arguments),
+            )])
+            for index, (name, arguments) in enumerate(actions)
+        ]
+
+        with patch("agents.ArxivSearch", return_value=search), patch(
+            "agent_runtime.query_model_with_tools", side_effect=responses,
+        ) as query_model:
+            review = PhDStudentAgent("model", "key").conduct_literature_review("topic")
+
+        self.assertTrue(review["success"])
+        self.assertEqual(review["review"], "review")
+        self.assertEqual(review["papers"], [{
+            "arxiv_id": "1234.5678", "summary": "summary", "full_text": "paper text",
+        }])
+        search.find_papers.assert_called_once_with("topic", excluded_ids=set())
+        search.retrieve_full_paper_text.assert_called_once_with("1234.5678", MAX_LEN=4000)
+        self.assertEqual(query_model.call_count, 4)
+        exposed_tools = [
+            {tool["function"]["name"] for tool in invocation.kwargs["tools"]}
+            for invocation in query_model.call_args_list
+        ]
+        self.assertEqual(exposed_tools, [
+            {"search_arxiv"},
+            {"read_arxiv_paper"},
+            {"add_paper", "reject_paper"},
+            {"submit_literature_review"},
+        ])
+        search_parameters = query_model.call_args_list[0].kwargs["tools"][0]["function"]["parameters"]
+        self.assertEqual(set(search_parameters["properties"]), {"query"})
+        self.assertEqual(search_parameters["required"], ["query"])
+
     def test_rejecting_read_paper_reopens_literature_search(self):
         search = MagicMock()
         search.find_papers.return_value = {
@@ -1186,13 +1249,13 @@ class AgentPromptTest(unittest.TestCase):
         with patch("agents.ArxivSearch", return_value=search), patch.object(
             AgentRuntime, "run", return_value=completed
         ) as run:
-            agent.conduct_literature_review("topic", required_papers=1)
+            agent.conduct_literature_review("topic")
 
         registry = run.call_args.kwargs["registry"]
         tool_names_provider = run.call_args.kwargs["tool_names_provider"]
         registry.execute(
             "search_arxiv",
-            {"query": "short", "max_results": 5},
+            {"query": "short"},
         )
         registry.execute("read_arxiv_paper", {"arxiv_id": "1234.5678"})
         rejected = registry.execute(
@@ -1213,72 +1276,75 @@ class AgentPromptTest(unittest.TestCase):
             {"arxiv_id": "1234.5678"},
         )
         self.assertTrue(repeated_read["success"])
-        self.assertEqual(tool_names_provider(), {"add_paper"})
+        self.assertEqual(tool_names_provider(), {"add_paper", "reject_paper"})
 
-    def test_two_empty_arxiv_searches_browse_remaining_candidates(self):
-        search = MagicMock()
-        search.find_papers.return_value = {"text": "", "candidate_ids": []}
-        search.browse_remaining_papers.return_value = {
-            "text": "fallback papers",
-            "candidate_ids": ["3456.7890"],
-        }
+    def test_empty_arxiv_searches_allow_a_new_query_to_find_candidates(self):
+        search = MagicMock(spec=ArxivSearch)
+        search.find_papers.side_effect = [
+            {"text": "", "candidate_ids": []},
+            {"text": "", "candidate_ids": []},
+            {"text": "matching paper", "candidate_ids": ["3456.7890"]},
+        ]
         agent = PhDStudentAgent("model", "key")
         completed = SimpleNamespace(value={"review": "review", "papers": []})
         with patch("agents.ArxivSearch", return_value=search), patch.object(
             AgentRuntime, "run", return_value=completed
         ) as run:
-            agent.conduct_literature_review("topic", required_papers=1)
+            agent.conduct_literature_review("topic")
 
         registry = run.call_args.kwargs["registry"]
         provider = run.call_args.kwargs["tool_names_provider"]
-        first = registry.execute(
-            "search_arxiv", {"query": "first", "max_results": 3}
-        )
-        self.assertFalse(first["fallback_used"])
-        self.assertEqual(provider(), {"search_arxiv"})
-        second = registry.execute(
-            "search_arxiv", {"query": "second", "max_results": 3}
+        for query in ("first", "second"):
+            result = registry.execute(
+                "search_arxiv", {"query": query}
+            )
+            self.assertEqual(result["candidate_ids"], [])
+            self.assertEqual(provider(), {"search_arxiv"})
+        third = registry.execute(
+            "search_arxiv", {"query": "third"}
         )
 
-        self.assertTrue(second["fallback_used"])
-        self.assertEqual(second["candidate_ids"], ["3456.7890"])
+        self.assertEqual(third["candidate_ids"], ["3456.7890"])
+        self.assertEqual(third["results"], "matching paper")
         self.assertEqual(
             provider(),
             {"read_arxiv_paper"},
         )
-        search.browse_remaining_papers.assert_called_once_with(
-            N=3,
-            excluded_ids=set(),
+        self.assertEqual(
+            search.mock_calls,
+            [
+                call.find_papers(query, excluded_ids=set())
+                for query in ("first", "second", "third")
+            ],
         )
 
-    def test_exhausted_arxiv_pool_exposes_terminal_report(self):
-        search = MagicMock()
+    def test_repeated_empty_arxiv_searches_do_not_create_candidates(self):
+        search = MagicMock(spec=ArxivSearch)
         search.find_papers.return_value = {"text": "", "candidate_ids": []}
-        search.browse_remaining_papers.return_value = {
-            "text": "",
-            "candidate_ids": [],
-        }
         agent = PhDStudentAgent("model", "key")
         completed = SimpleNamespace(value={"review": "review", "papers": []})
         with patch("agents.ArxivSearch", return_value=search), patch.object(
             AgentRuntime, "run", return_value=completed
         ) as run:
-            agent.conduct_literature_review("topic", required_papers=1)
+            agent.conduct_literature_review("topic")
 
         registry = run.call_args.kwargs["registry"]
         provider = run.call_args.kwargs["tool_names_provider"]
-        registry.execute("search_arxiv", {"query": "first", "max_results": 3})
-        exhausted = registry.execute(
-            "search_arxiv", {"query": "second", "max_results": 3}
+        for query in ("first", "second", "third"):
+            result = registry.execute(
+                "search_arxiv", {"query": query}
+            )
+            self.assertEqual(result["candidate_ids"], [])
+            self.assertEqual(result["candidate_count"], 0)
+            self.assertFalse(result["decision_required"])
+            self.assertEqual(provider(), {"search_arxiv"})
+        self.assertEqual(
+            search.mock_calls,
+            [
+                call.find_papers(query, excluded_ids=set())
+                for query in ("first", "second", "third")
+            ],
         )
-
-        self.assertEqual(exhausted["candidate_count"], 0)
-        self.assertEqual(provider(), {"report_no_local_paper"})
-        report = registry.execute(
-            "report_no_local_paper",
-            {"reason": "No remaining candidate supports the topic."},
-        )
-        self.assertTrue(report["success"])
 
     def test_postdoc_plan_prompt_requires_phd_consultation_and_full_plan(self):
         agent = PostdocAgent("model", "key")
@@ -1308,6 +1374,8 @@ class AgentPromptTest(unittest.TestCase):
         self.assertIn("reproducibility details", prompt)
         self.assertIn("Hugging Face dataset", prompt)
         self.assertIn("subgroup, cohort, category, source, time-period", prompt)
+        self.assertIn("do not open another consultation solely to confirm", prompt)
+        self.assertIn("Do not ask the PhDStudentAgent to confirm field names", prompt)
         self.assertIn("consultation_required", user_prompt)
 
         registry = run.call_args.kwargs["registry"]
@@ -1363,6 +1431,7 @@ class AgentPromptTest(unittest.TestCase):
         self.assertIn("evaluation metrics", prompt)
         self.assertIn("exact experimental procedure", prompt)
         self.assertIn("Do not select or name a concrete dataset ID", prompt)
+        self.assertIn("cannot block a valid abstract plan", prompt)
 
     def test_interpretation_prompts_require_postdoc_phd_dialogue(self):
         postdoc = PostdocAgent("model", "key")

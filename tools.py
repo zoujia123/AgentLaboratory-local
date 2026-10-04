@@ -155,24 +155,16 @@ class ArxivSearch:
     @traced_call(
         "tool",
         "arxiv.search",
-        metadata_factory=lambda args, kwargs: {
-            "max_results": kwargs.get("N", args[2] if len(args) > 2 else 20)
-        },
+        metadata_factory=lambda args, kwargs: {"max_results": 1},
         success_predicate=lambda result: result is not None,
     )
-    def find_papers(self, query, N=20, excluded_ids=None):
+    def find_papers(self, query, excluded_ids=None):
         return self.replay.replay_arxiv_search(
             query,
-            N,
-            self._process_query(query),
+            max_results=1,
+            processed_query=self._process_query(query),
             excluded_ids=excluded_ids,
             return_details=True,
-        )
-
-    def browse_remaining_papers(self, N=5, excluded_ids=None):
-        return self.replay.replay_remaining_arxiv_candidates(
-            N,
-            excluded_ids=excluded_ids,
         )
 
     @traced_call("tool", "arxiv.full_text")

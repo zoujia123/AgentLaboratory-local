@@ -619,32 +619,16 @@ print(len(recorded), len(fallback), sum(recorded['value']), sum(fallback['value'
         self.assertGreater(sleep.call_args.args[0], 0.05)
         self.assertLessEqual(sleep.call_args.args[0], 0.1)
 
-    def test_structured_arxiv_search_excludes_rejected_candidates(self):
+    def test_structured_arxiv_search_returns_one_non_excluded_candidate(self):
         session = self.make_session()
         with local_replay_scope(session):
             details = ArxivSearch().find_papers(
                 "abstract quantum",
-                N=2,
                 excluded_ids={"1111.00001v1"},
             )
 
         self.assertNotIn("1111.00001v1", details["candidate_ids"])
-        self.assertEqual(len(details["candidate_ids"]), 2)
-        self.assertIn("2222.00002v2", details["candidate_ids"])
-
-    def test_browse_remaining_arxiv_candidates_stays_in_query_pool(self):
-        session = self.make_session()
-        with local_replay_scope(session):
-            details = ArxivSearch().browse_remaining_papers(
-                N=2,
-                excluded_ids={"1111.00001v1"},
-            )
-
-        self.assertEqual(
-            details["candidate_ids"],
-            ["2222.00002v2", "3333.00003v1"],
-        )
-        self.assertEqual(session.events[-1]["match_kind"], "local_candidate_browse")
+        self.assertEqual(details["candidate_ids"], ["3333.00003v1"])
 
     def test_trace_summary_is_written_outside_material_root(self):
         session = self.make_session()
