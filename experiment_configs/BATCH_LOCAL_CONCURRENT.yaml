@@ -1,6 +1,7 @@
 material-root: "D:/work/HUST/MASLab"
 max-concurrent-queries: 2
 max-llm-http-attempts-per-query: 100
+code_execution_timeout_seconds: 2000  # 单次代码执行上限（秒），用于数据准备、主实验和补充实验
 compile-latex: false
 
 seeds:
@@ -52,3 +53,6 @@ queries:
     recording-id: latest   
   - query-id: query_020
     recording-id: latest 
+
+
+

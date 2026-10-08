@@ -1,379 +1,40 @@
-import ast
-import copy
-import hashlib
-import importlib
 import json
 import re
-from collections import Counter
+from copy import deepcopy
+from pathlib import Path
 
+from agent_helpers import (
+    _authoritative_execution_failure,
+    _citation_catalog,
+    _coalesce_experiment_edit_batches,
+    _code_hash,
+    _latest_experiment_failure_messages,
+    _latex_escape_text,
+    _object_schema,
+    _preparation_feedback_for_prompt,
+    _process_execution_result,
+    _stale_diagnostic_marker,
+    _string,
+)
 from agent_runtime import AgentRuntime, ToolRegistry
-from execution_diagnostics import classify_runtime_data_failure, runtime_data_repair_hint
-from local_replay import current_local_replay
-from prompts import literature_review_prompt, ml_dataset_selection_prompt, phd_interpretation_feedback_prompt, phd_plan_feedback_prompt, postdoc_interpretation_prompt, postdoc_plan_prompt, professor_readme_prompt,sw_data_preparation_prompt
+from data_preparation import _run_preparation_code
+from execution_diagnostics import python_syntax_error
+from prompts import (
+    experiment_solver_prompt,
+    literature_review_prompt,
+    ml_dataset_selection_prompt,
+    paper_blueprint_prompt,
+    paper_section_prompt,
+    phd_interpretation_feedback_prompt,
+    phd_plan_feedback_prompt,
+    postdoc_interpretation_prompt,
+    postdoc_plan_prompt,
+    professor_readme_prompt,
+    supplementary_experiment_solver_prompt,
+    sw_data_preparation_prompt,
+)
 from tools import ArxivSearch, HFDataSearch, execute_code, execution_capabilities
-
-
-def _object_schema(properties, required):
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": False,
-    }
-
-
-def _string(description):
-    return {"type": "string", "description": description}
-
-
-def _execution_capabilities():
-    return execution_capabilities()
-
-
-def _code_hash(code):
-    # A trailing newline or spaces do not make a failed program a new repair.
-    canonical_code = str(code).rstrip(" \t\r\n")
-    return hashlib.sha256(canonical_code.encode("utf-8")).hexdigest()
-
-
-
-def _assigned_name(target):
-    return target.id if isinstance(target, ast.Name) else None
-
-
-def _is_string_sequence(node, known_names):
-    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        return bool(node.elts) and all(
-            isinstance(item, ast.Constant) and isinstance(item.value, str)
-            for item in node.elts
-        )
-    if isinstance(node, ast.Name):
-        return node.id in known_names
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return _is_string_sequence(node.left, known_names) and _is_string_sequence(
-            node.right, known_names
-        )
-    if isinstance(node, ast.ListComp):
-        return _is_string_sequence(node.generators[0].iter, known_names)
-    return False
-
-
-def _is_load_dataset_call(node):
-    if not isinstance(node, ast.Call):
-        return False
-    if isinstance(node.func, ast.Name):
-        return node.func.id == "load_dataset"
-    return isinstance(node.func, ast.Attribute) and node.func.attr == "load_dataset"
-
-
-def _hf_load_dataset_split_list_line(tree):
-    string_sequences = set()
-    changed = True
-    while changed:
-        changed = False
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-                continue
-            name = _assigned_name(node.targets[0])
-            if (
-                name
-                and name not in string_sequences
-                and _is_string_sequence(node.value, string_sequences)
-            ):
-                string_sequences.add(name)
-                changed = True
-    for node in ast.walk(tree):
-        if not _is_load_dataset_call(node):
-            continue
-        split_keyword = next(
-            (item for item in node.keywords if item.arg == "split"),
-            None,
-        )
-        if split_keyword and _is_string_sequence(
-            split_keyword.value,
-            string_sequences,
-        ):
-            return node.lineno
-    return None
-
-
-def _hf_dataset_column_misuse(tree):
-    string_sequences = set()
-    dataset_objects = set()
-    dataset_methods = {
-        "filter",
-        "map",
-        "remove_columns",
-        "select",
-        "select_columns",
-        "shuffle",
-        "train_test_split",
-    }
-    changed = True
-    while changed:
-        changed = False
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-                continue
-            name = _assigned_name(node.targets[0])
-            if not name:
-                continue
-            if name not in string_sequences and _is_string_sequence(
-                node.value, string_sequences
-            ):
-                string_sequences.add(name)
-                changed = True
-            dataset_value = _is_load_dataset_call(node.value)
-            if (
-                isinstance(node.value, ast.Subscript)
-                and isinstance(node.value.value, ast.Name)
-                and node.value.value.id in dataset_objects
-            ):
-                dataset_value = True
-            if (
-                isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Attribute)
-                and node.value.func.attr in dataset_methods
-                and isinstance(node.value.func.value, ast.Name)
-                and node.value.func.value.id in dataset_objects
-            ):
-                dataset_value = True
-            if dataset_value and name not in dataset_objects:
-                dataset_objects.add(name)
-                changed = True
-
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "select"
-            and node.args
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in dataset_objects
-            and _is_string_sequence(node.args[0], string_sequences)
-        ):
-            return "select", node.lineno
-        if (
-            isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Name)
-            and node.value.id in dataset_objects
-            and _is_string_sequence(node.slice, string_sequences)
-        ):
-            return "multi_column_index", node.lineno
-    return None, None
-
-
-
-def _prepared_manifest_validation_issues(contract, manifest, artifacts):
-    if not isinstance(manifest, dict):
-        return [], [
-            "The code did not define prepared_data_manifest for the selected "
-            "dataset contract"
-        ]
-    if manifest.get("_manifest_error"):
-        return [], [str(manifest["_manifest_error"])]
-
-    def string_list(name):
-        value = manifest.get(name)
-        if not isinstance(value, list) or any(
-            not isinstance(item, str) for item in value
-        ):
-            return None
-        return value
-
-    errors = []
-    warnings = []
-    source_features = string_list("source_feature_columns")
-    target_columns = string_list("target_columns")
-    analysis_columns = string_list("analysis_columns")
-    if source_features is None:
-        errors.append("prepared_data_manifest.source_feature_columns must be a string array")
-    elif set(source_features) != set(contract.get("feature_columns") or []):
-        errors.append(
-            "prepared_data_manifest source features do not match dataset_contract"
-        )
-    if target_columns is None:
-        errors.append("prepared_data_manifest.target_columns must be a string array")
-    elif set(target_columns) != set(contract.get("target_columns") or []):
-        errors.append(
-            "prepared_data_manifest target columns do not match dataset_contract"
-        )
-    if analysis_columns is None:
-        warnings.append(
-            "prepared_data_manifest.analysis_columns must be a string array"
-        )
-    elif set(analysis_columns) != set(contract.get("analysis_columns") or []):
-        warnings.append(
-            "prepared_data_manifest analysis columns do not match dataset_contract"
-        )
-
-    feature_artifacts = manifest.get("feature_artifacts")
-    target_artifacts = manifest.get("target_artifacts")
-    analysis_artifacts = manifest.get("analysis_artifacts")
-    role_artifacts = manifest.get("role_artifacts")
-    if not isinstance(feature_artifacts, dict):
-        errors.append("prepared_data_manifest.feature_artifacts must be an object")
-        feature_artifacts = {}
-    if not isinstance(target_artifacts, dict):
-        errors.append("prepared_data_manifest.target_artifacts must be an object")
-        target_artifacts = {}
-    if not isinstance(analysis_artifacts, dict):
-        warnings.append(
-            "prepared_data_manifest.analysis_artifacts must be an object"
-        )
-        analysis_artifacts = {}
-    role_issues = (
-        errors
-        if contract.get("artifact_layout", "split_aligned") == "role_based"
-        else warnings
-    )
-    if role_artifacts is not None and not isinstance(role_artifacts, dict):
-        role_issues.append("prepared_data_manifest.role_artifacts must be an object")
-        role_artifacts = {}
-    elif not isinstance(role_artifacts, dict):
-        role_artifacts = {}
-
-    artifact_index = {
-        str(artifact.get("name")): artifact
-        for artifact in artifacts
-        if artifact.get("name")
-    }
-    required_splits = contract.get("required_prepared_splits") or []
-    feature_metadata = {}
-    target_metadata = {}
-    if contract.get("artifact_layout", "split_aligned") == "split_aligned":
-        for split in required_splits:
-            feature_name = feature_artifacts.get(split)
-            if not isinstance(feature_name, str) or feature_name not in artifact_index:
-                errors.append(
-                    f"Missing prepared feature artifact for split {split!r}"
-                )
-            else:
-                feature_metadata[split] = artifact_index[feature_name]
-                if (
-                    contract.get("feature_representation") == "numeric_matrix"
-                    and artifact_index[feature_name].get("numeric") is not True
-                ):
-                    errors.append(
-                        f"Feature artifact {feature_name!r} for split {split!r} "
-                        "is not numeric"
-                    )
-            if contract.get("target_columns"):
-                target_name = target_artifacts.get(split)
-                if not isinstance(target_name, str) or target_name not in artifact_index:
-                    errors.append(
-                        f"Missing prepared target artifact for split {split!r}"
-                    )
-                else:
-                    target_metadata[split] = artifact_index[target_name]
-                    if (
-                        contract.get("task_type") in {
-                            "classification",
-                            "regression",
-                            "text_classification",
-                            "image_classification",
-                            "time_series_forecasting",
-                            "retrieval",
-                        }
-                        and artifact_index[target_name].get("numeric") is not True
-                    ):
-                        errors.append(
-                            f"Target artifact {target_name!r} for split {split!r} "
-                            "is not numeric"
-                        )
-
-    feature_widths = set()
-    for split, metadata in feature_metadata.items():
-        shape = metadata.get("shape")
-        if isinstance(shape, list) and len(shape) >= 2:
-            feature_widths.add(shape[1])
-        target = target_metadata.get(split)
-        if target and metadata.get("length") != target.get("length"):
-            errors.append(
-                f"Feature and target lengths differ for split {split!r}"
-            )
-    if len(feature_widths) > 1:
-        errors.append("Prepared feature dimensions differ across required splits")
-
-    for column in contract.get("analysis_columns") or []:
-        reference = analysis_artifacts.get(column)
-        names = list(reference.values()) if isinstance(reference, dict) else [reference]
-        valid_names = [name for name in names if isinstance(name, str)]
-        if not valid_names or any(name not in artifact_index for name in valid_names):
-            warnings.append(
-                f"Missing prepared analysis artifact for column {column!r}"
-            )
-
-    expected_roles = {
-        str(source.get("role")): source
-        for source in contract.get("role_sources") or []
-        if source.get("role")
-    }
-    unknown_roles = sorted(set(role_artifacts) - set(expected_roles))
-    if unknown_roles:
-        warnings.append(
-            "prepared_data_manifest contains unknown role artifacts: "
-            + str(unknown_roles)
-        )
-    required_role_artifacts = {
-        role
-        for role, source in expected_roles.items()
-        if contract.get("artifact_layout") == "role_based"
-        or source.get("source_type") == "derived"
-    }
-    for role, source in expected_roles.items():
-        reference = role_artifacts.get(role)
-        if reference is None and role not in required_role_artifacts:
-            continue
-        role_splits = source.get("required_prepared_splits") or []
-        if role_splits:
-            if not isinstance(reference, dict):
-                role_issues.append(
-                    f"Role artifact {role!r} must map prepared splits to variables"
-                )
-                continue
-            missing_role_splits = [
-                split for split in role_splits if split not in reference
-            ]
-            if missing_role_splits:
-                role_issues.append(
-                    f"Role artifact {role!r} is missing prepared splits: "
-                    + str(missing_role_splits)
-                )
-            references = {
-                split: reference.get(split)
-                for split in role_splits
-                if split in reference
-            }
-        elif isinstance(reference, str):
-            references = {None: reference}
-        elif isinstance(reference, dict) and reference:
-            references = dict(reference)
-        else:
-            role_issues.append(f"Missing prepared role artifact for {role!r}")
-            continue
-
-        for split, artifact_name in references.items():
-            if not isinstance(artifact_name, str) or artifact_name not in artifact_index:
-                role_issues.append(
-                    f"Role artifact {role!r} references missing variable "
-                    f"{artifact_name!r}"
-                )
-                continue
-            if source.get("alignment") != "sample" or split is None:
-                continue
-            feature = feature_metadata.get(split)
-            role_metadata = artifact_index[artifact_name]
-            if (
-                feature
-                and feature.get("length") is not None
-                and role_metadata.get("length") != feature.get("length")
-            ):
-                role_issues.append(
-                    f"Role artifact {role!r} length differs from prepared "
-                    f"features for split {split!r}"
-                )
-    return errors, warnings
+from utils import compile_latex
 
 
 class BaseResearchAgent:
@@ -384,13 +45,14 @@ class BaseResearchAgent:
         self.api_key = api_key
         self.name = name or self.__class__.__name__
 
-    def runtime(self, phase, max_tool_steps=8):
+    def runtime(self, phase, max_tool_steps=8, *, max_tokens=8192):
         return AgentRuntime(
             model=self.model,
             api_key=self.api_key,
             agent_name=self.name,
             phase=phase,
             max_tool_steps=max_tool_steps,
+            max_tokens=max_tokens,
         )
 
 
@@ -402,8 +64,7 @@ class PhDStudentAgent(BaseResearchAgent):
 
         papers = [] # 保存已纳入综述的论文：arxiv_id、摘要、全文。纳入一篇后即可提交。
         pending_read = {"arxiv_id": None}   # 记录“刚读完、但尚未决定添加还是拒绝”的论文 ID。
-        rejected_papers = set() # 保存暂时拒绝的论文，避免下一次普通搜索又返回它；重新阅读并添加时会移除。
-        seen_paper_ids = set()  # 保存本轮所有搜索曾返回过的 ID，允许从较早搜索批次重新阅读。
+        rejected_papers = set() # 本轮拒绝过的论文不再返回或重新阅读。
         candidate_batch = {"query": None, "ids": []}    # ids 是最新一次搜索中尚待处理的候选；决定当前应继续读还是继续搜索。
 
         def unavailable_paper_ids():
@@ -416,17 +77,15 @@ class PhDStudentAgent(BaseResearchAgent):
             )
             candidate_batch["query"] = query
             candidate_batch["ids"] = list(details["candidate_ids"])
-            seen_paper_ids.update(candidate_batch["ids"])
             return {
                 "success": True,
                 "results": details["text"],
                 "candidate_ids": list(candidate_batch["ids"]),
                 "candidate_count": len(candidate_batch["ids"]),
                 "decision_required": bool(candidate_batch["ids"]),
-                "reconsiderable_paper_ids": sorted(rejected_papers),
                 "next_action_hint": (
-                    "Read one returned paper. After reading it, add it or reject it "
-                    "with the matching arXiv ID."
+                    "Read a candidate from this search, then call decide_paper once with the "
+                    "matching arXiv ID and decision 'add' or 'reject'."
                     if candidate_batch["ids"]
                     else "No candidates were returned. Search once more with a new query."
                 ),
@@ -438,20 +97,22 @@ class PhDStudentAgent(BaseResearchAgent):
                     "success": False,
                     "error": f"Paper {arxiv_id!r} is already included in the review",
                 }
-            if arxiv_id not in seen_paper_ids:  # 它要求模型只能阅读：本轮文献综述中，之前由 search_arxiv 返回过的论文
+            if arxiv_id not in candidate_batch["ids"] or arxiv_id in rejected_papers:
                 return {
                     "success": False,
                     "error": (
-                        f"Paper {arxiv_id!r} has not been returned by search in this review"
+                        f"Paper {arxiv_id!r} is not an unread candidate from the latest search"
                     ),
-                    "available_paper_ids": sorted(seen_paper_ids),
+                    "available_paper_ids": [
+                        item for item in candidate_batch["ids"] if item not in rejected_papers
+                    ],
                 }
             if pending_read["arxiv_id"] is not None:
                 return {
                     "success": False,
                     "error": (
-                        "Resolve the previously read paper with add_paper or "
-                        "reject_paper before reading another paper"
+                        "Resolve the previously read paper with decide_paper "
+                        "before reading another paper"
                     ),
                 }
             full_text = search.retrieve_full_paper_text(arxiv_id, MAX_LEN=4000)
@@ -462,8 +123,9 @@ class PhDStudentAgent(BaseResearchAgent):
                 "full_text": full_text,
                 "decision_required": True,
                 "next_action_hint": (
-                    "Call add_paper if this paper is relevant, or reject_paper "
-                    "if it is not relevant. Use the same arXiv ID."
+                    "Call decide_paper exactly once for this arXiv ID. Choose "
+                    "decision 'add' for useful direct or methodological relevance, "
+                    "or 'reject' when neither applies, and provide an explanation."
                 ),
             }
 
@@ -489,7 +151,6 @@ class PhDStudentAgent(BaseResearchAgent):
                     "full_text": full_text,
                 })
             pending_read["arxiv_id"] = None
-            rejected_papers.discard(arxiv_id)
             candidate_batch["ids"] = [
                 item for item in candidate_batch["ids"] if item != arxiv_id
             ]
@@ -515,19 +176,38 @@ class PhDStudentAgent(BaseResearchAgent):
                 }
             rejected_papers.add(arxiv_id)
             pending_read["arxiv_id"] = None
-            candidate_batch["ids"] = [
-                item for item in candidate_batch["ids"] if item != arxiv_id
-            ]
+            candidate_batch["ids"] = []  # 拒绝后结束当前批次，下一步必须重新搜索。
             return {
                 "success": True,
                 "arxiv_id": arxiv_id,
                 "reason": reason,
                 "rejected_paper_count": len(rejected_papers),
                 "next_action_hint": (
-                    "The paper is set aside. Consider other candidates, or reread it "
-                    "if you have a new reason to reconsider its relevance."
+                    "The paper was rejected. Call search_arxiv next to find a new "
+                    "candidate; rejected papers cannot be reread in this review."
                 ),
             }
+
+        def decide_paper(arxiv_id, decision, explanation):
+            if not isinstance(arxiv_id, str) or not arxiv_id.strip():
+                return {"success": False, "error": "arxiv_id must be a non-empty string"}
+            if not isinstance(decision, str) or decision not in {"add", "reject"}:
+                return {"success": False, "error": "decision must be exactly 'add' or 'reject'"}
+            if not isinstance(explanation, str) or not explanation.strip():
+                return {"success": False, "error": "explanation must be a non-empty string"}
+            if pending_read["arxiv_id"] is None:
+                return {"success": False, "error": "Read a paper before calling decide_paper"}
+            if arxiv_id != pending_read["arxiv_id"]:
+                return {
+                    "success": False,
+                    "error": (
+                        "Decide only the currently read paper with arXiv ID "
+                        f"{pending_read['arxiv_id']!r}"
+                    ),
+                }
+            if decision == "add":
+                return add_paper(arxiv_id, summary=explanation.strip())
+            return reject_paper(arxiv_id, reason=explanation.strip())
 
         def submit_literature_review(review):
             if not papers:
@@ -543,24 +223,23 @@ class PhDStudentAgent(BaseResearchAgent):
 
         def available_tools():
             if pending_read["arxiv_id"] is not None:
-                return {"add_paper", "reject_paper"}
+                return {"decide_paper"}
             if papers:
                 return {"submit_literature_review"}
-            readable = seen_paper_ids - {item["arxiv_id"] for item in papers}   # 系统允许模型之后有新理由时重新阅读曾 reject 的论文，而不是永久禁止它。
             if candidate_batch["ids"]:
                 return {"read_arxiv_paper"}
-            return {"search_arxiv"} | ({"read_arxiv_paper"} if readable else set())
+            return {"search_arxiv"}
 
         registry = ToolRegistry()
         registry.register(
             "search_arxiv",
             (
-                "Search this query's local arXiv papers with a short query, excluding "
-                "already included or set-aside papers from new results."
+                "Search local arXiv papers for query. Return candidate IDs and search "
+                "results, excluding papers already added or rejected in this review."
             ),
             _object_schema(
                 {
-                    "query": _string("Short English paper search query"),
+                    "query": _string("Write a short English query for papers relevant to the research topic."),
                 },
                 ["query"],
             ),
@@ -568,55 +247,61 @@ class PhDStudentAgent(BaseResearchAgent):
         ).register(
             "read_arxiv_paper",
             (
-                "Read a paper returned by any search in this review, including a "
-                "previously rejected paper. Then call add_paper or reject_paper for "
-                "the same arXiv ID."
+                "Read one unreviewed candidate from the latest search_arxiv result. "
+                "Rejected papers cannot be read again in this review. Then "
+                "call decide_paper once for the same arxiv_id."
             ),
             _object_schema(
-                {"arxiv_id": _string("arXiv identifier returned by search_arxiv")},
+                {"arxiv_id": _string("Use the exact candidate ID returned by the latest search_arxiv call.")},
                 ["arxiv_id"],
             ),
             read_arxiv_paper,
         ).register(
-            "add_paper",
+            "decide_paper",
             (
-                "Include the currently read paper when it either directly supports the "
-                "study or provides transferable methodological, comparative, evaluative "
-                "or conceptual background. The dataset, domain, model, task and exact "
-                "research question need not match. Summarize what transfers, findings, "
-                "relevance and limitations using the same arXiv ID."
+                "Make exactly one decision for the paper just read. "
+                "Choose 'add' for either direct evidence OR useful methodological "
+                "or conceptual background. Background relevance is sufficient "
+                "when you can identify a concrete contribution to the current "
+                "study's hypothesis, feature or model choice, experimental design, "
+                "evaluation, or interpretation. "
+                "The paper need not answer the entire research question or use "
+                "the same dataset, model, settings, or exact comparison. "
+                "Missing the exact ablation or baseline comparison is not by "
+                "itself a reason to reject. "
+                "Shared keywords or a broad topic alone are insufficient. "
+                "Choose 'reject' only when no substantive direct or background "
+                "connection can be identified. "
+                "Do not infer that the paper lacks a method or analysis merely "
+                "because it is absent from a truncated excerpt."
             ),
             _object_schema(
                 {
-                    "arxiv_id": _string("Identifier of the paper already read"),
-                    "summary": _string("Accurate summary and relevant experimental findings"),
+                    "arxiv_id": _string("Use the exact ID of the paper just read."),
+                    "decision": {
+                        "type": "string",
+                        "enum": ["add", "reject"],
+                        "description": "Choose exactly one: add the paper or reject it.",
+                    },
+                    "explanation": _string(
+                        "For add, identify the concrete contribution to this study, "
+                        "summarize the supporting findings, and state limitations. "
+                        "For reject, explain why neither direct evidence nor useful "
+                        "background applies; dataset or setting differences alone "
+                        "are insufficient."
+                    ),
                 },
-                ["arxiv_id", "summary"],
+                ["arxiv_id", "decision", "explanation"],
             ),
-            add_paper,
-        ).register(
-            "reject_paper",
-            (
-                "Set aside the currently read paper only when its full text has no "
-                "substantive connection after considering transferable methods, "
-                "comparisons, evaluations or concepts. A mismatch in dataset, domain, "
-                "model, task, wording or exact research question alone is never enough. "
-                "Give a concise reason for the same arXiv ID; the paper may be "
-                "reconsidered later."
-            ),
-            _object_schema(
-                {
-                    "arxiv_id": _string("Identifier of the paper just read"),
-                    "reason": _string("Concise evidence-based rejection reason"),
-                },
-                ["arxiv_id", "reason"],
-            ),
-            reject_paper,
+            decide_paper,
         ).register(
             "submit_literature_review",
-            "Submit the completed literature review.",
+            (
+                "Write the complete English literature review in review and submit it. "
+                "Add at least one read paper first; this completes the literature-review stage."
+            ),
             _object_schema(
-                {"review": _string("Integrated English literature review")},
+                {"review": _string("Write the complete review, connecting the included papers to the research topic.")},
                 ["review"],
             ),
             submit_literature_review,
@@ -636,9 +321,9 @@ class PhDStudentAgent(BaseResearchAgent):
     def plan_feedback(self, topic, literature_review, postdoc_message):
         registry = ToolRegistry().register(
             "send_dialogue",
-            "Send planning feedback to the PostdocAgent.",
+            "Write concise planning feedback in message and send it to PostdocAgent.",
             _object_schema(
-                {"message": _string("Concise planning feedback")},
+                {"message": _string("Write feedback or corrections for the proposed experimental plan.")},
                 ["message"],
             ),
             lambda message: {"success": True, "message": message},
@@ -656,18 +341,18 @@ class PhDStudentAgent(BaseResearchAgent):
         registry = ToolRegistry().register(
             "send_dialogue",
             (
-                "Send results-analysis feedback to the PostdocAgent and state "
-                "whether one bounded, executable supplementary experiment is "
-                "necessary before final interpretation."
+                "Write evidence-based feedback in message for PostdocAgent. Set "
+                "supplement_required to say whether one specific additional experiment "
+                "is needed before final interpretation."
             ),
             _object_schema(
                 {
-                    "message": _string("Evidence-based interpretation feedback"),
+                    "message": _string("Write feedback on the results; if a supplement is needed, state its goal and expected outputs."),
                     "supplement_required": {
                         "type": "boolean",
                         "description": (
-                            "True only when one specific bounded executable "
-                            "supplement is necessary before final interpretation"
+                            "True: a specific supplement is required. False: finalize "
+                            "interpretation using existing evidence without another experiment."
                         ),
                     },
                 },
@@ -715,27 +400,27 @@ class PostdocAgent(BaseResearchAgent):
         registry = ToolRegistry().register(
             "send_dialogue",
             (
-                "Ask the PhDStudentAgent for focused planning feedback. This must be "
-                "used before submit_plan when no PhD feedback has been received."
+                "Write a proposed plan or focused question in message for PhDStudentAgent. "
+                "Request feedback before submitting the plan."
             ),
             _object_schema(
-                {"message": _string("Question or proposed planning direction")},
+                {"message": _string("Write the proposed plan or planning question for PhDStudentAgent.")},
                 ["message"],
             ),
             lambda message: {"success": True, "message": message},
         ).register(
             "submit_plan",
             (
-                "Submit the final experimental plan after receiving and incorporating "
-                "PhDStudentAgent feedback, together with a separate concise abstract "
-                "data-preparation requirements brief. Do not choose a concrete dataset."
+                "Write the final experiment plan in plan and separate data-preparation "
+                "needs in data_requirements. Submit after PhD feedback; leave concrete "
+                "dataset selection to the engineers."
             ),
             _object_schema(
                 {
-                    "plan": _string("Complete English experimental plan for MLESolver"),
+                    "plan": _string("Write the complete English experiment plan for MLESolverAgent."),
                     "data_requirements": _string(
-                        "Concise abstract data requirements for SWEngineerAgent and "
-                        "MLEngineerAgent before schema inspection"
+                        "Write abstract data requirements only; omit dataset IDs and "
+                        "schema-dependent field names."
                     ),
                 },
                 ["plan", "data_requirements"],
@@ -768,90 +453,93 @@ class PostdocAgent(BaseResearchAgent):
                 },
             }
 
+        def available_tools():
+            # 先完成审阅，再根据补实验决定或结束要求开放工具。
+            if phd_review_required:
+                return {"send_dialogue"}
+            if force_submit:
+                return {"submit_interpretation"}
+            if supplement_required is True:
+                return {"request_supplementary_experiment"}
+            if supplement_required is None:
+                return {"request_supplementary_experiment", "submit_interpretation"}
+            return {"submit_interpretation"}
+
         request_schema = _object_schema(
             {
-                "objective": _string("One specific evidence gap to resolve"),
-                "reason": _string("Why interpretation is unsafe without it"),
+                "objective": _string("Write the single evidence gap this supplement should resolve."),
+                "reason": _string("Write why this extra evidence is needed for the final interpretation."),
                 "required_outputs": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Exact metrics, comparisons, or diagnostics needed",
+                    "items": _string("One required metric, comparison, or diagnostic."),
+                    "description": "List the exact results the supplement must produce.",
                 },
                 "constraints": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Boundaries preserving the original experiment",
+                    "items": _string("One limit on scope, resources, or allowed changes."),
+                    "description": "List limits for the supplement; keep the original experiment unchanged.",
                 },
             },
             ["objective", "reason", "required_outputs", "constraints"],
         )
         submit_schema = _object_schema(
-            {"interpretation": _string("Final English interpretation")},
+            {"interpretation": _string("Write the complete final English interpretation, including remaining evidence limits.")},
             ["interpretation"],
         )
         submit_handler = lambda interpretation: {
             "success": True,
             "interpretation": interpretation,
         }
+        if supplement_required is True: # PhD 要求补充。评审完成且未强制收尾时，只开放申请补充实验的工具。
+            request_description = (
+                "Write objective, reason, required_outputs, and constraints for the "
+                "supplement required by PhD review. "
+                "At most ONE supplementary experiment is allowed across the entire "
+                "workflow for the original experiment. If one already exists, "
+                "do not request another; report remaining gaps as limitations. "
+                "This submits a request; the workflow runs it. "
+                "Preserve the original experiment."
+            )
+        else:   # else 虽然同时覆盖 None 和 False，但在 False 时，这段工具描述不会实际提供给模型，因为申请工具被隐藏了。 它主要用于 None 时让 Postdoc 自行判断。
+            request_description = (
+                "Write objective, reason, required_outputs, and constraints for one "
+                "necessary new supplement. "
+                "At most ONE supplementary experiment is allowed across the entire "
+                "workflow for the original experiment. If one already exists, "
+                "do not request another; report remaining gaps as limitations. "
+                "This submits a request; the workflow runs it. "
+                "Preserve the original experiment."
+            )
+
         registry = ToolRegistry()
-        if phd_review_required:
-            registry.register(
-                "send_dialogue",
-                (
-                    "Ask the PhDStudentAgent for focused interpretation feedback. This "
-                    "must be used before any final interpretation decision."
-                ),
-                _object_schema(
-                    {"message": _string("Question or proposed interpretation")},
-                    ["message"],
-                ),
-                lambda message: {"success": True, "message": message},
-            )
-        elif supplement_required is True and not force_submit:
-            registry.register(
-                "request_supplementary_experiment",
-                (
-                    "Request the one bounded, concrete supplementary experiment "
-                    "identified as necessary by PhD review. It must preserve the "
-                    "original experiment and cannot replace or edit it."
-                ),
-                request_schema,
-                request_supplementary_experiment,
-            )
-        elif supplement_required is None and not force_submit:
-            registry.register(
-                "request_supplementary_experiment",
-                (
-                    "Request one bounded, materially new supplementary experiment "
-                    "only when it is necessary for a sound interpretation. It must "
-                    "preserve the original experiment and cannot replace or edit it."
-                ),
-                request_schema,
-                request_supplementary_experiment,
-            ).register(
-                "submit_interpretation",
-                (
-                    "Submit the final evidence-based result interpretation after "
-                    "receiving and incorporating PhDStudentAgent feedback. State "
-                    "unresolved evidence gaps as limitations rather than repeating "
-                    "dialogue or replacing the original experiment."
-                ),
-                submit_schema,
-                submit_handler,
-            )
-        else:
-            registry.register(
-                "submit_interpretation",
-                (
-                    "Submit the final evidence-based result interpretation after "
-                    "receiving and incorporating PhDStudentAgent feedback. State "
-                    "unresolved evidence gaps as limitations rather than repeating "
-                    "dialogue or replacing the original experiment."
-                ),
-                submit_schema,
-                submit_handler,
-            )
-        return self.runtime("results interpretation", max_tool_steps=1).run_one(
+        registry.register(
+            "send_dialogue",
+            (
+                "Write a result interpretation or focused question in message for "
+                "PhDStudentAgent. Get feedback before requesting a supplement or "
+                "submitting the interpretation."
+            ),
+            _object_schema(
+                {"message": _string("Write the interpretation or question that PhDStudentAgent should review.")},
+                ["message"],
+            ),
+            lambda message: {"success": True, "message": message},
+        ).register(
+            "request_supplementary_experiment",
+            request_description,
+            request_schema,
+            request_supplementary_experiment,
+        ).register(
+            "submit_interpretation",
+            (
+                "Write the final English interpretation in interpretation using the "
+                "observed results and PhD feedback. Submit it to finish this stage; "
+                "state unresolved gaps as limitations."
+            ),
+            submit_schema,
+            submit_handler,
+        )
+        return self.runtime("results interpretation", max_tool_steps=1).run(
             system_prompt=postdoc_interpretation_prompt(),
             user_prompt=(
                 f"Topic: {topic}\nPlan: {plan}\n"
@@ -871,324 +559,9 @@ class PostdocAgent(BaseResearchAgent):
                 f"Workflow notice: {workflow_notice or 'None'}"
             ),
             registry=registry,
+            terminal_tools=registry.names,
+            tool_names_provider=available_tools,
         )
-
-_DATA_PREPARATION_FORBIDDEN_MODULE_PREFIXES = (
-    "sklearn.ensemble",
-    "sklearn.linear_model",
-    "sklearn.tree",
-    "sklearn.svm",
-    "sklearn.neighbors",
-    "sklearn.neural_network",
-    "sklearn.cluster",
-    "sklearn.naive_bayes",
-    "sklearn.discriminant_analysis",
-    "sklearn.gaussian_process",
-    "sklearn.metrics",
-    "xgboost",
-    "lightgbm",
-    "catboost",
-    "tensorflow",
-    "keras",
-    "torch.nn",
-    "torch.optim",
-)
-
-_DATA_PREPARATION_FORBIDDEN_METHODS = {
-    "predict",
-    "predict_proba",
-    "predict_log_proba",
-    "fit_predict",
-    "score",
-    "evaluate",
-    "backward",
-}
-
-_DATA_PREPARATION_FORBIDDEN_CALLS = {
-    "GridSearchCV",
-    "RandomizedSearchCV",
-    "cross_val_score",
-    "cross_validate",
-    "learning_curve",
-    "validation_curve",
-}
-
-_DATA_PREPARATION_FORBIDDEN_METRIC_CALLS = {
-    "accuracy_score",
-    "balanced_accuracy_score",
-    "classification_report",
-    "confusion_matrix",
-    "f1_score",
-    "mean_absolute_error",
-    "mean_squared_error",
-    "precision_score",
-    "r2_score",
-    "recall_score",
-    "roc_auc_score",
-}
-
-_DATA_PREPARATION_FORBIDDEN_NAMESPACE_IMPORTS = {
-    "sklearn": {
-        "cluster",
-        "discriminant_analysis",
-        "ensemble",
-        "gaussian_process",
-        "linear_model",
-        "metrics",
-        "naive_bayes",
-        "neighbors",
-        "neural_network",
-        "svm",
-        "tree",
-    },
-    "torch": {"nn", "optim"},
-}
-
-
-def _dotted_ast_name(node):
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parent = _dotted_ast_name(node.value)
-        return f"{parent}.{node.attr}" if parent else node.attr
-    return ""
-
-
-def _is_data_preparation_forbidden_module(module_name):
-    return any(
-        module_name == prefix or module_name.startswith(prefix + ".")
-        for prefix in _DATA_PREPARATION_FORBIDDEN_MODULE_PREFIXES
-    )
-
-
-def _data_preparation_scope_violations(code):
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        # The execution layer already returns a precise syntax diagnostic.
-        return []
-
-    violations = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if _is_data_preparation_forbidden_module(alias.name):
-                    violations.add(f"import {alias.name}")
-        elif isinstance(node, ast.ImportFrom):
-            module_name = node.module or ""
-            if _is_data_preparation_forbidden_module(module_name):
-                violations.add(f"import from {module_name}")
-            elif module_name in _DATA_PREPARATION_FORBIDDEN_NAMESPACE_IMPORTS:
-                for alias in node.names:
-                    if alias.name in _DATA_PREPARATION_FORBIDDEN_NAMESPACE_IMPORTS[module_name]:
-                        violations.add(f"import {module_name}.{alias.name}")
-        elif isinstance(node, ast.Call):
-            dotted_name = _dotted_ast_name(node.func)
-            call_name = dotted_name.rsplit(".", 1)[-1]
-            if _is_data_preparation_forbidden_module(dotted_name):
-                violations.add(f"call {dotted_name}()")
-            if call_name in _DATA_PREPARATION_FORBIDDEN_METHODS:
-                violations.add(f"call .{call_name}()")
-            if call_name in _DATA_PREPARATION_FORBIDDEN_CALLS:
-                violations.add(f"call {call_name}()")
-            if call_name in _DATA_PREPARATION_FORBIDDEN_METRIC_CALLS:
-                violations.add(f"call {call_name}()")
-            if call_name.endswith(("Classifier", "Regressor")):
-                violations.add(f"construct {call_name}()")
-    return sorted(violations)
-
-
-_KEY_ERROR_COLUMN_RE = re.compile(r"KeyError:\s*['\"]([^'\"]+)['\"]")
-_GENERATED_CODE_LINE_RE = re.compile(r'File "<string>", line (\d+)')
-_DATAFRAME_TRANSFORMATION_MARKERS = (
-    ("pd.get_dummies", "one-hot encoding"),
-    (".drop(", "column removal"),
-    (".rename(", "column renaming"),
-    (".set_index(", "index restructuring"),
-    (".reset_index(", "index restructuring"),
-    (".merge(", "dataframe merge"),
-    (".join(", "dataframe join"),
-    (".pivot(", "dataframe pivot"),
-    (".melt(", "dataframe reshape"),
-)
-
-
-def _data_preparation_syntax_repair_hint(code):
-    """Point a repair attempt at the local syntax error and its nearby code."""
-    try:
-        ast.parse(str(code))
-    except SyntaxError as exc:
-        if not exc.lineno:
-            return None
-        code_lines = str(code).splitlines()
-        start = max(0, exc.lineno - 3)
-        end = min(len(code_lines), exc.lineno + 2)
-        context = "\n".join(
-            f"{index + 1}: {code_lines[index]}"
-            for index in range(start, end)
-        )
-        return (
-            f"Python syntax validation failed at line {exc.lineno}: {exc.msg}. "
-            "Correct the shown line and its surrounding indentation, parentheses, "
-            "or commas before retrying.\nRelevant code:\n"
-            + context
-        )
-    return None
-
-
-def _data_preparation_key_error_repair_hint(
-    code,
-    error,
-    traceback_text,
-    inspected_dataset,
-):
-    match = _KEY_ERROR_COLUMN_RE.search(str(error or ""))
-    if match is None:
-        match = _KEY_ERROR_COLUMN_RE.search(str(traceback_text or ""))
-    if match is None:
-        return None
-    missing_column = match.group(1)
-    schema = (
-        inspected_dataset.get("dataset_schema", {})
-        if isinstance(inspected_dataset, dict)
-        else {}
-    )
-    columns = schema.get("columns", {}) if isinstance(schema, dict) else {}
-    if missing_column not in columns:
-        return None
-
-    code_lines = str(code).splitlines()
-    generated_lines = _GENERATED_CODE_LINE_RE.findall(str(traceback_text or ""))
-    if generated_lines:
-        failure_line = int(generated_lines[-1])
-        relevant_code = "\n".join(code_lines[:max(0, failure_line - 1)])
-    else:
-        relevant_code = str(code)
-    transformations = [
-        label
-        for marker, label in _DATAFRAME_TRANSFORMATION_MARKERS
-        if marker in relevant_code
-    ]
-    if not transformations:
-        return None
-    transformation_summary = ", ".join(dict.fromkeys(transformations))
-    return (
-        f"The missing column {missing_column!r} exists in the inspected raw schema. "
-        "The KeyError occurred after a dataframe transformation "
-        f"({transformation_summary}), so do not re-inspect the raw schema. "
-        "Trace the transformed dataframe, preserve target and analysis-role columns "
-        "before feature transformations, encode a separate feature dataframe, and "
-        "do not access original role columns from the transformed dataframe."
-    )
-
-
-def _run_preparation_code(code, workdir, inspected_dataset=None):
-    """Shared execution for ML trials and SW final submissions."""
-    if not code.strip():
-        return {"success": False, "code": code, "output": "", "error": "Provide Python code"}
-    violations = _data_preparation_scope_violations(code)
-    if violations:
-        return {
-            "success": False,
-            "error_type": "data_preparation_scope_violation",
-            "error": (
-                "Data preparation code may only prepare reusable data. Move model "
-                "training, prediction, and final evaluation to MLESolver: "
-                + ", ".join(violations)
-            ),
-            "traceback": "",
-            "exit_code": None,
-            "code": code,
-            "output": "",
-            "selection": {},
-            "artifacts": [],
-            "prepared_data_manifest": None,
-        }
-    execution = execute_code(code, timeout=900, workdir=workdir, return_details=True)
-    details = execution
-    output = details["output"]
-    selection = {}
-    for event in details.get("replay_events", []):
-        if event.get("tool") == "huggingface.load_dataset" and event.get("success") is True:
-            request = event.get("request") or {}
-            selection = {
-                "dataset_id": request.get("dataset_id"),
-                "config_name": request.get("config_name"),
-                "split": request.get("split"),
-                "revision": event.get("object_revision") or request.get("revision"),
-            }
-            break
-    result = {
-        "success": details["success"],
-        "error_type": details["error_type"],
-        "error": details["error"],
-        "traceback": details["traceback"],
-        "exit_code": details["exit_code"],
-        "code": code,
-        "output": output,
-        "selection": selection,
-        "artifacts": list(details.get("artifacts", [])),
-        "prepared_data_manifest": details.get("prepared_data_manifest"),
-    }
-    if result["success"] is False:
-        category = classify_runtime_data_failure(
-            result["error"], result["traceback"]
-        )
-        if category is not None:
-            result["failure_category"] = category
-            repair_hint = runtime_data_repair_hint(category)
-        else:
-            repair_hint = _data_preparation_syntax_repair_hint(code)
-        if repair_hint is None:
-            repair_hint = _data_preparation_key_error_repair_hint(
-                code,
-                result["error"],
-                result["traceback"],
-                inspected_dataset,
-            )
-        if repair_hint:
-            result["repair_hint"] = repair_hint
-    return result
-
-
-def _inspection_feedback_for_prompt(feedback, inspected_dataset):
-    """Reference an identical inspection already included separately in this prompt."""
-    if (
-        not isinstance(feedback, dict)
-        or feedback.get("tool") != "inspect_huggingface_dataset"
-        or feedback.get("success") is not True
-        or not isinstance(inspected_dataset, dict)
-        or inspected_dataset.get("success", True) is not True
-        or not inspected_dataset.get("dataset_schema")
-    ):
-        return feedback
-    identity_fields = ("dataset_id", "revision", "config_name", "split")
-    if any(not inspected_dataset.get(name) for name in identity_fields):
-        return feedback
-    feedback_details = {key: value for key, value in feedback.items() if key not in {"tool", "success"}}
-    inspected_details = {key: value for key, value in inspected_dataset.items() if key not in {"tool", "success"}}
-    if feedback_details != inspected_details:
-        return feedback
-    return {
-        "tool": "inspect_huggingface_dataset",
-        "success": True,
-        "message": "Inspection succeeded; see Authoritative inspected dataset below for the complete result.",
-    }
-
-
-def _authoritative_execution_failure(value):
-    if not isinstance(value, dict) or value.get("success") is not False:
-        return None
-    return dict(value)
-
-
-def _stale_diagnostic_marker():
-    return {
-        "message": (
-            "A newer execution failure is supplied below as the authoritative "
-            "diagnostic. Do not rely on older error analysis or repair advice."
-        )
-    }
 
 
 class MLEngineerAgent(BaseResearchAgent):
@@ -1234,30 +607,33 @@ class MLEngineerAgent(BaseResearchAgent):
             }
         return None
 
-    def data_preparation_turn(
-        self, topic, data_requirements, literature_review, sw_message,
-        conversation_history="", workdir=None, feedback=None,
-        inspected_dataset=None,
-        trial_pending=False,
-        selected_dataset=None,
-        latest_execution_failure=None,
-        failed_trial_code_failures=None,
-    ):
+    def data_preparation_turn(self, topic, data_requirements, literature_review, sw_message,conversation_history="", workdir=None, feedback=None,inspected_dataset=None,selected_dataset=None,latest_execution_failure=None,failed_trial_code_failures=None,*,code_execution_timeout_seconds):
         search = HFDataSearch()
-        must_execute = bool(inspected_dataset) and trial_pending
-        if isinstance(selected_dataset, dict):
+        if inspected_dataset:   # 若已经完成 inspection，inspection 的身份信息最可靠，直接从中重新构造选中数据集。
+            selected_dataset = {
+                key: inspected_dataset.get(key)
+                for key in ("dataset_id", "revision", "config_name", "split")
+            }
+        elif isinstance(selected_dataset, dict):    # 表示还没 inspection，但外层工作流已经明确传来了选定数据集。这里复制一份，避免后面修改局部变量时影响外层原来的字典。
             selected_dataset = dict(selected_dataset)
-        elif isinstance(feedback, dict) and isinstance(feedback.get("selected_dataset"), dict):
+        elif isinstance(feedback, dict) and isinstance(feedback.get("selected_dataset"), dict): # 若参数 selected_dataset 没有传入，但上一轮工具反馈里带着：就从反馈中把选择恢复出来。
             selected_dataset = dict(feedback["selected_dataset"])
-        else:
+        else:   # 表示当前还没有选定任何数据集。因此后面只应允许搜索，不能直接 inspection 或执行代码。
             selected_dataset = None
         latest_execution_failure = _authoritative_execution_failure(
             latest_execution_failure
-        )
-        if failed_trial_code_failures is None:
+        )   # 是把“上一轮失败信息”过滤成可靠形式。
+        if failed_trial_code_failures is None:  # 用来保存已经执行失败过的数据准备代码哈希, 避免重复执行相同的失败代码。
             failed_trial_code_failures = {}
 
-        def search_huggingface(query, max_results):
+        def search_huggingface_datasets(query, max_results):
+            if selected_dataset:
+                return {
+                    "success": False,
+                    "error_type": "dataset_selection_locked",
+                    "error": "The dataset is already selected; inspect or prepare that dataset",
+                    "selected_dataset": selected_dataset,
+                }
             results = search.retrieve_ds(query, N=max(1, min(int(max_results), 10)))
             selected = self._select_first_complete_dataset(results)
             return {
@@ -1266,34 +642,24 @@ class MLEngineerAgent(BaseResearchAgent):
                 "selected_dataset": selected,
                 "next_action_hint": (
                     "A complete local candidate was selected. Call "
-                    "inspect_huggingface_dataset for that candidate; do not search again."
+                    "inspect_selected_dataset for that candidate; do not search again."
                     if selected
                     else "No complete local candidate was returned. Search with a different query."
                 ),
             }
 
-        def inspect_huggingface_dataset(
-            dataset_id=None,
-            revision=None,
-            config_name=None,
-            split=None,
-        ):
-            if selected_dataset:
-                dataset_id = selected_dataset["dataset_id"]
-                revision = selected_dataset["revision"]
-                config_name = selected_dataset["config_name"]
-                split = selected_dataset["split"]
-            elif not all((dataset_id, revision, config_name, split)):
+        def inspect_selected_dataset():
+            if not selected_dataset:
                 return {
                     "success": False,
                     "error_type": "missing_dataset_selection",
-                    "error": "Provide a complete dataset selection before inspection",
+                    "error": "Select a local Hugging Face dataset before inspection",
                 }
             inspected = search.inspect_dataset(
-                dataset_id,
-                revision,
-                config_name,
-                split,
+                selected_dataset["dataset_id"],
+                selected_dataset["revision"],
+                selected_dataset["config_name"],
+                selected_dataset["split"],
             )
             return {
                 "success": True,
@@ -1301,24 +667,18 @@ class MLEngineerAgent(BaseResearchAgent):
                 "selected_dataset": selected_dataset,
             }
 
-        def execute_dataset_code(code):
-            fingerprint = _code_hash(code)
+        def write_and_run_dataset_code(code):
+            # A trailing newline or spaces do not make a failed preparation program a new repair.
+            fingerprint = _code_hash(str(code).rstrip(" \t\r\n"))
+            # 检查是否已经执行过相同的代码
             if fingerprint in failed_trial_code_failures:
-                prior_failure = dict(
-                    failed_trial_code_failures.get(fingerprint) or {}
-                )
+                prior_failure = dict(failed_trial_code_failures.get(fingerprint) or {}) # 取出上次失败摘要，并复制一份。
                 original_error = prior_failure.get("error") or "the prior failure"
-                return {
+                return {    # 直接返回失败结果
                     "success": False,
                     "error_type": "unchanged_failed_dataset_code",
-                    "error": (
-                        "This exact data-preparation code already failed. It was not "
-                        "executed again."
-                    ),
-                    "repair_hint": (
-                        "Make a substantive code change that resolves the original "
-                        f"failure before retrying: {original_error}"
-                    ),
+                    "error": ("This exact data-preparation code already failed. It was not executed again."),
+                    "repair_hint": (f"Make a substantive code change that resolves the original failure before retrying: {original_error}"),  # 提示模型必须真正修复此前错误，而不是原样重试。
                     "original_error_type": prior_failure.get("error_type"),
                     "original_error": prior_failure.get("error"),
                     "original_repair_hint": prior_failure.get("repair_hint"),
@@ -1333,67 +693,66 @@ class MLEngineerAgent(BaseResearchAgent):
                     "selected_dataset": selected_dataset,
                 }
             result = {
-                **_run_preparation_code(code, workdir, inspected_dataset),
+                **_run_preparation_code(
+                    code, workdir, inspected_dataset, code_execution_timeout_seconds,
+                ),
                 "code_hash": fingerprint,
                 "selected_dataset": selected_dataset,
-            }
-            if result.get("success") is False:
+            }   # 它会真正执行代码
+            if result.get("success") is False:  # 只要真实执行失败，就把该代码哈希加入失败表：
                 failed_trial_code_failures[fingerprint] = {
                     key: result.get(key)
                     for key in ("error_type", "error", "repair_hint")
                     if result.get(key)
-                }
+                }   # 只是把上次失败的诊断摘要存起来：下一次模型又提交同一份代码时，框架会取回它的失败原因
             return result
 
-        selection_pending = bool(selected_dataset) and not inspected_dataset
-        selected_and_inspected = bool(selected_dataset) and bool(inspected_dataset)
-        inspection_schema = (
-            _object_schema({}, [])
-            if selection_pending
-            else _object_schema({
-                "dataset_id": _string("Exact dataset ID returned by search_huggingface"),
-                "revision": _string("Exact materialized revision returned by search"),
-                "config_name": _string("Exact materialized configuration name"),
-                "split": _string("Exact materialized split name"),
-            }, ["dataset_id", "revision", "config_name", "split"])
-        )
-        inspection_description = (
-            "Inspect the automatically selected complete local dataset. No arguments "
-            "are needed; the framework supplies the dataset identity."
-            if selection_pending
-            else (
-                "Read the authoritative schema of one exact local Hugging Face "
-                "dataset revision, configuration, and split. Use this after search "
-                "and before writing schema-dependent preparation code."
+        selection_pending = bool(selected_dataset) and not inspected_dataset    # 表示已经选择数据集，但还没有完成 inspection。
+        selected_and_inspected = bool(selected_dataset) and bool(inspected_dataset)    # 表示已经选择数据集，并且已经完成 inspection。
+        if selection_pending:
+            next_action = "Inspect the automatically selected local candidate; do not search again."
+        elif selected_and_inspected and latest_execution_failure:
+            next_action = (
+                "Repair the complete preparation program using the authoritative execution "
+                "failure and repair_hint, then call write_and_run_dataset_code. "
+                "Do not resubmit unchanged failed code."
             )
-        )
+        elif selected_and_inspected:
+            next_action = "Generate the complete preparation program and call write_and_run_dataset_code."
+        else:
+            next_action = "Search for a local dataset or discuss the preparation requirements."
         registry = ToolRegistry().register(
-            "search_huggingface",
+            "search_huggingface_datasets",
             (
-                "Search the current query's local Hugging Face datasets. When a "
-                "complete candidate is returned, the framework selects the first one "
-                "and exposes only inspect_huggingface_dataset next."
+                "Find local Hugging Face datasets for your query. The framework "
+                "selects the first complete result for preparation."
             ),
             _object_schema({
-                "query": _string("Dataset search query"),
-                "max_results": {"type": "integer", "description": "Number of results, 1 to 10"},
+                "query": _string("Short search terms describing the required data and task."),
+                "max_results": {"type": "integer", "description": "Maximum number of dataset results to return, from 1 to 10."},
             }, ["query", "max_results"]),
-            search_huggingface,
+            search_huggingface_datasets,
         ).register(
-            "inspect_huggingface_dataset",
-            inspection_description,
-            inspection_schema,
-            inspect_huggingface_dataset,
+            "inspect_selected_dataset",
+            "Read the selected dataset's columns, types, row counts, and sample types. "
+            "No arguments; the dataset is already selected.",
+            _object_schema({}, []),
+            inspect_selected_dataset,
         ).register(
-            "execute_dataset_code",
-            "Run complete candidate data-preparation Python code and inspect its output. "
-            "This is a trial; the SWEngineerAgent submits the final code.",
-            _object_schema({"code": _string("Complete candidate Python code")}, ["code"]),
-            execute_dataset_code,
+            "write_and_run_dataset_code",
+            "Write the complete data-preparation program in code. The tool checks and "
+            "runs it. Success finishes data preparation; failure returns an error to fix.",
+            _object_schema({"code": _string(
+                "Complete Python source with imports for the inspected dataset. "
+                "Data preparation only; no model training or evaluation. No Markdown fences."
+            )}, ["code"]),
+            write_and_run_dataset_code,
         ).register(
             "send_dialogue",
-            "Reply to the SWEngineerAgent with dataset choices, code suggestions or questions.",
-            _object_schema({"message": _string("Message to the software engineer")}, ["message"]),
+            "Send SWEngineerAgent a dataset suggestion or a question about the data requirements.",
+            _object_schema({"message": _string(
+                "Your concrete question or suggestion for preparing the required data."
+            )}, ["message"]),
             lambda message: {"success": True, "message": message},
         )
         return self.runtime("data preparation collaboration", max_tool_steps=1).run(
@@ -1401,28 +760,26 @@ class MLEngineerAgent(BaseResearchAgent):
             user_prompt=(
                 f"Topic: {topic}\n"
                 f"Data preparation requirements: {data_requirements}\n"
-                f"Latest SWEngineer message: "
-                f"{'Repair the authoritative latest execution failure below.' if latest_execution_failure else sw_message}\n"
+                f"Latest SWEngineer message: {sw_message}\n"
                 f"Previous ML command result: "
-                f"{json.dumps(_stale_diagnostic_marker() if latest_execution_failure else _inspection_feedback_for_prompt(feedback, inspected_dataset), ensure_ascii=True, default=str)}\n"
+                f"{json.dumps(_preparation_feedback_for_prompt(feedback, inspected_dataset, latest_execution_failure), ensure_ascii=True, default=str)}\n"
                 f"Authoritative latest execution failure: "
                 f"{json.dumps(latest_execution_failure, ensure_ascii=True, default=str)}\n"
                 f"Authoritative inspected dataset: "
                 f"{json.dumps(inspected_dataset, ensure_ascii=True, default=str)}\n"
                 f"Automatically selected local dataset: "
                 f"{json.dumps(selected_dataset, ensure_ascii=True, default=str)}\n"
-                f"Next action: "
-                f"{'Execute the complete preparation code now; schema inspection has succeeded.' if must_execute else ('Inspect the automatically selected local candidate; do not search again.' if selection_pending else ('Repair and execute preparation code for the selected, inspected dataset.' if selected_and_inspected else 'Choose the next useful action from the available tools.'))}\n"
+                f"Next action: {next_action}\n"
                 f"Conversation so far:\n{conversation_history or 'None'}\n"
-                f"Execution environment: {json.dumps(_execution_capabilities(), ensure_ascii=True)}"
+                f"Execution environment: {json.dumps(execution_capabilities(), ensure_ascii=True)}"
             ),
             registry=registry,
             terminal_tools=registry.names,
             return_after_tool=True,
             tool_names_provider=(
-                lambda: {"execute_dataset_code"}
-                if must_execute or selected_and_inspected
-                else ({"inspect_huggingface_dataset"} if selection_pending else registry.names)
+                lambda: {"write_and_run_dataset_code"}
+                if selected_and_inspected
+                else ({"inspect_selected_dataset"} if selection_pending else {"search_huggingface_datasets", "send_dialogue"})
             ),
         )
 
@@ -1435,48 +792,16 @@ class SWEngineerAgent(BaseResearchAgent):
         conversation_history="", feedback=None, ml_result=None,
         inspected_dataset=None,
         latest_execution_failure=None,
-        verified_trial=None,
+        *, code_execution_timeout_seconds,
     ):
-        def submit_dataset_code(code=None):
-            if isinstance(verified_trial, dict):
-                return dict(verified_trial)
-            if not inspected_dataset:
-                return {
-                    "success": False,
-                    "error_type": "schema_not_inspected",
-                    "error": (
-                        "Inspect the selected Hugging Face dataset schema before "
-                        "submitting data-preparation code"
-                    ),
-                    "code": code,
-                    "output": "",
-                }
-            return _run_preparation_code(code, workdir, inspected_dataset)
-
-        # 据 verified_trial 是否存在，注册不同版本的工具。
-        if isinstance(verified_trial, dict):    # MLE 已经验证成功,不传任何参数
-            registry = ToolRegistry().register(
-                "submit_dataset_code",
-                (
-                    "Promote the exact successful MLE trial code and execution result. "
-                    "No arguments are accepted and the code is not executed again."
-                ),
-                _object_schema({}, []),
-                submit_dataset_code,
-            )
-        else:   # 还没有验证成功,一整段新的数据准备代码
-            registry = ToolRegistry().register(
-                "send_dialogue",
-                "Direct or consult the MLEngineerAgent about dataset search and preparation code.",
-                _object_schema({"message": _string("Message to the ML engineer")}, ["message"]),
-                lambda message: {"success": True, "message": message},
-            ).register(
-                "submit_dataset_code",
-                "Execute the complete final data-preparation code. Successful execution "
-                "submits it; on failure the error returns to the collaboration.",
-                _object_schema({"code": _string("Complete final Python data-preparation code")}, ["code"]),
-                submit_dataset_code,
-            )
+        registry = ToolRegistry().register(
+            "send_dialogue",
+            "Send MLEngineerAgent your data requirements analysis or a specific code-fix instruction.",
+            _object_schema({"message": _string(
+                "Your analysis and next requested action. For a failure, identify the failing code and the fix."
+            )}, ["message"]),
+            lambda message: {"success": True, "message": message},
+        )
         return self.runtime("data preparation collaboration", max_tool_steps=1).run(
             system_prompt=sw_data_preparation_prompt(),
             user_prompt=(
@@ -1485,22 +810,858 @@ class SWEngineerAgent(BaseResearchAgent):
                 f"Previous SW command result: "
                 f"{json.dumps(_stale_diagnostic_marker() if _authoritative_execution_failure(latest_execution_failure) else feedback, ensure_ascii=True, default=str)}\n"
                 f"Latest ML command result: "
-                f"{json.dumps(_stale_diagnostic_marker() if _authoritative_execution_failure(latest_execution_failure) else _inspection_feedback_for_prompt(ml_result, inspected_dataset), ensure_ascii=True, default=str)}\n"
+                f"{json.dumps(_preparation_feedback_for_prompt(ml_result, inspected_dataset, latest_execution_failure), ensure_ascii=True, default=str)}\n"
                 f"Authoritative latest execution failure: "
                 f"{json.dumps(_authoritative_execution_failure(latest_execution_failure), ensure_ascii=True, default=str)}\n"
                 f"Authoritative inspected dataset: "
                 f"{json.dumps(inspected_dataset, ensure_ascii=True, default=str)}\n"
-                f"Verified MLE trial ready for direct submission: "
-                f"{isinstance(verified_trial, dict)}\n"
                 f"Conversation so far:\n{conversation_history or 'None'}\n"
-                f"Execution environment: {json.dumps(_execution_capabilities(), ensure_ascii=True)}"
+                f"Execution environment: {json.dumps(execution_capabilities(), ensure_ascii=True)}"
             ),
             registry=registry,
             terminal_tools=registry.names,
             return_after_tool=True, # 无论成功还是失败，只要执行过一个工具，就把控制权交回外层协作流程
-            automatic_tools={"submit_dataset_code"} if isinstance(verified_trial, dict) else set(), # 框架要不要跳过模型，自己直接调用工具.
-            # 若 verified_trial 存在：直接submit_dataset_code()，不会请求大模型。若不存在，automatic_tools = set()，需要调用模型让模型选择
         )
+
+
+class MLESolverAgent(BaseResearchAgent):
+    role = "machine learning experiment solver"
+
+    def __init__(self, model, api_key, code_execution_timeout_seconds):
+        super().__init__(model, api_key)
+        self.code_execution_timeout_seconds = code_execution_timeout_seconds
+
+    def solve(self, state, workdir):
+        current = {
+            "code": "",     # 当前版本的实验代码，不包含前置的数据准备代码.write_experiment_code() 整体替换；edit_experiment_code() 局部修改
+            "output": "",   # 当前程序最近一次执行的输出.替换、编辑代码时清空；_process_execution_result() 在执行后写入
+            "success": None,    # 当前代码的执行状态：None 未执行、False 执行失败、True 执行成功
+            "code_hash": None,  # 当前代码的指纹，用于判断代码文本是否相同.code_hash：现在是哪一份代码？
+            "failed_hashes": set(), # 已经失败过的代码指纹集合。failed_hashes：这份代码以前失败过吗？
+            "failed_failures": {},  # 每个失败代码指纹对应的错误详情。failed_failures：它以前为什么失败？
+            "last_failure_category": None,  # 最近一次执行失败的类别
+            "consecutive_failure_category_count": 0,    # 连续出现同一错误类别的次数
+            "force_replace": False,  # 是否强制替换当前代码
+            "latest_execution_failure": None,  # 最近一次执行失败的详情
+        }
+
+        # 当模型提交了一份不应再次执行的实验代码时，生成拒绝结果，并把之前的报错信息返回给模型，帮助它继续修复。
+        def rejected_experiment_code(fingerprint, action):
+            """
+                fingerprint：这次提交代码的哈希值，用来识别代码版本。
+                action：这次操作的名字，例如 write_experiment_code 或 edit_experiment_code。
+                current：外层函数保存的实验状态，包括当前代码、失败过的代码版本，以及对应的错误信息。
+            """
+            previously_failed = fingerprint in current["failed_hashes"] # 在曾经执行失败的集合中，previously_failed 就是 True，否则是 False。
+            latest_failure = current.get("latest_execution_failure")    # # 取出最近一次实验执行的错误信息。如果不存在这个键，则得到 None。
+            if previously_failed:  # 如果这份代码以前失败过，进入这个分支。
+                original_failure = dict(current.get("failed_failures", {}).get(fingerprint) or {})  # 找到这份代码自己对应的历史失败诊断。original_failure 是整份错误详情，是一个字典。
+                original_error = original_failure.get("error") or "the original failure"    # 取出这份代码当时的错误描述。失败记录里的具体错误描述
+                result = {
+                    "success": False,
+                    "error_type": "unchanged_failed_experiment_code",
+                    "error": (
+                        "This exact experiment code previously failed and was not executed again."
+                    ),
+                    "repair_hint": (
+                        "Do not submit this code hash again. Apply atomic edits or "
+                        "write a materially different replacement that resolves the "
+                        f"original failure: {original_error}"
+                    ),
+                    "original_error_type": original_failure.get("error_type"),
+                    "original_error": original_failure.get("error"),
+                    "original_failure_category": original_failure.get(
+                        "failure_category"
+                    ),
+                    "original_repair_hint": original_failure.get("repair_hint"),
+                    "code_hash": fingerprint,
+                    "action": action,
+                }   # 创建一个新的返回字典，同时把旧记录里的字段复制过去，换一个名字
+                if original_failure:    #  # 如果找到了这份代码自己的历史失败诊断，把它加入结果中。
+                    result["original_execution_diagnostic"] = original_failure
+                if latest_failure:   # 如果当前状态中存在最近一次执行的失败诊断
+                    result["latest_execution_diagnostic"] = dict(latest_failure)
+                return result
+            return {
+                "success": False,
+                "error_type": "unchanged_current_experiment_code",
+                "error": "The proposed experiment code is unchanged from the current draft.",
+                "repair_hint": "Make a substantive code change before retrying.",
+                "code_hash": fingerprint,
+                "action": action,
+            }
+
+        def execute_experiment_code():
+            if not current["code"]:
+                return {"success": False, "error": "Create experiment code first"}
+            fingerprint = _code_hash(current["code"])
+            if fingerprint in current["failed_hashes"]:
+                return rejected_experiment_code(fingerprint, "execute_experiment_code")
+
+            combined = state.dataset_code + "\n\n" + current["code"]    # 合并数据准备代码和当前实验代码
+            execution = execute_code(combined,timeout=self.code_execution_timeout_seconds,workdir=workdir,return_details=True,expected_hf_dataset=state.dataset_selection or None,)
+            return _process_execution_result(current, fingerprint, execution, "running experiments",)
+
+        def write_experiment_code(code):
+            syntax_error = python_syntax_error(code)   # 检查代码能否被 Python 正常解析。
+            if syntax_error:
+                return {"success": False,"error_type": "syntax_error","error": syntax_error,}
+
+            fingerprint = _code_hash(code)  # 计算代码指纹，检查是否重复
+            if fingerprint in {current.get("code_hash"),} or fingerprint in current["failed_hashes"]:   # 如果代码指纹与当前代码指纹相同，或者代码指纹在失败集合中，都拒绝替换。
+                return rejected_experiment_code(fingerprint,"write_experiment_code")
+
+            current.update(code=code,output="",success=None,code_hash=fingerprint,force_replace=False,) # 通过检查后，接受新代码
+            return {"success": True,"message": "Experiment code replaced; automatic execution is next","code_hash": fingerprint,}
+
+        def edit_experiment_code(edits):
+            if not current["code"]: # 如果目前还没有代码，就无法修改，直接返回失败。
+                return {"success": False, "error": "Create experiment code first"}
+            if not isinstance(edits, list) or not edits:    # edits 必须是列表。列表不能为空。列表不能为空。列表不能为空。edit：当前修改字典，例如 {"old_text": "...", "new_text": "..."}。
+                return {"success": False,"error": "edits must contain at least one edit object",}
+            if len(edits) > 6:  # 限制一次最多提交 6 处修改。
+                return {"success": False,"error": "edits may contain at most 6 changes",}
+
+            source = current["code"]    # 把当前代码取出来，保存为 source。这一批修改都以这份原代码为匹配依据。
+            seen_old_text = set()    # 建立集合，记录本批次已经出现过哪些 old_text，用于检查重复。
+            planned_edits = []  # 建立列表，保存已经检查通过的修改计划。每处修改的起始位置、结束位置和新内容。此时还没有真正替换代码。
+            for index, edit in enumerate(edits, start=1):   # 逐个检查修改对象
+                if not isinstance(edit, dict) or set(edit) != {"old_text", "new_text"}:
+                    return {"success": False,"error": (f"edit {index} must contain only old_text and new_text"),}
+                old_text = edit["old_text"]
+                new_text = edit["new_text"] # 取出要查找的旧片段，以及准备替换进去的新片段。
+
+                if not isinstance(old_text, str) or not isinstance(new_text, str):  # 要求两者都是字符串。
+                    return {"success": False,"error": f"edit {index} old_text and new_text must be strings",}
+                if not old_text:    # 旧片段不能为空，否则无法明确定位修改位置。
+                    return {"success": False,"error": f"edit {index} old_text must not be empty",}
+                if old_text in seen_old_text:   # 如果本批次已经处理过相同的旧片段，就拒绝重复修改。
+                    return {"success": False,"error": "Each edit old_text must be unique within one batch",}
+                seen_old_text.add(old_text)
+
+                occurrences = source.count(old_text)    # 统计旧片段在原代码中的匹配次数。
+                if occurrences != 1:     # 如果匹配次数不是 1，就拒绝修改。0 次：原代码中找不到，可能写错了内容或空格。多于 1 次：无法确定想修改哪一处。
+                    return {"success": False,
+                        "error": ( f"edit {index} old_text must match exactly once; matched {occurrences}"),}
+
+                start = source.index(old_text)  # 找到旧片段在原代码中开始的位置。
+                planned_edits.append((start, start + len(old_text), new_text))  # 把修改计划保存为三元组：(起始位置, 结束位置, 新内容)
+
+            planned_edits.sort(key=lambda item: item[0])    # 按照每处修改的起始位置排序。
+            for previous, following in zip(planned_edits, planned_edits[1:]):
+                if following[0] < previous[1]:    # 如果后续修改的起始位置在前一个修改的结束位置之前，说明重叠，就拒绝修改。
+                    return {"success": False,"error": "Batch edits overlap in the current experiment code",}
+
+            edited = source
+            for start, end, new_text in reversed(planned_edits):    # 按位置从后往前处理修改。
+                edited = edited[:start] + new_text + edited[end:]   # 换掉原来的 edited[start:end]
+            syntax_error = python_syntax_error(edited)  #@ 检查修改后的 Python 语法，例如括号、缩进是否有问题。
+            if syntax_error:    # 发现语法错误就拒绝更新。语法检查通过，只能说明语法合法，不代表代码运行一定正确。
+                return {
+                    "success": False,
+                    "error_type": "syntax_error",
+                    "error": syntax_error,
+                }
+
+            fingerprint = _code_hash(edited)    # 为修改后的代码计算哈希，用来识别代码版本。
+            if fingerprint in {current.get("code_hash"),} or fingerprint in current["failed_hashes"]:
+                return rejected_experiment_code(fingerprint,"edit_experiment_code",)
+
+            current.update(code=edited,output="",success=None,code_hash=fingerprint,)
+            return {
+                "success": True,
+                "message": (
+                    f"Applied {len(planned_edits)} experiment edits atomically; "
+                    "automatic execution is next"
+                ),
+                "code_hash": fingerprint,
+                "edit_count": len(planned_edits),
+            }
+
+        def submit_experiment():
+            if not current["code"]:
+                return {"success": False, "error": "Create experiment code first"}
+            if current["success"] is not True:
+                return {"success": False,"error": "Execute experiment code successfully before submitting",}
+            return {"success": True,"code": current["code"],"output": current["output"],}
+
+        def available_tools():
+            if not current["code"]:
+                return {"write_experiment_code"}
+            if current["success"] is True:
+                return {"submit_experiment"}
+            if current["success"] is False:
+                if current["last_failure_category"] == "execution_infrastructure_error":    # 当前 _process_execution_result() 遇到子进程异常退出、结果传输失败等被归为基础设施故障的情况，不会把代码加入失败集合，以便允许重试。
+                    return {"execute_experiment_code", "edit_experiment_code", "write_experiment_code"}
+                if current["force_replace"]:
+                    return {"write_experiment_code"}
+                return {"edit_experiment_code", "write_experiment_code"}
+            return {"execute_experiment_code"}
+
+        registry = ToolRegistry()
+        registry.register(
+            "write_experiment_code",
+            (
+                "Save the full experiment program from code, replacing the current draft. "
+                "The framework then automatically executes it and submits successful results."
+            ),
+            _object_schema(
+                {"code": _string(
+                    "Complete experiment-only Python source with imports. Reuse prepared data variables; "
+                    "do not repeat data-preparation code. No Markdown fences."
+                )},
+                ["code"],
+            ),
+            write_experiment_code,
+        ).register(
+            "edit_experiment_code",
+            (
+                "Provide 1 to 6 exact replacements in edits. The tool applies all edits "
+                "or none. The framework then automatically executes the updated experiment."
+            ),
+            _object_schema(
+                {
+                    "edits": {
+                        "type": "array",
+                        "description": "All changes to the current experiment code in one call. The matched fragments must not overlap.",
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "items": {
+                            "type": "object",
+                            "description": "One exact text replacement in the current experiment code.",
+                            "properties": {
+                                "old_text": _string(
+                                    "Copy a non-empty fragment exactly from the current code, including indentation. It must occur once."
+                                ),
+                                "new_text": _string(
+                                    "Python text to replace old_text; keep correct indentation. Use an empty string to delete it."
+                                ),
+                            },
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                ["edits"],
+            ),
+            edit_experiment_code,
+            batch_coalescer=_coalesce_experiment_edit_batches,
+        ).register(
+            "execute_experiment_code",
+            (
+                "Execute the saved experiment with the saved data-preparation code. "
+                "Used for new drafts and retries after an execution environment failure. No arguments."
+            ),
+            _object_schema({}, []),
+            execute_experiment_code,
+        ).register(
+            "submit_experiment",
+            "Return the last successful code and output as the final experiment result. No arguments.",
+            _object_schema({}, []),
+            submit_experiment,
+        )
+        runtime = self.runtime("running experiments", max_tool_steps=50)
+        system_prompt = experiment_solver_prompt()
+        user_prompt = (
+            f"Topic: {state.topic}\nPlan: {state.plan}\n"
+            f"Selected dataset: {state.dataset_selection}\n"
+            f"Fixed numerical seeds: "
+            f"{json.dumps(getattr(state, 'seeds', {}), sort_keys=True)}\n"
+            f"Execution environment: "
+            f"{json.dumps(execution_capabilities(), ensure_ascii=True)}\n"
+            f"Prepared dataset manifest: "
+            f"{json.dumps(getattr(state, 'dataset_manifest', {}), ensure_ascii=True)}\n"
+            f"Dataset validation warnings: "
+            f"{json.dumps(getattr(state, 'dataset_validation_warnings', []), ensure_ascii=True)}\n"
+            f"Dataset code: {state.dataset_code}\n"
+            f"Literature review: {state.literature_review}"
+        )
+
+        # 当实验执行失败时，调用 compact_experiment_failure 来生成压缩后的失败信息。减少发给模型的错误信息长度。
+        # 一次工具调用失败后，如果手里有“当前实验代码”和“最近一次执行错误”，就重新组织下一轮发给模型的消息。
+        def compact_experiment_failure(*, tool_call, arguments, value):
+            # diagnostic：最近一次程序运行为什么失败。
+            # value：刚才这次工具调用返回了什么。
+            del arguments
+            if not current.get("code") or tool_call.name not in {
+                "execute_experiment_code", "write_experiment_code", "edit_experiment_code",
+            }:
+                return None
+            diagnostic = current.get("latest_execution_failure")    # 获取最近一次真实执行失败的诊断。
+            if not diagnostic:
+                return None
+            return _latest_experiment_failure_messages(
+                system_prompt,
+                user_prompt,
+                current["code"],
+                diagnostic,
+                action_rejection=(
+                    None if tool_call.name == "execute_experiment_code" else value
+                ),
+            )
+
+        result = runtime.run(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            registry=registry,
+            terminal_tools={"submit_experiment"},
+            tool_names_provider=available_tools,
+            automatic_tools={"execute_experiment_code", "submit_experiment"},
+            failure_history_compactor=compact_experiment_failure,
+        )
+        return result.value
+
+    def supplement(self, state, request, workdir, supplement_index):
+        supplement_id = f"supplement_{int(supplement_index):02d}"
+        supplement_workdir = Path(workdir).resolve() / "supplements" / supplement_id
+        supplement_workdir.mkdir(parents=True, exist_ok=True)
+        current = {
+            "code": "",
+            "output": "",
+            "success": None,
+            "code_hash": None,
+            "failed_hashes": set(),
+            "failed_failures": {},
+            "last_failure_category": None,
+            "consecutive_failure_category_count": 0,
+            "force_replace": False,
+        }
+
+        def rejected_supplement_code(fingerprint, action):
+            original_failure = dict(
+                current.get("failed_failures", {}).get(fingerprint) or {}
+            )
+            original_error = original_failure.get("error") or "the original failure"
+            result = {
+                "success": False,
+                "error_type": "unchanged_failed_supplement_code",
+                "error": (
+                    "This exact supplement code previously failed and was not "
+                    "executed again."
+                ),
+                "repair_hint": (
+                    "Do not submit this code hash again. Make a substantive "
+                    f"change that resolves the original failure: {original_error}"
+                ),
+                "original_error_type": original_failure.get("error_type"),
+                "original_error": original_failure.get("error"),
+                "original_failure_category": original_failure.get(
+                    "failure_category"
+                ),
+                "original_repair_hint": original_failure.get("repair_hint"),
+                "code_hash": fingerprint,
+                "action": action,
+            }
+            if original_failure:
+                result["original_execution_diagnostic"] = original_failure
+            return result
+
+        def execute_supplement_code():
+            if not current["code"]:
+                return {"success": False, "error": "Create supplement code first"}
+            fingerprint = _code_hash(current["code"])
+            if fingerprint in current["failed_hashes"]:
+                return rejected_supplement_code(
+                    fingerprint,
+                    "execute_supplement_code",
+                )
+            combined = state.dataset_code + "\n\n" + current["code"]
+            execution = execute_code(
+                combined,
+                timeout=self.code_execution_timeout_seconds,
+                workdir=str(supplement_workdir),
+                return_details=True,
+                expected_hf_dataset=state.dataset_selection or None,
+            )
+            return _process_execution_result(
+                current, fingerprint, execution, f"supplementary experiment {supplement_id}",
+            )
+
+        def write_supplement_code(code):
+            syntax_error = python_syntax_error(code)
+            if syntax_error:
+                return {
+                    "success": False,
+                    "error_type": "syntax_error",
+                    "error": syntax_error,
+                }
+            fingerprint = _code_hash(code)
+            if fingerprint in current["failed_hashes"]:
+                return rejected_supplement_code(
+                    fingerprint,
+                    "write_supplement_code",
+                )
+            if fingerprint == current.get("code_hash"):
+                return {
+                    "success": False,
+                    "error_type": "unchanged_current_supplement_code",
+                    "error": "Replacement supplement code is unchanged from the current draft.",
+                    "repair_hint": "Make a substantive code change before retrying.",
+                    "code_hash": fingerprint,
+                }
+            current.update(
+                code=code,
+                output="",
+                success=None,
+                code_hash=fingerprint,
+                force_replace=False,
+            )
+            return {
+                "success": True,
+                "message": "Supplement code replaced; automatic execution is next",
+                "code_hash": fingerprint,
+            }
+
+        def edit_supplement_code(old_text, new_text):
+            if not current["code"]: # 如果目前还没有代码，就无法修改，直接返回失败。
+                return {"success": False, "error": "Create supplement code first"}
+
+            occurrences = current["code"].count(old_text)
+            if occurrences != 1:
+                return {
+                    "success": False,
+                    "error": f"old_text must match exactly once; matched {occurrences}",
+                }
+            edited = current["code"].replace(old_text, new_text, 1)
+            syntax_error = python_syntax_error(edited)
+            if syntax_error:
+                return {
+                    "success": False,
+                    "error_type": "syntax_error",
+                    "error": syntax_error,
+                }
+            fingerprint = _code_hash(edited)
+            if fingerprint in current["failed_hashes"]:
+                return rejected_supplement_code(
+                    fingerprint,
+                    "edit_supplement_code",
+                )
+            if fingerprint == current.get("code_hash"):
+                return {
+                    "success": False,
+                    "error_type": "unchanged_current_supplement_code",
+                    "error": "The edited supplement code is unchanged from the current draft.",
+                    "repair_hint": "Make a substantive code change before retrying.",
+                    "code_hash": fingerprint,
+                }
+            current.update(
+                code=edited,
+                output="",
+                success=None,
+                code_hash=fingerprint,
+            )
+            return {
+                "success": True,
+                "message": "Supplement code edited; automatic execution is next",
+                "code_hash": fingerprint,
+            }
+
+        def submit_supplementary_experiment():
+            if not current["code"]:
+                return {"success": False, "error": "Create supplement code first"}
+            if current["success"] is not True:
+                return {
+                    "success": False,
+                    "error": "Execute supplement code successfully before submitting",
+                }
+            return {
+                "success": True,
+                "supplement_id": supplement_id,
+                "request": request,
+                "code": current["code"],
+                "output": current["output"],
+            }
+
+        def available_tools():
+            if not current["code"]:
+                return {"write_supplement_code"}
+            if current["success"] is True:
+                return {"submit_supplementary_experiment"}
+            if current["success"] is False:
+                if current["last_failure_category"] == "execution_infrastructure_error":
+                    return {"execute_supplement_code", "edit_supplement_code", "write_supplement_code"}
+                if current["force_replace"]:
+                    return {"write_supplement_code"}
+                return {"edit_supplement_code", "write_supplement_code"}
+            return {"execute_supplement_code"}
+
+        registry = ToolRegistry()
+        registry.register(
+            "write_supplement_code",
+            (
+                "Save the full supplementary experiment from code, replacing the current draft. "
+                "The framework then automatically executes it and submits successful results."
+            ),
+            _object_schema(
+                {"code": _string(
+                    "Complete supplement-only Python source with imports. Reuse prepared data and "
+                    "leave the original experiment unchanged. No Markdown fences."
+                )},
+                ["code"],
+            ),
+            write_supplement_code,
+        ).register(
+            "edit_supplement_code",
+            (
+                "Provide one exact text replacement for the saved supplement. "
+                "The tool applies it. The framework then automatically executes the updated supplement."
+            ),
+            _object_schema(
+                {
+                    "old_text": _string(
+                        "Copy a non-empty fragment exactly from the saved supplement, including indentation. It must occur once."
+                    ),
+                    "new_text": _string(
+                        "Python text to replace old_text; keep correct indentation. Use an empty string to delete it."
+                    ),
+                },
+                ["old_text", "new_text"],
+            ),
+            edit_supplement_code,
+        ).register(
+            "execute_supplement_code",
+            (
+                "Execute the saved supplement with the saved data-preparation code. "
+                "Used for new drafts and retries after an execution environment failure. No arguments."
+            ),
+            _object_schema({}, []),
+            execute_supplement_code,
+        ).register(
+            "submit_supplementary_experiment",
+            "Return the last successful supplement code and output with its request and ID. No arguments.",
+            _object_schema({}, []),
+            submit_supplementary_experiment,
+        )
+        runtime = self.runtime("supplementary experiments", max_tool_steps=20)
+        result = runtime.run(
+            system_prompt=supplementary_experiment_solver_prompt(supplement_id),
+            user_prompt=(
+                f"Topic: {state.topic}\nPlan: {state.plan}\n"
+                f"Selected dataset: {state.dataset_selection}\n"
+                f"Fixed numerical seeds: "
+                f"{json.dumps(getattr(state, 'seeds', {}), sort_keys=True)}\n"
+                f"Execution environment: "
+                f"{json.dumps(execution_capabilities(), ensure_ascii=True)}\n"
+                f"Prepared dataset manifest: "
+                f"{json.dumps(getattr(state, 'dataset_manifest', {}), ensure_ascii=True)}\n"
+                f"Dataset validation warnings: "
+                f"{json.dumps(getattr(state, 'dataset_validation_warnings', []), ensure_ascii=True)}\n"
+                f"Dataset code: {state.dataset_code}\n"
+                f"Original experiment code (read only): {state.experiment_code}\n"
+                f"Previous supplements: "
+                f"{json.dumps(getattr(state, 'supplementary_experiments', []), ensure_ascii=True)}\n"
+                f"Supplement request: {json.dumps(request, ensure_ascii=True)}"
+            ),
+            registry=registry,
+            terminal_tools={"submit_supplementary_experiment"},
+            tool_names_provider=available_tools,
+            automatic_tools={"execute_supplement_code", "submit_supplementary_experiment"},
+        )
+        return result.value
+
+
+class PaperSolverAgent(BaseResearchAgent):
+    role = "research paper writer"
+
+    def __init__(self, model, api_key, name=None, *, paper_writing):
+        super().__init__(model, api_key, name=name)
+        self.paper_config = deepcopy(paper_writing)
+
+    def write(self, state, workdir, compile_pdf=False):
+        settings = self.paper_config["sections"]
+        sections = tuple(item["name"] for item in settings)
+        generation_order = self.paper_config["generation_order"]
+        word_targets = {item["name"]: item["word_target"] for item in settings}
+        max_chars = {item["name"]: item["max_chars"] for item in settings}
+        workdir = Path(workdir).resolve()
+        available_figures = [name for name in ("Figure_1.png", "Figure_2.png") if Path(workdir, name).is_file() ]   # 检查有哪些图片
+        citations = _citation_catalog(state)    # 根据研究状态中的文献记录，生成引用目录。
+        supplements = getattr(state, "supplementary_experiments", []) or []
+        authoritative_evidence = {
+            "topic": state.topic,
+            "literature_review": state.literature_review,
+            "plan": state.plan,
+            "dataset_selection": state.dataset_selection,
+            "fixed_numerical_seeds": getattr(state, "seeds", {}),
+            "experiment_output": state.experiment_output,
+            "supplementary_experiments": [
+                {key: value for key, value in item.items() if key != "code"}
+                for item in supplements
+            ],
+            "interpretation": state.interpretation,
+            "citation_catalog": citations,
+            "available_figures": available_figures,
+        }   # 把研究资料整理成一个字典：
+
+        def submit_paper_blueprint(title, central_claim, section_plans):
+            """
+            title：论文标题。
+            central_claim：论文最核心的结论。
+            section_plans：每个章节准备写什么。
+            """
+            if set(section_plans) != set(sections):
+                return {
+                    "success": False,
+                    "error": "The blueprint must plan every fixed paper section exactly once",
+                }
+            return {
+                "success": True,
+                "title": title.strip(),
+                "central_claim": central_claim.strip(),
+                "section_plans": {
+                    section: str(section_plans[section]).strip()
+                    for section in sections
+                },
+            }
+
+        blueprint_registry = ToolRegistry().register(
+            "submit_paper_blueprint",
+            (
+                "Write a title in title, one evidence-based claim in central_claim, "
+                "and a plan for every required section in section_plans. Submit this "
+                "outline before writing sections."
+            ),
+            _object_schema(
+                {
+                    "title": {
+                        "type": "string",
+                        "description": "Write a concise paper title.",
+                        "maxLength": 180,
+                    },
+                    "central_claim": {
+                        "type": "string",
+                        "description": "Write one main claim supported by the supplied evidence.",
+                        "maxLength": 600,
+                    },
+                    "section_plans": {
+                        "type": "object",
+                        "description": "Map every required section name to its brief writing plan.",
+                        "properties": {
+                            section: {
+                                "type": "string",
+                                "description": f"Write a brief content plan for {section}.",
+                                "maxLength": 500,
+                            }
+                            for section in sections
+                        },
+                        "required": list(sections),
+                        "additionalProperties": False,
+                    },
+                },
+                ["title", "central_claim", "section_plans"],
+            ),
+            submit_paper_blueprint,
+        )
+        blueprint = self.runtime(
+            "report writing blueprint",
+            max_tool_steps=2,
+            max_tokens=3000,
+        ).run_one(
+            system_prompt=paper_blueprint_prompt(sections, available_figures),
+            user_prompt=(
+                "Authoritative evidence:\n"
+                + json.dumps(
+                    {
+                        **authoritative_evidence,
+                        "experiment_code": state.experiment_code,
+                    },
+                    ensure_ascii=True,
+                    default=str,
+                )
+            ),
+            registry=blueprint_registry,
+        ).value  # 让模型真正生成提纲
+
+        tex_dir = workdir / "tex"
+        sections_dir = tex_dir / "sections"
+        sections_dir.mkdir(parents=True, exist_ok=True)
+        (tex_dir / "paper_blueprint.json").write_text(
+            json.dumps(blueprint, ensure_ascii=True, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+        # 接着准备逐节生成：
+        section_bodies = {}
+        allowed_citation_keys = {item["key"] for item in citations}
+        # 定义章节正文不能包含的内容
+        forbidden_section_fragments = (
+            "\\documentclass",
+            "\\begin{document}",
+            "\\end{document}",
+            "\\title{",
+            "\\maketitle",
+            "\\begin{abstract}",
+            "\\begin{thebibliography}",
+            "\\begin{figure}",
+            "\\includegraphics",
+        )
+
+        # 开始依次生成章节：
+        for section in generation_order:
+            # 每一轮都会定义一个章节提交函数：
+            def submit_paper_section(section_name, latex_body, expected=section):
+                """
+                section_name：模型声称正在提交的章节。
+                latex_body：该章节的 LaTeX 正文。
+                expected=section：锁定当前这一轮要求的章节。
+                """
+                if section_name != expected:
+                    return {
+                        "success": False,
+                        "error": f"Submit only the requested section {expected!r}",
+                    }
+                body = str(latex_body).strip()  # 把正文转成字符串，去掉两端空白。
+                if not body:
+                    return {"success": False, "error": "Section body cannot be empty"}  # 正文为空就拒绝。
+                forbidden = [fragment for fragment in forbidden_section_fragments if fragment in body]   # 检查禁用内容：
+                if re.search(r"\\section\*?\s*\{", body):   # 正文不应该自己带一级章节标题，因为程序稍后会统一添加。
+                    forbidden.append("main section command")
+                if forbidden:
+                    return {"success": False,"error": ("The framework owns document structure and figures; remove: "+ ", ".join(forbidden)),}
+
+                used_citations = set()  # 建立集合，收集正文实际使用的引用标识。
+                for group in re.findall(r"\\cite(?:t|p)?\{([^}]*)\}", body):
+                    used_citations.update(
+                        key.strip()
+                        for key in group.split(",")
+                        if key.strip()
+                    )
+                unknown_citations = sorted(used_citations - allowed_citation_keys)
+                if unknown_citations:
+                    return {
+                        "success": False,
+                        "error": "Unknown citation keys: " + ", ".join(unknown_citations),
+                    }
+                return {
+                    "success": True,
+                    "section_name": expected,
+                    "latex_body": body,
+                }
+
+            section_registry = ToolRegistry().register(
+                "submit_paper_section",
+                (
+                        f"Submit only the LaTeX body for {section}, with its exact "
+                        "name in section_name. The framework adds section headings, "
+                        "figures, and the bibliography automatically. "
+                        "Do not insert images or figure environments. "
+                        "If submission is rejected, correct the reported violations "
+                        "before resubmitting."
+                ),
+                _object_schema(
+                    {
+                        "section_name": {
+                            "type": "string",
+                            "enum": [section],
+                            "description": f"Use exactly {section!r}.",
+                        },
+                        "latex_body": {
+                            "type": "string",
+                            "description": (
+                                "Write section body only. Subsections, equations, and tables "
+                                "are allowed. Do not include a main section heading, document "
+                                "wrapper, or bibliography. "
+                                "Refer to available figures in prose, such as 'Figure 1'; "
+                                "the framework inserts the images automatically. "
+                                "Never include \\begin{figure}, \\end{figure}, or \\includegraphics. "
+                                "If rejected for figure commands, remove the entire figure "
+                                "environment, including its image, caption, and label, "
+                                "while preserving the surrounding results and discussion. "
+                                "Use only supplied citation keys."
+                            ),
+                            "maxLength": max_chars[section],
+                        },
+                    },
+                    ["section_name", "latex_body"],
+                ),
+                submit_paper_section,
+            )
+            section_evidence = dict(authoritative_evidence)
+            if section in {"Methods", "Experimental Setup"}:
+                section_evidence["experiment_code"] = state.experiment_code
+                section_evidence["supplementary_experiments"] = [
+                    dict(item) for item in supplements
+                ]
+            section_result = self.runtime(
+                f"report writing section {section}",
+                max_tool_steps=2,
+                max_tokens=4096,
+            ).run_one(
+                system_prompt=paper_section_prompt(
+                    section,
+                    word_targets[section],
+                    available_figures,
+                ),
+                user_prompt=(
+                    "Approved paper blueprint:\n"
+                    + json.dumps(blueprint, ensure_ascii=True, default=str)
+                    + "\nCurrent section plan:\n"
+                    + blueprint["section_plans"][section]
+                    + "\nAuthoritative evidence:\n"
+                    + json.dumps(
+                        section_evidence,
+                        ensure_ascii=True,
+                        default=str,
+                    )
+                ),
+                registry=section_registry,
+            ).value
+            section_bodies[section] = section_result["latex_body"]
+            section_index = sections.index(section) + 1   # 查询该章节在论文最终排列顺序中的位置。
+            section_filename = (f"{section_index:02d}_"+ section.lower().replace(" ", "_")+ ".tex")   # 然后构造文件名：
+            (sections_dir / section_filename).write_text(section_bodies[section] + "\n",encoding="utf-8",)# 保存文件
+
+        # 所有章节完成后，开始组装整篇 LaTeX：
+        document = [
+            r"\documentclass[11pt]{article}",
+            r"\usepackage[margin=1in]{geometry}",
+            r"\usepackage{amsmath,amssymb,booktabs,graphicx}",
+            r"\usepackage[hidelinks]{hyperref}",
+            r"\title{" + _latex_escape_text(blueprint["title"]) + "}",
+            r"\author{Agent Laboratory}",
+            r"\date{}",
+            r"\begin{document}",
+            r"\maketitle",
+        ]
+        for section in sections:
+            document.extend(["", rf"\section{{{section}}}", section_bodies[section]])
+            if section == "Results":
+                for figure_index, figure in enumerate(available_figures, start=1):
+                    document.extend([
+                        "",
+                        r"\begin{figure}[htbp]",
+                        r"\centering",
+                        rf"\includegraphics[width=0.82\linewidth]{{{figure}}}",
+                        (
+                            rf"\caption{{Observed experiment result visualization "
+                            rf"{figure_index}.}}"
+                        ),
+                        r"\end{figure}",
+                    ])
+        if citations:
+            document.extend(["", r"\begin{thebibliography}{99}"])
+            for citation in citations:
+                document.append(
+                    rf"\bibitem{{{citation['key']}}} Reviewed work, "
+                    rf"\texttt{{arXiv:{_latex_escape_text(citation['arxiv_id'])}}}."
+                )
+            document.append(r"\end{thebibliography}")
+        document.extend(["", r"\end{document}", ""])
+        latex = "\n".join(document)
+        compile_result = compile_latex(
+            latex,
+            str(workdir),
+            compile=bool(compile_pdf),
+        )
+        if "[CODE EXECUTION ERROR]" in compile_result:
+            raise RuntimeError(compile_result)
+        return {
+            "success": True,
+            "latex": latex,
+            "compile_result": compile_result,
+            "blueprint": blueprint,
+            "sections": section_bodies,
+        }
 
 
 class ProfessorAgent(BaseResearchAgent):
@@ -1509,9 +1670,9 @@ class ProfessorAgent(BaseResearchAgent):
     def generate_readme(self, state):
         registry = ToolRegistry().register(
             "submit_readme",
-            "Submit the final GitHub README in Markdown.",
+            "Write the complete README in markdown and submit it for the workflow to save.",
             _object_schema(
-                {"markdown": _string("Complete README Markdown")},
+                {"markdown": _string("Write the complete README in Markdown.")},
                 ["markdown"],
             ),
             lambda markdown: {"success": True, "markdown": markdown},

@@ -5,17 +5,19 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent_runtime import AgentRunResult
 from workflows.collaboration import (
     _compact_collaboration_result,
     _render_collaboration_history,
-    _render_sw_collaboration_history,
 )
 from workflows.laboratory import LaboratoryWorkflow
 from research_state import ResearchState
 from run_logging import PromptRecorder, RunLogger, run_log_scope
+
+with patch("dotenv.load_dotenv"):
+    from ai_lab_repo import load_paper_writing_config
 
 
 COLLABORATION_ROUNDS = {
@@ -29,150 +31,28 @@ def result(tool_name, value):
     return AgentRunResult(tool_name, {}, value, [])
 
 
-class SWHistoryTest(unittest.TestCase):
-    def setUp(self):
-        self.selection = {
-            "dataset_id": "owner/data",
-            "revision": "revision",
-            "config_name": "default",
-            "split": "train",
-        }
-        self.inspected = {
-            **self.selection,
-            "available_configs": ["default"],
-            "dataset_schema": {"row_count": 10, "columns": {"value": "double"}},
-        }
-        self.trial = {
-            "tool": "execute_dataset_code",
-            "success": True,
-            "code": "value = 1\n" * 300,
-            "output": "shape: (10, 1)",
-            "selection": dict(self.selection),
-        }
-        self.conversation = [
-            _compact_collaboration_result(
-                "MLEngineerAgent", "search_huggingface",
-                {"success": True, "results": [{
-                    "id": "owner/data", "description": "OLD_SEARCH_DESCRIPTION" * 20,
-                }]}, 0,
-            ),
-            _compact_collaboration_result(
-                "SWEngineerAgent", "send_dialogue",
-                {"success": True, "message": "Exclude Id and preserve fixed seeds."}, 1,
-            ),
-            _compact_collaboration_result(
-                "MLEngineerAgent", "execute_dataset_code", {
-                    "success": False,
-                    "code": "OLD_FAILED_CODE\n" * 300,
-                    "error": "NameError: missing encoder",
-                    "error_type": "python_exception",
-                    "traceback": "OLD_TRACEBACK",
-                    "output": "OLD_EXECUTION_OUTPUT",
-                    "selection": dict(self.selection),
-                    "validation_warnings": ["Check labels before submission"],
-                }, 1,
-            ),
-            _compact_collaboration_result(
-                "SWEngineerAgent", "send_dialogue",
-                {"success": True, "message": "CURRENT_SW_MESSAGE"}, 2,
-            ),
-            _compact_collaboration_result(
-                "MLEngineerAgent", "execute_dataset_code", self.trial, 2,
-            ),
-        ]
-
-    def test_successful_trial_summarizes_search_and_earlier_failures(self):
-        original = deepcopy((self.conversation, self.trial, self.inspected))
-        before = _render_collaboration_history(
-            self.conversation,
-            omit_latest_senders={"SWEngineerAgent", "MLEngineerAgent"},
-        )
-        history = _render_sw_collaboration_history(
-            self.conversation, self.trial, self.inspected,
-        )
-        entries = [json.loads(line) for line in history.splitlines()]
-
-        self.assertLess(len(history), len(before))
-        self.assertNotIn("OLD_SEARCH_DESCRIPTION", history)
-        self.assertNotIn("OLD_FAILED_CODE", history)
-        self.assertNotIn("OLD_TRACEBACK", history)
-        self.assertNotIn("OLD_EXECUTION_OUTPUT", history)
-        self.assertNotIn("CURRENT_SW_MESSAGE", history)
-        self.assertIn("Exclude Id and preserve fixed seeds.", history)
-        failure = next(item for item in entries if item.get("success") is False)
-        self.assertIn("does not establish data validity", failure["message"])
-        self.assertEqual(failure["error"], "NameError: missing encoder")
-        self.assertEqual(failure["code_sha256"], self.conversation[2]["code_sha256"])
-        self.assertEqual(failure["validation_warnings"], ["Check labels before submission"])
-        self.assertEqual((self.conversation, self.trial, self.inspected), original)
-
-    def test_non_trial_success_and_failed_trial_keep_diagnostics(self):
-        for feedback in (
-            None,
-            {**self.trial, "success": False},
-            {**self.trial, "success": "true"},
-            {**self.trial, "tool": "send_dialogue"},
-            {**self.trial, "tool": "inspect_huggingface_dataset"},
-            {**self.trial, "code": " "},
-        ):
-            with self.subTest(feedback=feedback):
-                history = _render_sw_collaboration_history(
-                    self.conversation, feedback, self.inspected,
-                )
-                self.assertIn("OLD_SEARCH_DESCRIPTION", history)
-                self.assertIn("OLD_TRACEBACK", history)
-
-    def test_wrong_or_unknown_dataset_identity_keeps_diagnostics(self):
-        for field in ("dataset_id", "revision", "config_name", "split"):
-            for value in ("different", None):
-                if field == "config_name" and value is None:
-                    continue
-                with self.subTest(field=field, value=value):
-                    trial = {**self.trial, "selection": {**self.selection, field: value}}
-                    history = _render_sw_collaboration_history(
-                        self.conversation, trial, self.inspected,
-                    )
-                    self.assertIn("OLD_TRACEBACK", history)
-        self.assertIn("OLD_TRACEBACK", _render_sw_collaboration_history(
-            self.conversation, self.trial, None,
-        ))
-
-    def test_omitted_config_requires_one_unambiguous_materialized_config(self):
-        trial = {**self.trial, "selection": {**self.selection, "config_name": None}}
-        history = _render_sw_collaboration_history(
-            self.conversation, trial, self.inspected,
-        )
-        self.assertNotIn("OLD_TRACEBACK", history)
-        ambiguous = {**self.inspected, "available_configs": ["default", "other"]}
-        history = _render_sw_collaboration_history(
-            self.conversation, trial, ambiguous,
-        )
-        self.assertIn("OLD_TRACEBACK", history)
-
-    def test_later_failure_restores_existing_history_view(self):
-        _render_sw_collaboration_history(self.conversation, self.trial, self.inspected)
-        history = _render_sw_collaboration_history(
-            self.conversation, {**self.trial, "success": False}, self.inspected,
-        )
-        self.assertIn("OLD_FAILED_CODE", history)
-        self.assertIn("OLD_TRACEBACK", history)
-
+class CollaborationHistoryTest(unittest.TestCase):
     def test_latest_execution_failure_hides_prior_failure_history(self):
         latest_failure = {
-            "tool": "execute_dataset_code",
+            "tool": "write_and_run_dataset_code",
             "success": False,
             "error": "CURRENT_ERROR",
         }
-        history = _render_sw_collaboration_history(
-            self.conversation,
-            {**self.trial, "success": False},
-            self.inspected,
+        conversation = [
+            {"sender": "MLEngineerAgent", "tool": "write_and_run_dataset_code",
+             "success": False, "error": "OLD_ERROR", "traceback": "OLD_TRACEBACK"},
+            {"sender": "SWEngineerAgent", "tool": "send_dialogue",
+             "success": True, "message": "CURRENT_SW_MESSAGE"},
+            {"sender": "MLEngineerAgent", **latest_failure},
+        ]
+        original = deepcopy(conversation)
+        history = _render_collaboration_history(
+            conversation,
+            omit_latest_senders={"SWEngineerAgent", "MLEngineerAgent"},
             latest_execution_failure=latest_failure,
         )
-        self.assertNotIn("OLD_FAILED_CODE", history)
-        self.assertNotIn("OLD_TRACEBACK", history)
-        self.assertNotIn("OLD_EXECUTION_OUTPUT", history)
         self.assertEqual(history, "")
+        self.assertEqual(conversation, original)
 
 
 class WorkflowTest(unittest.TestCase):
@@ -181,8 +61,8 @@ class WorkflowTest(unittest.TestCase):
         output = "output-head\n" + ("x" * 5000) + "\noutput-tail"
 
         compact = _compact_collaboration_result(
-            "SWEngineerAgent",
-            "submit_dataset_code",
+            "MLEngineerAgent",
+            "write_and_run_dataset_code",
             {
                 "success": False,
                 "error_type": "python_exception",
@@ -233,6 +113,8 @@ class WorkflowTest(unittest.TestCase):
             workflow = LaboratoryWorkflow(
                 state, "model", "key", temp_dir,
                 collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+                code_execution_timeout_seconds=17.5,
+                paper_writing=load_paper_writing_config(),
             )
             workflow.sw_engineer.data_preparation_turn = MagicMock(return_value=result(
                 "unknown_command",
@@ -251,10 +133,97 @@ class WorkflowTest(unittest.TestCase):
             with run_log_scope(logger, prompts):
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "SWEngineerAgent must send dialogue or submit dataset code",
+                    "SWEngineerAgent must send dialogue during data preparation",
                 ):
                     workflow._prepare_dataset_collaboratively()
             logger.close()
+            workflow.ml_engineer.data_preparation_turn.assert_not_called()
+
+    def test_sw_feedback_reaches_ml_and_dialogue_preserves_ml_execution_failure(self):
+        inspected = {
+            "success": True,
+            "dataset_id": "owner/data",
+            "revision": "revision",
+            "config_name": "default",
+            "split": "train",
+            "dataset_schema": {"columns": {"value": "int64"}},
+        }
+        first_message = {"success": True, "message": "请检查选定的数据集。"}
+        execution_message = {"success": True, "message": "请按照检查结果准备并执行代码。"}
+        failure = {
+            "success": False,
+            "code": "value = data['missing']",
+            "error_type": "python_exception",
+            "error": "KeyError: 'missing'",
+            "traceback": "execution traceback",
+            "output": "loaded selected data",
+        }
+        repair_message = {
+            "success": True,
+            "message": "请使用已经检查过的 value 列修复代码。",
+        }
+        retry_message = {"success": True, "message": "请执行完整的修复代码。"}
+        trial = {
+            "success": True,
+            "code": "value = data['value']",
+            "output": "prepared",
+            "executed_dataset": {
+                "dataset_id": "owner/data",
+                "revision": "revision",
+                "resources": [{"config_name": "default", "split": "train"}],
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workflow = LaboratoryWorkflow(
+                ResearchState("query_001", "recording_001", "topic"),
+                "model", "key", temp_dir,
+                collaboration_rounds={
+                    **COLLABORATION_ROUNDS, "data_preparation_max_rounds": 4,
+                },
+                code_execution_timeout_seconds=17.5,
+                paper_writing=load_paper_writing_config(),
+            )
+            workflow.sw_engineer.data_preparation_turn = MagicMock(side_effect=[
+                result("send_dialogue", first_message),
+                result("send_dialogue", execution_message),
+                result("send_dialogue", repair_message),
+                result("send_dialogue", retry_message),
+            ])
+            workflow.ml_engineer.data_preparation_turn = MagicMock(side_effect=[
+                result("inspect_selected_dataset", inspected),
+                result("write_and_run_dataset_code", failure),
+                result("send_dialogue", {"success": True, "message": "I will repair it."}),
+                result("write_and_run_dataset_code", trial),
+            ])
+
+            selected, submitted = workflow._prepare_dataset_collaboratively()
+
+        self.assertEqual(selected, inspected)
+        self.assertEqual(submitted["code"], trial["code"])
+        calls = workflow.ml_engineer.data_preparation_turn.call_args_list
+        self.assertEqual(len(calls), 4)
+        for agent in (workflow.sw_engineer, workflow.ml_engineer):
+            for preparation_call in agent.data_preparation_turn.call_args_list:
+                self.assertEqual(
+                    preparation_call.kwargs["code_execution_timeout_seconds"], 17.5,
+                )
+        for ml_call, feedback in zip(
+            calls, (first_message, execution_message, repair_message, retry_message),
+        ):
+            self.assertEqual(json.loads(ml_call.args[3]), feedback)
+        sw_calls = workflow.sw_engineer.data_preparation_turn.call_args_list
+        self.assertEqual(sw_calls[2].kwargs["ml_result"], {
+            "tool": "write_and_run_dataset_code", **failure,
+        })
+        for agent_calls in (sw_calls, calls):
+            for preparation_call in agent_calls[:2]:
+                self.assertIsNone(preparation_call.kwargs["latest_execution_failure"])
+            for preparation_call in agent_calls[2:]:
+                self.assertEqual(
+                    preparation_call.kwargs["latest_execution_failure"],
+                    {"tool": "write_and_run_dataset_code", **failure},
+                )
+                self.assertEqual(preparation_call.kwargs["inspected_dataset"], inspected)
 
     def test_data_preparation_passes_only_three_recent_dialogue_rounds(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -264,6 +233,8 @@ class WorkflowTest(unittest.TestCase):
             workflow = LaboratoryWorkflow(
                 state, "model", "key", temp_dir,
                 collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+                code_execution_timeout_seconds=17.5,
+                paper_writing=load_paper_writing_config(),
             )
             selection = {"dataset_id": "owner/data", "revision": "revision"}
             observed_sw_calls = []
@@ -321,12 +292,14 @@ class WorkflowTest(unittest.TestCase):
                 "ml-message-10",
             )
 
-    def test_runs_fixed_agent_flow_and_serial_reviewers(self):
+    def test_research_finishes_with_paper_and_readme(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state = ResearchState("query_001", "recording_001", "topic")
             workflow = LaboratoryWorkflow(
                 state, "model", "key", temp_dir,
                 collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+                code_execution_timeout_seconds=17.5,
+                paper_writing=load_paper_writing_config(),
             )
             workflow.phd.conduct_literature_review = MagicMock(return_value={
                 "review": "review",
@@ -360,23 +333,20 @@ class WorkflowTest(unittest.TestCase):
                     "success": True,
                     "message": "Please select a suitable dataset.",
                 }),
-                result("submit_dataset_code", {
+                result("send_dialogue", {
                     "success": True,
-                    "selection": selection,
-                    "code": "dataset_code",
-                    "output": "dataset_output",
-                    "prepared_data_manifest": {"feature_artifacts": {}},
-                    "validation_warnings": ["analysis metadata incomplete"],
+                    "message": "Please prepare and execute the code using the inspected schema.",
                 }),
             ])
-            workflow.ml_engineer.data_preparation_turn = MagicMock(return_value=result(
-                "inspect_huggingface_dataset",
+            workflow.ml_engineer.data_preparation_turn = MagicMock(side_effect=[result(
+                "inspect_selected_dataset",
                 {
                     "success": True,
                     "dataset_id": "owner/data",
                     "config_name": "default",
                     "split": "train",
                     "revision": "revision",
+                    "dataset_contract": selection["dataset_contract"],
                     "available_configs": ["default"],
                     "available_splits": ["train"],
                     "dataset_schema": {
@@ -386,15 +356,19 @@ class WorkflowTest(unittest.TestCase):
                     "materialized_resources": [],
                     "materialized_schemas": {},
                 },
-            ))
+            ), result("write_and_run_dataset_code", {
+                "success": True,
+                "selection": selection,
+                "code": "dataset_code",
+                "output": "dataset_output",
+                "prepared_data_manifest": {"feature_artifacts": {}},
+                "validation_warnings": ["analysis metadata incomplete"],
+            })])
             workflow.ml_solver.solve = MagicMock(return_value={
                 "success": True,
                 "code": "experiment_code",
                 "output": "accuracy=0.9",
             })
-            workflow.experiment_reward.score = MagicMock(
-                return_value={"success": True, "score": 0.9}
-            )
             workflow.postdoc.interpretation_turn = MagicMock(side_effect=[
                 result(
                     "send_dialogue",
@@ -412,14 +386,6 @@ class WorkflowTest(unittest.TestCase):
                 return_value={"success": True, "latex": "paper"}
             )
             workflow.professor.generate_readme = MagicMock(return_value="readme")
-            review_order = []
-            workflow.reviewers = [
-                SimpleNamespace(review=lambda current, index=index: review_order.append(index) or {"reviewer_index": index})
-                for index in (1, 2, 3)
-            ]
-            workflow.paper_reward.score = MagicMock(
-                return_value={"success": True, "score": 8.0}
-            )
 
             logger = RunLogger(temp_dir, "query_001", "job_001", console=False)
             prompts = PromptRecorder(temp_dir, "query_001", "job_001")
@@ -427,9 +393,10 @@ class WorkflowTest(unittest.TestCase):
                 completed = workflow.perform_research()
             logger.close()
 
-            self.assertEqual(review_order, [1, 2, 3])
             self.assertEqual(completed.paper, "paper")
             self.assertEqual(completed.readme, "readme")
+            self.assertEqual(completed.interpretation, "interpretation")
+            workflow.phd.interpretation_feedback.assert_called_once()
             self.assertEqual(completed.data_requirements, "requirements")
             self.assertEqual(
                 completed.dataset_selection["dataset_id"],
@@ -456,29 +423,41 @@ class WorkflowTest(unittest.TestCase):
             )
             self.assertTrue(Path(temp_dir, "readme.md").is_file())
             self.assertTrue(Path(temp_dir, "state.json").is_file())
+            self.assertEqual(
+                Path(temp_dir, "report.tex").read_text(encoding="utf-8"),
+                "paper",
+            )
+            self.assertEqual(
+                {path.name for path in Path(temp_dir).glob("*.json")},
+                {"state.json"},
+            )
+            self.assertEqual(
+                json.loads(Path(temp_dir, "state.json").read_text(encoding="utf-8")),
+                completed.to_dict(),
+            )
             workflow.professor.generate_readme.assert_called_once()
             self.assertEqual(
                 workflow.sw_engineer.data_preparation_turn.call_count,
                 2,
             )
-            workflow.ml_engineer.data_preparation_turn.assert_called_once()
+            self.assertEqual(workflow.ml_engineer.data_preparation_turn.call_count, 2)
             log_text = Path(temp_dir, "workflow.log").read_text(encoding="utf-8")
-            for phase in (
+            expected_phases = [
                 "literature review",
                 "plan formulation",
                 "data preparation collaboration",
                 "running experiments",
-                "experiment scoring",
                 "results interpretation",
                 "report writing",
                 "readme writing",
-                "paper review reviewer=1",
-                "paper review reviewer=2",
-                "paper review reviewer=3",
-                "paper scoring",
-            ):
-                self.assertIn(f"BEGIN {phase}", log_text)
-                self.assertIn(f"END {phase}", log_text)
+            ]
+            for event in ("BEGIN", "END"):
+                marker = f"] {event} "
+                self.assertEqual(
+                    [line.split(marker, 1)[1].split(" elapsed=", 1)[0]
+                     for line in log_text.splitlines() if marker in line],
+                    expected_phases,
+                )
             self.assertIn("HANDOFF SWEngineerAgent -> MLEngineerAgent", log_text)
             self.assertIn("HANDOFF MLEngineerAgent -> SWEngineerAgent", log_text)
             self.assertNotIn("DATASET CONTRACT REVIEW", log_text)
@@ -498,6 +477,8 @@ class WorkflowTest(unittest.TestCase):
             workflow = LaboratoryWorkflow(
                 state, "model", "key", temp_dir,
                 collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+                code_execution_timeout_seconds=17.5,
+                paper_writing=load_paper_writing_config(),
             )
             request = {
                 "objective": "check robustness",
@@ -623,6 +604,8 @@ class WorkflowTest(unittest.TestCase):
             workflow = LaboratoryWorkflow(
                 state, "model", "key", temp_dir,
                 collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+                code_execution_timeout_seconds=17.5,
+                paper_writing=load_paper_writing_config(),
             )
             workflow.postdoc.interpretation_turn = MagicMock(side_effect=[
                 result(
@@ -669,6 +652,8 @@ class WorkflowTest(unittest.TestCase):
             workflow = LaboratoryWorkflow(
                 state, "model", "key", temp_dir,
                 collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+                code_execution_timeout_seconds=17.5,
+                paper_writing=load_paper_writing_config(),
             )
             workflow.postdoc.interpretation_turn = MagicMock(side_effect=[
                 result("send_dialogue", {"success": True, "message": "review"}),
@@ -694,6 +679,8 @@ class WorkflowTest(unittest.TestCase):
             workflow = LaboratoryWorkflow(
                 state, "model", "key", temp_dir,
                 collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+                code_execution_timeout_seconds=17.5,
+                paper_writing=load_paper_writing_config(),
             )
             workflow.collaboration_rounds = {
                 **workflow.collaboration_rounds,

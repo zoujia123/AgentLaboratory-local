@@ -26,6 +26,10 @@ class LocalReplayMismatch(LocalReplayError):
     pass
 
 
+class DatasetBindingError(LocalReplayMismatch):
+    pass
+
+
 class LocalReplayIntegrityError(LocalReplayError):
     pass
 
@@ -84,8 +88,6 @@ def _load_records(directory):
         item.get("call_index") is None,
         item.get("call_index", 0),
     ))
-    for index, record in enumerate(records, start=1):
-        record["_sequence_index"] = index
     return records
 
 
@@ -318,21 +320,6 @@ class LocalReplaySession:
                 "success": True,
                 "purpose": purpose,
             }, "synthetic_median", reservation_index
-
-    def _consume_next(self, stream, purpose):
-        records = self.records[stream]
-        consumed = self._consumed[stream]
-        with self._match_lock:
-            index = next(
-                (item for item, used in enumerate(consumed) if not used), None
-            )
-            if index is not None:
-                consumed[index] = True
-                return records[index]
-        raise LocalReplayMismatch(
-            f"No unused {stream} recording remains for {purpose}. "
-            f"query_id={self.query_id}, recording_id={self.recording_id}"
-        )
 
     def _path_from_root(self, relative_path):
         if not relative_path:
@@ -578,8 +565,8 @@ class LocalReplaySession:
         )
         return text
 
-    def worker_context(self):
-        return {
+    def worker_context(self, expected_hf_dataset=None):
+        context = {
             "root": str(self.root),
             "query_id": self.query_id,
             "recording_id": self.recording_id,
@@ -587,6 +574,9 @@ class LocalReplaySession:
             "latency_scale": self.latency_scale,
             "hf_candidates": sorted(self.hf_candidates),
         }
+        if expected_hf_dataset is not None:
+            context["expected_hf_dataset"] = copy.deepcopy(expected_hf_dataset)
+        return context
 
     def select_hf_dataset(
         self,
@@ -787,9 +777,40 @@ class WorkerDatasetReplay:
         self.original_load_dataset = original_load_dataset
         self.root = Path(self.context["root"]).resolve()
         self.events = []
+        self.expected_hf_dataset = self.context.get("expected_hf_dataset")
+        self._binding_violations = []
+        self._loaded_resources = set()
+        self._executed_dataset = None
 
     def _event(self, **event):
         self.events.append({"recorded_at": _utc_now(), **event})
+
+    def _binding_failure(self, message, request=None):
+        self._binding_violations.append(message)
+        self._event(
+            tool="huggingface.load_dataset", match_kind="mismatch", success=False,
+            request=request or {}, error=message, error_type="dataset_binding_error",
+        )
+        raise DatasetBindingError(message)
+
+    def validate_execution(self):
+        if self.expected_hf_dataset is None:
+            return None
+        if self._binding_violations:
+            # Catching an invalid load inside generated code must not approve the trial.
+            raise DatasetBindingError(self._binding_violations[0])
+        if self._executed_dataset is None:
+            self._binding_failure(
+                "Data preparation must complete at least one load_dataset call for "
+                f"the selected dataset {self.expected_hf_dataset['dataset_id']!r}."
+            )
+        return {
+            **self._executed_dataset,
+            "resources": [
+                {"config_name": config_name, "split": split}
+                for config_name, split in sorted(self._loaded_resources)
+            ],
+        }
 
     @staticmethod
     def _config_name(args, kwargs):
@@ -814,17 +835,35 @@ class WorkerDatasetReplay:
 
     def load_dataset(self, path, *args, **kwargs):
         dataset_id = str(path)
-        if dataset_id in self.LOCAL_BUILDERS and self._local_data_files(
-            kwargs.get("data_files")
-        ):
-            return self.original_load_dataset(path, *args, **kwargs)
-        if Path(dataset_id).exists():
-            return self.original_load_dataset(path, *args, **kwargs)
-
-        started = time.perf_counter_ns()
         config_name = self._config_name(args, kwargs)
         split = kwargs.get("split")
         revision = kwargs.get("revision")
+        expected = self.expected_hf_dataset
+        if expected is not None:
+            request = {"dataset_id": dataset_id, "config_name": config_name,
+                       "split": split, "revision": revision}
+            if dataset_id != expected["dataset_id"]:
+                self._binding_failure(
+                    f"Selected dataset mismatch: expected {expected['dataset_id']!r}, "
+                    f"received {dataset_id!r}.", request,
+                )
+            if revision is not None and revision != expected["revision"]:
+                self._binding_failure(
+                    f"Selected dataset revision mismatch: expected {expected['revision']!r}, "
+                    f"received {revision!r} for {dataset_id!r}.", request,
+                )
+            revision = expected["revision"]
+            if config_name is None:
+                config_name = expected["config_name"]
+        else:
+            if dataset_id in self.LOCAL_BUILDERS and self._local_data_files(
+                kwargs.get("data_files")
+            ):
+                return self.original_load_dataset(path, *args, **kwargs)
+            if Path(dataset_id).exists():
+                return self.original_load_dataset(path, *args, **kwargs)
+
+        started = time.perf_counter_ns()
         allowed = dataset_id in set(self.context.get("hf_candidates") or [])
         if not allowed:
             error = (
@@ -839,6 +878,12 @@ class WorkerDatasetReplay:
             raise LocalReplayMismatch(error)
 
         manifest = _find_hf_manifest(self.root, dataset_id, revision)
+        if expected is not None and manifest.get("revision") != expected["revision"]:
+            self._binding_failure(
+                f"Selected dataset revision mismatch: expected {expected['revision']!r}, "
+                f"resolved {manifest.get('revision')!r} for {dataset_id!r}.",
+                {"dataset_id": dataset_id, "revision": manifest.get("revision")},
+            )
         loaded, resolved_config, resolved_splits = self._load_materialized(
             manifest,
             config_name,
@@ -864,6 +909,14 @@ class WorkerDatasetReplay:
                 for split_name in resolved_splits
             ],
         )
+        if expected is not None:
+            self._executed_dataset = {
+                "dataset_id": dataset_id,
+                "revision": manifest.get("revision"),
+            }
+            self._loaded_resources.update(
+                (resolved_config, split_name) for split_name in resolved_splits
+            )
         return loaded
 
     def _load_materialized(self, manifest, config_name, split, kwargs):
@@ -883,6 +936,13 @@ class WorkerDatasetReplay:
             config_key = _safe_name(config_name)
         split_manifests = materialized.get(config_key)
         if not split_manifests:
+            if self.expected_hf_dataset is not None:
+                self._binding_failure(
+                    f"Selected dataset config mismatch: {config_name or config_key!r} "
+                    f"is not materialized for {manifest.get('dataset_id')!r}.",
+                    {"dataset_id": manifest.get("dataset_id"), "config_name": config_name,
+                     "split": split, "revision": manifest.get("revision")},
+                )
             raise LocalReplayMismatch(
                 f"Config {config_name or config_key!r} is not materialized for "
                 f"{manifest.get('dataset_id')}"
@@ -892,6 +952,33 @@ class WorkerDatasetReplay:
             for name in (manifest.get("configs") or [])
         }
         resolved_config = config_names.get(config_key, config_key)
+
+        if self.expected_hf_dataset is not None:
+            expected = self.expected_hf_dataset
+            resources = expected.get("materialized_resources") or [{
+                "config_name": expected["config_name"], "split": expected["split"],
+            }]
+            allowed_resources = {
+                (resource["config_name"], resource["split"]) for resource in resources
+            }
+            resolved_splits = sorted(split_manifests) if split is None else [split]
+            if any(
+                not isinstance(split_name, str)
+                or split_name not in split_manifests
+                or (resolved_config, split_name) not in allowed_resources
+                for split_name in resolved_splits
+            ):
+                self._binding_failure(
+                    "Selected dataset resource mismatch: "
+                    f"requested config {resolved_config!r}, split {split!r}; "
+                    f"inspected resources are {sorted(allowed_resources)!r}.",
+                    {"dataset_id": manifest.get("dataset_id"), "config_name": resolved_config,
+                     "split": split, "revision": manifest.get("revision")},
+                )
+            # Check before reading data, and load only the requested, inspected resources.
+            split_manifests = {
+                split_name: split_manifests[split_name] for split_name in resolved_splits
+            }
 
         import pyarrow.parquet as parquet
         from datasets import Dataset, DatasetDict

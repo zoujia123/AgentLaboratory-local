@@ -14,6 +14,7 @@ class ConfigTest(unittest.TestCase):
             mode="w", suffix=".yaml", encoding="utf-8", delete=False
         )
         config_file.write(
+            "code_execution_timeout_seconds: 123\n"
             "llm_sampling:\n"
             "  temperature: 0.1\n"
             "  top_p: 1\n"
@@ -42,6 +43,7 @@ class ConfigTest(unittest.TestCase):
         self.assertFalse(config.compile_latex)
         self.assertFalse(config.console_log)
         self.assertEqual(config.max_llm_http_attempts_per_query, 100)
+        self.assertEqual(config.code_execution_timeout_seconds, 123)
 
     def test_parses_console_log_flag(self):
         config = parse_yaml(self.write_config(

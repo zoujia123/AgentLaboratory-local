@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -76,6 +77,164 @@ class InferenceRetryTest(unittest.TestCase):
                 },
             },
         }]
+
+    def test_empty_choices_retry_then_success_without_changing_request(self):
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [
+            SimpleNamespace(id="empty-choices", choices=[]),
+            successful_completion(),
+        ]
+        messages = [{"role": "user", "content": "prompt"}]
+        with llm_http_attempt_budget_scope(2) as budget, patch(
+            "inference.OpenAI", return_value=client
+        ), patch("inference.time.sleep") as sleep:
+            response = query_model_with_tools(
+                "model", messages, self.tools, openai_api_key="key",
+                tries=2, retry_delay=0.25,
+            )
+        self.assertEqual(response.tool_calls[0].name, "submit")
+        self.assertEqual(budget.used, 2)
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        sleep.assert_called_once_with(0.25)
+        for call in client.chat.completions.create.call_args_list:
+            self.assertEqual(call.kwargs["messages"], messages)
+
+    def test_malformed_choices_and_messages_are_not_valid_empty_tool_responses(self):
+        malformed = [
+            (SimpleNamespace(), "choices must be"),
+            (SimpleNamespace(choices=None), "choices must be"),
+            (SimpleNamespace(choices={}), "choices must be"),
+            (SimpleNamespace(choices="invalid"), "choices must be"),
+            (SimpleNamespace(choices=[]), "has no choices"),
+            (SimpleNamespace(choices=[None]), "first choice has no message"),
+            (SimpleNamespace(choices=[{}]), "first choice has no message"),
+            (SimpleNamespace(choices=[{"message": None}]), "invalid message"),
+            (SimpleNamespace(choices=[{"message": []}]), "invalid message"),
+            (SimpleNamespace(choices=[{"message": {}}]), "invalid message"),
+            (SimpleNamespace(choices=[{"message": {"content": []}}]), "content must be"),
+        ]
+        for completion, error in malformed:
+            with self.subTest(completion=completion):
+                client = MagicMock()
+                client.chat.completions.create.return_value = completion
+                with patch("inference.OpenAI", return_value=client), patch(
+                    "inference.time.sleep"
+                ) as sleep:
+                    with self.assertRaisesRegex(RuntimeError, error) as caught:
+                        query_model_with_tools(
+                            "model", [], self.tools, openai_api_key="key",
+                            tries=1, return_on_no_tool_call=True,
+                        )
+                self.assertIsInstance(caught.exception.__cause__, ToolResponseError)
+                sleep.assert_not_called()
+
+    def test_tuple_choices_and_valid_text_message_preserve_no_tool_handling(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = {
+            "id": "text-only",
+            "choices": ({
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "finished", "tool_calls": []},
+            },),
+        }
+        with patch("inference.OpenAI", return_value=client), patch(
+            "inference.time.sleep"
+        ) as sleep:
+            response = query_model_with_tools(
+                "model", [], self.tools, openai_api_key="key",
+                return_on_no_tool_call=True,
+            )
+        self.assertEqual(response.content, "finished")
+        self.assertEqual(response.tool_calls, [])
+        self.assertEqual(response.finish_reason, "stop")
+        self.assertEqual(client.chat.completions.create.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_repeated_empty_choices_stop_at_retry_limit_with_cause_and_traceback(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(id="empty-choices", choices=[])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logger = RunLogger(temp_dir, "query_018", "job_018", console=False)
+            prompts = PromptRecorder(temp_dir, "query_018", "job_018")
+            with run_log_scope(logger, prompts), llm_http_attempt_budget_scope(10) as budget, patch(
+                "inference.OpenAI", return_value=client
+            ), patch("inference.time.sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "failed after 3 attempts: Model response has no choices") as caught:
+                    query_model_with_tools("model", [], self.tools, openai_api_key="key")
+            logger.close()
+            log_text = Path(temp_dir, "workflow.log").read_text(encoding="utf-8")
+        self.assertEqual(client.chat.completions.create.call_count, 3)
+        self.assertEqual(budget.used, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertIsInstance(caught.exception.__cause__, ToolResponseError)
+        self.assertIn("stage=parse_response", log_text)
+        self.assertIn("Traceback (most recent call last)", log_text)
+        self.assertIn('"choices_count": 0', log_text)
+
+    def test_sdk_index_error_is_logged_as_request_failure_without_stale_response(self):
+        client = MagicMock()
+        sdk_error = IndexError("SDK list index out of range")
+        client.chat.completions.create.side_effect = [
+            SimpleNamespace(id="earlier-malformed", choices=[]), sdk_error,
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logger = RunLogger(temp_dir, "query_018", "job_018", console=False)
+            prompts = PromptRecorder(temp_dir, "query_018", "job_018")
+            with run_log_scope(logger, prompts), patch(
+                "inference.OpenAI", return_value=client
+            ), patch("inference.time.sleep"):
+                with self.assertRaisesRegex(RuntimeError, "SDK list index out of range") as caught:
+                    query_model_with_tools("model", [], self.tools, openai_api_key="key", tries=2)
+            logger.close()
+            log_text = Path(temp_dir, "workflow.log").read_text(encoding="utf-8")
+        self.assertIs(caught.exception.__cause__, sdk_error)
+        self.assertIn("stage=request error=SDK list index out of range", log_text)
+        self.assertIn("IndexError: SDK list index out of range", log_text)
+        self.assertNotIn("[attempt=2/2] RESPONSE STRUCTURE", log_text)
+
+    def test_response_structure_summary_is_bounded_and_omits_payload_and_credentials(self):
+        secret = "sensitive-api-key"
+        payload = "private model response " * 1000
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            id=secret + "x" * 4000,
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=[payload], tool_calls=[]),
+                finish_reason="stop",
+            )],
+            headers={"Authorization": secret},
+            error={"message": payload},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logger = RunLogger(temp_dir, "query_018", "job_018", console=False)
+            prompts = PromptRecorder(temp_dir, "query_018", "job_018")
+            with run_log_scope(logger, prompts), patch("inference.OpenAI", return_value=client):
+                with self.assertRaises(RuntimeError):
+                    query_model_with_tools("model", [], self.tools, openai_api_key=secret, tries=1)
+            logger.close()
+            log_text = Path(temp_dir, "workflow.log").read_text(encoding="utf-8")
+        summary_line = next(line for line in log_text.splitlines() if "RESPONSE STRUCTURE " in line)
+        summary_text = summary_line.split("RESPONSE STRUCTURE ", 1)[1]
+        self.assertLessEqual(len(summary_text), 2000)
+        summary = json.loads(summary_text)
+        self.assertEqual(summary["choices_count"], 1)
+        self.assertEqual(summary["content_type"], "list")
+        self.assertNotIn(secret, log_text)
+        self.assertNotIn(payload, log_text)
+        self.assertNotIn("Authorization", log_text)
+
+    def test_malformed_response_retry_respects_http_budget(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(choices=[])
+        with llm_http_attempt_budget_scope(1) as budget, patch(
+            "inference.OpenAI", return_value=client
+        ), patch("inference.time.sleep") as sleep:
+            with self.assertRaises(LLMHTTPAttemptLimitError):
+                query_model_with_tools("model", [], self.tools, openai_api_key="key", tries=3)
+        self.assertEqual(client.chat.completions.create.call_count, 1)
+        self.assertEqual(budget.used, 1)
+        self.assertTrue(budget.request_blocked)
+        sleep.assert_not_called()
 
     def test_logs_failed_attempt_then_successful_retry(self):
         first_client = MagicMock()

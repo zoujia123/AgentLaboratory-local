@@ -194,12 +194,14 @@ class LocalReplayTest(unittest.TestCase):
             side_effect=AssertionError("network access is forbidden"),
         ):
             search = ArxivSearch()
-            second = search.find_papers_by_str("  SECOND   QUERY ", N=1)
-            first = search.find_papers_by_str("first query", N=1)
+            second = search.find_papers("  SECOND   QUERY ")
+            first = search.find_papers("first query")
 
-        self.assertIn("Second Paper", second)
-        self.assertIn("Publication Date: 2025-02-03", second)
-        self.assertIn("First Paper", first)
+        self.assertIn("Second Paper", second["text"])
+        self.assertIn("Publication Date: 2025-02-03", second["text"])
+        self.assertIn("First Paper", first["text"])
+        self.assertEqual(second["candidate_ids"], ["2222.00002v2"])
+        self.assertEqual(first["candidate_ids"], ["1111.00001v1"])
         self.assertEqual(
             [event["match_kind"] for event in session.events],
             ["local_bm25", "local_bm25"],
@@ -212,17 +214,17 @@ class LocalReplayTest(unittest.TestCase):
     def test_unrecorded_search_text_uses_local_candidate_index(self):
         session = self.make_session()
         with local_replay_scope(session):
-            result = ArxivSearch().find_papers_by_str("second abstract topic", N=1)
-        self.assertIn("Second Paper", result)
+            result = ArxivSearch().find_papers("second abstract topic")
+        self.assertIn("Second Paper", result["text"])
         self.assertEqual(session.events[-1]["match_kind"], "local_bm25")
 
     def test_arxiv_search_uses_deterministic_synthetic_latency_when_exhausted(self):
         session = self.make_session()
         with local_replay_scope(session):
             search = ArxivSearch()
-            search.find_papers_by_str("first", N=1)
-            search.find_papers_by_str("second", N=1)
-            search.find_papers_by_str("third", N=1)
+            search.find_papers("first")
+            search.find_papers("second")
+            search.find_papers("third")
         self.assertEqual(session.events[-1]["match_kind"], "local_bm25")
         self.assertEqual(session.events[-1]["latency_match_kind"], "synthetic_median")
         self.assertEqual(session.events[-1]["reservation_index"], 3)
@@ -286,9 +288,8 @@ class LocalReplayTest(unittest.TestCase):
         with local_replay_scope(session):
             search = HFDataSearch()
             results = search.retrieve_ds("small dataset", N=1)
-            rendered = search.results_str(results)
         self.assertEqual(results[0]["id"], "owner/recorded")
-        self.assertIn("Dataset ID: owner/recorded", rendered[0])
+        self.assertEqual(results[0]["description"], "recorded dataset")
 
     def test_excluded_hf_candidates_are_not_searchable_or_selectable(self):
         excluded_dir = self.recording_dir / "huggingface" / "excluded"
@@ -360,20 +361,28 @@ print(len(recorded), len(fallback), sum(recorded['value']), sum(fallback['value'
         self.assertIn("datasets", artifacts["data"]["type"])
 
     def test_preparation_execution_captures_dataset_for_workflow(self):
-        from agents import _run_preparation_code
+        from data_preparation import _run_preparation_code
         session = self.make_session()
+        inspected = session.select_hf_dataset(
+            "owner/recorded", revision="revision-one", config_name="default", split="train",
+        )
         code = (
             "from datasets import load_dataset\n"
             "data = load_dataset('owner/recorded', split='train')\n"
             "print(len(data))\n"
         )
         with local_replay_scope(session):
-            result = _run_preparation_code(code, str(self.root))
+            result = _run_preparation_code(code, str(self.root), inspected, code_execution_timeout_seconds=30)
         self.assertTrue(result["success"], result["output"])
         self.assertEqual(result["code"], code)
         self.assertEqual(result["output"].strip(), "2")
         self.assertEqual(result["selection"]["dataset_id"], "owner/recorded")
         self.assertEqual(result["selection"]["split"], "train")
+        self.assertEqual(result["selection"], inspected)
+        self.assertEqual(result["executed_dataset"], {
+            "dataset_id": "owner/recorded", "revision": "revision-one",
+            "resources": [{"config_name": "default", "split": "train"}],
+        })
 
     def test_split_none_returns_dataset_dict_and_records_resolved_resources(self):
         object_dir = (
@@ -614,7 +623,7 @@ print(len(recorded), len(fallback), sum(recorded['value']), sum(fallback['value'
     def test_recorded_latency_sleeps_only_for_remaining_duration(self):
         session = self.make_session(**{"latency-mode": "recorded"})
         with local_replay_scope(session), patch("local_replay.time.sleep") as sleep:
-            ArxivSearch().find_papers_by_str("first query", N=1)
+            ArxivSearch().find_papers("first query")
         sleep.assert_called_once()
         self.assertGreater(sleep.call_args.args[0], 0.05)
         self.assertLessEqual(sleep.call_args.args[0], 0.1)
@@ -633,7 +642,7 @@ print(len(recorded), len(fallback), sum(recorded['value']), sum(fallback['value'
     def test_trace_summary_is_written_outside_material_root(self):
         session = self.make_session()
         with local_replay_scope(session):
-            ArxivSearch().find_papers_by_str("first query", N=1)
+            ArxivSearch().find_papers("first query")
         with tempfile.TemporaryDirectory() as trace_temp:
             trace_dir = Path(trace_temp)
             summary = session.write_trace(trace_dir)

@@ -69,12 +69,7 @@ class RunLogger:
             self.logger.addHandler(console_handler)
 
     def _write(self, level, message, exc_info=False):
-        self.logger.log(
-            level,
-            str(message),
-            extra={"query_id": self.query_id},
-            exc_info=exc_info,
-        )
+        self.logger.log(level, str(message), extra={"query_id": self.query_id}, exc_info=exc_info)
 
     def debug(self, message):
         self._write(logging.DEBUG, message)

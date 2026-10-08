@@ -334,7 +334,7 @@ class AgentRuntimeTest(unittest.TestCase):
         self.assertEqual(rejected["available_tools"], ["submit"])
         self.assertTrue(rejected["retryable"])
 
-    def test_executes_all_batchable_search_calls_and_returns_every_result(self):
+    def test_rejects_all_search_calls_then_recovers_with_single_calls(self):
         calls = []
         observed_messages = []
         registry = ToolRegistry()
@@ -343,7 +343,6 @@ class AgentRuntimeTest(unittest.TestCase):
             "Search",
             schema({"query": {"type": "string"}}, ["query"]),
             lambda query: calls.append(query) or {"results": [query]},
-            allow_multiple=True,
         ).register(
             "submit",
             "Submit",
@@ -359,7 +358,10 @@ class AgentRuntimeTest(unittest.TestCase):
                     ModelToolCall("call-3", "search", '{"query":"third"}'),
                 ],
             ),
-            ToolModelResponse("", [ModelToolCall("call-4", "submit", "{}")]),
+            ToolModelResponse(
+                "", [ModelToolCall("call-4", "search", '{"query":"corrected"}')]
+            ),
+            ToolModelResponse("", [ModelToolCall("call-5", "submit", "{}")]),
         ]
 
         def respond(**kwargs):
@@ -373,7 +375,7 @@ class AgentRuntimeTest(unittest.TestCase):
             result = runtime.run("system", "user", registry, {"submit"})
 
         self.assertTrue(result.value["success"])
-        self.assertEqual(calls, ["first", "second", "third"])
+        self.assertEqual(calls, ["corrected"])
         second_turn_messages = observed_messages[1]
         assistant_message = second_turn_messages[-4]
         self.assertEqual(len(assistant_message["tool_calls"]), 3)
@@ -381,12 +383,20 @@ class AgentRuntimeTest(unittest.TestCase):
             [message["tool_call_id"] for message in second_turn_messages[-3:]],
             ["call-1", "call-2", "call-3"],
         )
-        self.assertEqual(record.call_args.kwargs["metadata"]["tool_count"], 3)
-        self.assertEqual(
-            record.call_args.kwargs["metadata"]["execution_mode"], "sequential"
+        for message in second_turn_messages[-3:]:
+            rejected = json.loads(message["content"])
+            self.assertFalse(rejected["success"])
+            self.assertEqual(rejected["error_type"], "multiple_tool_calls")
+        rejection = next(
+            call.kwargs
+            for call in record.call_args_list
+            if call.kwargs.get("name") == "agent.rejected_multiple_tool_calls"
         )
+        self.assertEqual(rejection["metadata"]["requested_tools"], ["search"] * 3)
+        self.assertEqual(rejection["metadata"]["executed_tools"], [])
+        self.assertEqual(len(observed_messages), 3)
 
-    def test_recovers_from_multi_call_batch_with_non_batchable_tool(self):
+    def test_rejects_mixed_tool_calls_without_partially_executing_them(self):
         actions = []
         observed_messages = []
         registry = ToolRegistry()
@@ -445,7 +455,7 @@ class AgentRuntimeTest(unittest.TestCase):
             self.assertFalse(payload["success"])
             self.assertEqual(
                 payload["error_type"],
-                "non_batchable_tool_batch",
+                "multiple_tool_calls",
             )
             self.assertIn("No tool was executed", payload["error"])
         recorded_events = [call.args[0] for call in recorder.record.call_args_list]
@@ -455,6 +465,7 @@ class AgentRuntimeTest(unittest.TestCase):
             if event["event"] == "tool_protocol_recovery"
         )
         self.assertEqual(recovery["repair_attempt"], 1)
+        self.assertEqual(recovery["reason"], "multiple_tool_calls")
         self.assertEqual(recovery["executed_tools"], [])
 
     def test_coalesces_registered_atomic_edit_calls(self):
@@ -509,7 +520,40 @@ class AgentRuntimeTest(unittest.TestCase):
         self.assertEqual(coalesced["source_call_count"], 5)
         self.assertFalse(any(event["event"] == "tool_protocol_recovery" for event in events))
 
-    def test_repeated_non_batchable_batches_exhaust_protocol_repair_budget(self):
+    def test_rejects_multiple_calls_when_registered_coalescer_declines(self):
+        actions = []
+        coalescer = MagicMock(return_value=None)
+        registry = ToolRegistry().register(
+            "edit",
+            "Atomically edit code",
+            schema({"edits": {"type": "array"}}, ["edits"]),
+            lambda edits: actions.append(edits) or {"success": True},
+            batch_coalescer=coalescer,
+        )
+        responses = [
+            ToolModelResponse(
+                "",
+                [
+                    ModelToolCall("call-1", "edit", '{"edits":["first"]}'),
+                    ModelToolCall("call-2", "edit", '{"edits":["second"]}'),
+                ],
+            ),
+            ToolModelResponse(
+                "", [ModelToolCall("call-3", "edit", '{"edits":["corrected"]}')]
+            ),
+        ]
+        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        with patch("agent_runtime.query_model_with_tools", side_effect=responses) as query:
+            result = runtime.run_one("system", "user", registry)
+
+        self.assertTrue(result.value["success"])
+        self.assertEqual(actions, [["corrected"]])
+        self.assertEqual(query.call_count, 2)
+        coalescer.assert_called_once_with([
+            {"edits": ["first"]}, {"edits": ["second"]},
+        ])
+
+    def test_repeated_multiple_calls_exhaust_protocol_repair_budget(self):
         actions = []
         registry = ToolRegistry().register(
             "submit",
@@ -620,7 +664,7 @@ class AgentRuntimeTest(unittest.TestCase):
         self.assertEqual(query.call_count, 2)
         self.assertEqual(actions, [])
 
-    def test_missing_arguments_reject_entire_batch_before_execution(self):
+    def test_missing_search_arguments_are_rejected_before_execution(self):
         actions = []
         observed_messages = []
         registry = ToolRegistry().register(
@@ -628,7 +672,6 @@ class AgentRuntimeTest(unittest.TestCase):
             "Search",
             schema({"query": {"type": "string"}}, ["query"]),
             lambda query: actions.append(query) or {"success": True},
-            allow_multiple=True,
         ).register(
             "submit",
             "Submit",
@@ -638,10 +681,10 @@ class AgentRuntimeTest(unittest.TestCase):
         responses = [
             ToolModelResponse(
                 "",
-                [
-                    ModelToolCall("call-1", "search", '{"query":"valid"}'),
-                    ModelToolCall("call-2", "search", "{}"),
-                ],
+                [ModelToolCall("call-1", "search", "{}")],
+            ),
+            ToolModelResponse(
+                "", [ModelToolCall("call-2", "search", '{"query":"corrected"}')]
             ),
             ToolModelResponse("", [ModelToolCall("call-3", "submit", "{}")]),
         ]
@@ -650,26 +693,22 @@ class AgentRuntimeTest(unittest.TestCase):
             observed_messages.append(deepcopy(kwargs["messages"]))
             return responses[len(observed_messages) - 1]
 
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=2)
         with patch("agent_runtime.query_model_with_tools", side_effect=respond):
             result = runtime.run("system", "user", registry, {"submit"})
 
         self.assertTrue(result.value["success"])
-        self.assertEqual(actions, ["submit"])
-        recovery_messages = observed_messages[1][-3:]
+        self.assertEqual(actions, ["corrected", "submit"])
+        recovery_messages = observed_messages[1][-2:]
         self.assertEqual(recovery_messages[0]["role"], "assistant")
-        valid_call_result = json.loads(recovery_messages[1]["content"])
-        missing_call_result = json.loads(recovery_messages[2]["content"])
-        self.assertEqual(
-            valid_call_result["error_type"],
-            "batch_rejected_due_to_missing_arguments",
-        )
+        missing_call_result = json.loads(recovery_messages[1]["content"])
         self.assertEqual(
             missing_call_result["error_type"],
             "missing_required_arguments",
         )
+        self.assertEqual(missing_call_result["missing_arguments"], ["query"])
 
-    def test_executes_batchable_read_and_add_calls_in_order(self):
+    def test_return_after_tool_rejects_multiple_calls_before_executing_one(self):
         actions = []
         registry = ToolRegistry()
         registry.register(
@@ -677,41 +716,34 @@ class AgentRuntimeTest(unittest.TestCase):
             "Read",
             schema({"paper_id": {"type": "string"}}, ["paper_id"]),
             lambda paper_id: actions.append(("read", paper_id)) or {"text": paper_id},
-            allow_multiple=True,
         ).register(
             "add",
             "Add",
             schema({"paper_id": {"type": "string"}}, ["paper_id"]),
             lambda paper_id: actions.append(("add", paper_id)) or {"success": True},
-            allow_multiple=True,
-        ).register(
-            "submit", "Submit", schema(), lambda: {"success": True}
         )
         responses = [
             ToolModelResponse(
                 "",
                 [
                     ModelToolCall("read-1", "read", '{"paper_id":"p1"}'),
-                    ModelToolCall("read-2", "read", '{"paper_id":"p2"}'),
+                    ModelToolCall("add-1", "add", '{"paper_id":"p1"}'),
                 ],
             ),
             ToolModelResponse(
                 "",
-                [
-                    ModelToolCall("add-1", "add", '{"paper_id":"p1"}'),
-                    ModelToolCall("add-2", "add", '{"paper_id":"p2"}'),
-                ],
+                [ModelToolCall("read-2", "read", '{"paper_id":"corrected"}')],
             ),
-            ToolModelResponse("", [ModelToolCall("submit-1", "submit", "{}")]),
         ]
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=3)
-        with patch("agent_runtime.query_model_with_tools", side_effect=responses):
-            result = runtime.run("system", "user", registry, {"submit"})
-        self.assertTrue(result.value["success"])
-        self.assertEqual(
-            actions,
-            [("read", "p1"), ("read", "p2"), ("add", "p1"), ("add", "p2")],
-        )
+        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        with patch("agent_runtime.query_model_with_tools", side_effect=responses) as query:
+            result = runtime.run(
+                "system", "user", registry, set(), return_after_tool=True,
+            )
+        self.assertEqual(result.tool_name, "read")
+        self.assertEqual(result.value["text"], "corrected")
+        self.assertEqual(actions, [("read", "corrected")])
+        self.assertEqual(query.call_count, 2)
 
     def test_recovers_from_response_without_tool_calls(self):
         observed_messages = []

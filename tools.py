@@ -16,7 +16,7 @@ from pathlib import Path
 
 import matplotlib
 
-from local_replay import current_local_replay, install_worker_hf_replay
+from local_replay import DatasetBindingError, current_local_replay, install_worker_hf_replay
 from seeding import (
     SeedConfig,
     current_seed_config,
@@ -93,22 +93,6 @@ class HFDataSearch:
             revision=revision,
         )
 
-    @staticmethod
-    def results_str(results):
-        rendered = []
-        for result in results:
-            rendered.append(
-                "\n".join([
-                    f"Dataset ID: {result.get('id', '')}",
-                    f"Description: {result.get('description', '')}",
-                    f"Configs: {result.get('configs', [])}",
-                    f"Splits: {result.get('splits', [])}",
-                    f"Likes: {result.get('likes', 0)}",
-                    f"Downloads: {result.get('downloads', 0)}",
-                ])
-            )
-        return rendered
-
 
 class ArxivSearch:
     def __init__(self):
@@ -136,21 +120,6 @@ class ArxivSearch:
             output.append(word)
             current_length += len(word) + 1
         return " ".join(output)
-
-    @traced_call(
-        "tool",
-        "arxiv.search",
-        metadata_factory=lambda args, kwargs: {
-            "max_results": kwargs.get("N", args[2] if len(args) > 2 else 20)
-        },
-        success_predicate=lambda result: result is not None,
-    )
-    def find_papers_by_str(self, query, N=20):
-        return self.replay.replay_arxiv_search(
-            query,
-            N,
-            self._process_query(query),
-        )
 
     @traced_call(
         "tool",
@@ -437,6 +406,10 @@ def worker_run_code(
         initial_names = set(globals_dict)
         stage = "python_exception"
         exec(code_str, globals_dict)
+        if worker_replay is not None:
+            executed_dataset = worker_replay.validate_execution()
+            if executed_dataset is not None:
+                result["executed_dataset"] = executed_dataset
         stage = "result_collection_error"
         result.update(
             artifacts=_artifact_inventory(globals_dict, initial_names),
@@ -450,7 +423,10 @@ def worker_run_code(
         )
     except BaseException as exc:
         # Only the child catches SystemExit/KeyboardInterrupt. The parent remains interruptible.
-        kind = "worker_interrupted" if isinstance(exc, (SystemExit, KeyboardInterrupt)) else stage
+        if isinstance(exc, DatasetBindingError):
+            kind = "dataset_binding_error"
+        else:
+            kind = "worker_interrupted" if isinstance(exc, (SystemExit, KeyboardInterrupt)) else stage
         result.update(_execution_failure(
             kind, f"{type(exc).__name__}: {exc}", traceback.format_exc()
         ))
@@ -531,7 +507,10 @@ def _wait_for_execution(process, output_queue, deadline):
     },
     success_predicate=lambda result: result["success"] is True,
 )
-def _execute_code_details(code_str, timeout=600, MAX_LEN=50000, workdir=None, seeds=None):
+def _execute_code_details(
+    code_str, timeout=600, MAX_LEN=50000, workdir=None, seeds=None,
+    expected_hf_dataset=None,
+):
     process = None
     output_queue = None
     replay = None
@@ -545,7 +524,14 @@ def _execute_code_details(code_str, timeout=600, MAX_LEN=50000, workdir=None, se
                 _execution_failure("validation_error", exc), MAX_LEN
             )
         replay = current_local_replay(required=False)
-        replay_context = replay.worker_context() if replay is not None else None
+        if expected_hf_dataset is not None:
+            if replay is None:
+                raise DatasetBindingError(
+                    "Selected dataset execution requires an active local replay session."
+                )
+            replay_context = replay.worker_context(expected_hf_dataset=expected_hf_dataset)
+        else:
+            replay_context = replay.worker_context() if replay is not None else None
         resolved_workdir = None
         if workdir is not None:
             resolved_workdir = str(Path(workdir).resolve())
@@ -563,7 +549,9 @@ def _execute_code_details(code_str, timeout=600, MAX_LEN=50000, workdir=None, se
             result["error"] += f" ({timeout} seconds)"
     except Exception as exc:
         result = _execution_failure(
-            "execution_environment_error", f"{type(exc).__name__}: {exc}", traceback.format_exc()
+            "dataset_binding_error" if isinstance(exc, DatasetBindingError)
+            else "execution_environment_error",
+            f"{type(exc).__name__}: {exc}", traceback.format_exc()
         )
     finally:
         # Also clean up on a parent KeyboardInterrupt, then let it propagate.
@@ -588,9 +576,11 @@ def _execute_code_details(code_str, timeout=600, MAX_LEN=50000, workdir=None, se
 
 def execute_code(
     code_str, timeout=600, MAX_LEN=50000, workdir=None, seeds=None, return_details=False,
+    expected_hf_dataset=None,
 ):
     result = _execute_code_details(
         code_str, timeout=timeout, MAX_LEN=MAX_LEN, workdir=workdir, seeds=seeds,
+        expected_hf_dataset=expected_hf_dataset,
     )
     if return_details:
         return result

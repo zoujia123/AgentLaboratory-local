@@ -5,13 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent_runtime import AgentRuntime
-from mlesolver import (
-    EXPERIMENT_EXECUTION_TIMEOUT_SECONDS,
-    MLESolverAgent,
-    _execution_failure_category,
-    _failure_repair_hint,
-    _python_syntax_error,
+from execution_diagnostics import (
+    classify_runtime_data_failure,
+    python_syntax_error,
+    runtime_data_repair_hint,
 )
+from agents import MLESolverAgent
 
 
 def execution_result(output, success=True, error_type=None):
@@ -41,7 +40,7 @@ class MLESolverSolveTest(unittest.TestCase):
                 "",
                 [ModelToolCall(
                     "write",
-                    "replace_experiment_code",
+                    "write_experiment_code",
                     json.dumps({"code": "draft = 1"}),
                 )],
             ),
@@ -49,7 +48,7 @@ class MLESolverSolveTest(unittest.TestCase):
                 "",
                 [ModelToolCall(
                     "rewrite",
-                    "replace_experiment_code",
+                    "write_experiment_code",
                     json.dumps({"code": "fixed = 1"}),
                 )],
             ),
@@ -78,10 +77,10 @@ class MLESolverSolveTest(unittest.TestCase):
             "agent_runtime.current_prompt_recorder",
             return_value=recorder,
         ), patch(
-            "mlesolver.execute_code",
+            "agents.execute_code",
             side_effect=[failure, execution_result("final_output")],
         ):
-            result = MLESolverAgent("model", "key").solve(state, folder)
+            result = MLESolverAgent("model", "key", code_execution_timeout_seconds=123).solve(state, folder)
 
         self.assertTrue(result["success"])
         self.assertEqual(result["code"], "fixed = 1")
@@ -129,7 +128,7 @@ class MLESolverSolveTest(unittest.TestCase):
                 "",
                 [ModelToolCall(
                     "write",
-                    "replace_experiment_code",
+                    "write_experiment_code",
                     json.dumps({"code": "draft = 1"}),
                 )],
             ),
@@ -137,7 +136,7 @@ class MLESolverSolveTest(unittest.TestCase):
                 "",
                 [ModelToolCall(
                     "repeat",
-                    "replace_experiment_code",
+                    "write_experiment_code",
                     json.dumps({"code": "draft = 1"}),
                 )],
             ),
@@ -145,7 +144,7 @@ class MLESolverSolveTest(unittest.TestCase):
                 "",
                 [ModelToolCall(
                     "rewrite",
-                    "replace_experiment_code",
+                    "write_experiment_code",
                     json.dumps({"code": "fixed = 1"}),
                 )],
             ),
@@ -177,10 +176,10 @@ class MLESolverSolveTest(unittest.TestCase):
             "agent_runtime.current_prompt_recorder",
             return_value=recorder,
         ), patch(
-            "mlesolver.execute_code",
+            "agents.execute_code",
             side_effect=[failure, execution_result("final_output")],
         ):
-            result = MLESolverAgent("model", "key").solve(state, folder)
+            result = MLESolverAgent("model", "key", code_execution_timeout_seconds=123).solve(state, folder)
 
         self.assertTrue(result["success"])
         self.assertEqual(len(requested_messages), 3)
@@ -217,12 +216,12 @@ class MLESolverSolveTest(unittest.TestCase):
             "run",
             return_value=completed,
         ) as run, patch(
-            "mlesolver.execute_code",
+            "agents.execute_code",
             return_value=failure,
         ):
-            MLESolverAgent("model", "key").solve(state, folder)
+            MLESolverAgent("model", "key", code_execution_timeout_seconds=123).solve(state, folder)
             registry = run.call_args.kwargs["registry"]
-            registry.execute("replace_experiment_code", {"code": "draft = 1"})
+            registry.execute("write_experiment_code", {"code": "draft = 1"})
             result = registry.execute("execute_experiment_code", {})
 
         self.assertEqual(result["failure_category"], "evaluation_subset_alignment")
@@ -234,7 +233,12 @@ class MLESolverSolveTest(unittest.TestCase):
         from inference import ModelToolCall, ToolModelResponse
 
         state = SimpleNamespace(
-            topic="topic", plan="plan", dataset_selection={}, seeds={},
+            topic="topic", plan="plan", seeds={},
+            dataset_selection={
+                "dataset_id": "owner/data", "revision": "r1",
+                "config_name": "default", "split": "train",
+                "dataset_schema": {"row_count": 1, "columns": {"value": "int64"}},
+            },
             dataset_code="data = [1]", literature_review="review",
             experiment_code="original_code", experiment_output="original_output",
             supplementary_experiments=[],
@@ -244,7 +248,7 @@ class MLESolverSolveTest(unittest.TestCase):
         for supplement in (False, True):
             for fail_first in (False, True):
                 with self.subTest(supplement=supplement, fail_first=fail_first), tempfile.TemporaryDirectory() as folder:
-                    replace = "replace_supplement_code" if supplement else "replace_experiment_code"
+                    replace = "write_supplement_code" if supplement else "write_experiment_code"
                     edit = "edit_supplement_code" if supplement else "edit_experiment_code"
                     submit = "submit_supplementary_experiment" if supplement else "submit_experiment"
                     edit_arguments = (
@@ -283,14 +287,20 @@ class MLESolverSolveTest(unittest.TestCase):
                     recorder = MagicMock()
                     with patch("agent_runtime.query_model_with_tools", side_effect=respond), patch(
                         "agent_runtime.current_prompt_recorder", return_value=recorder
-                    ), patch("mlesolver.execute_code", side_effect=outputs) as execute:
-                        agent = MLESolverAgent("model", "key")
+                    ), patch("agents.execute_code", side_effect=outputs) as execute:
+                        agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
                         result = (
                             agent.supplement(state, request, folder, 1)
                             if supplement else agent.solve(state, folder)
                         )
                     self.assertEqual(len(calls), 2 if fail_first else 1)
                     self.assertEqual(execute.call_count, len(outputs))
+                    for execution_call in execute.call_args_list:
+                        self.assertEqual(execution_call.kwargs["timeout"], 123)
+                        self.assertEqual(
+                            execution_call.kwargs["expected_hf_dataset"],
+                            state.dataset_selection,
+                        )
                     self.assertTrue(result["success"])
                     self.assertTrue(result["automatic_execution"])
                     self.assertEqual(result["code"], "value = 2" if fail_first else "value = 1")
@@ -323,9 +333,9 @@ class MLESolverSolveTest(unittest.TestCase):
                         "traceback": "", "exit_code": 0,
                     }
                     failure[diagnostic_field] = "ValueError: could not convert string to float: 'tcp'"
-                    agent = MLESolverAgent("model", "key")
+                    agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
                     with patch.object(AgentRuntime, "run", return_value=SimpleNamespace(value={})) as run, patch(
-                        "mlesolver.execute_code", side_effect=[
+                        "agents.execute_code", side_effect=[
                             failure, failure, execution_result("accuracy=0.9"),
                         ],
                     ):
@@ -338,7 +348,7 @@ class MLESolverSolveTest(unittest.TestCase):
                             agent.solve(state, folder)
                         registry = run.call_args.kwargs["registry"]
                         provider = run.call_args.kwargs["tool_names_provider"]
-                        replace = "replace_supplement_code" if supplement else "replace_experiment_code"
+                        replace = "write_supplement_code" if supplement else "write_experiment_code"
                         execute = "execute_supplement_code" if supplement else "execute_experiment_code"
                         submit = "submit_supplementary_experiment" if supplement else "submit_experiment"
                         for version in (1, 2):
@@ -352,9 +362,22 @@ class MLESolverSolveTest(unittest.TestCase):
                         self.assertEqual(provider(), {replace})
                         self.assertIn("numeric feature", failed["repair_hint"])
                         registry.execute(replace, {"code": "value = 3"})
-                        registry.execute(execute, {})
+                        successful = registry.execute(execute, {})
                         self.assertEqual(provider(), {submit})
+                        self.assertIsNone(successful["failure_category"])
+                        self.assertIsNone(successful["repair_hint"])
+                        self.assertEqual(successful["same_category_count"], 0)
+                        self.assertFalse(successful["full_replacement_required"])
                         self.assertEqual(registry.execute(submit, {})["output"], "accuracy=0.9")
+                        # Success clears the active failure, but preserves old failed versions.
+                        rejected = registry.execute(replace, {"code": "value = 1"})
+                        original = rejected["original_execution_diagnostic"]
+                        self.assertFalse(rejected["success"])
+                        self.assertEqual(original["code_hash"], rejected["code_hash"])
+                        self.assertEqual(original["same_category_count"], 1)
+                        self.assertFalse(original["full_replacement_required"])
+                        self.assertNotIn("latest_execution_diagnostic", rejected)
+                        self.assertEqual(provider(), {submit})
 
     def test_main_and_supplement_use_status_and_allow_infrastructure_retry(self):
         state = SimpleNamespace(
@@ -365,9 +388,9 @@ class MLESolverSolveTest(unittest.TestCase):
         )
         for supplement in (False, True):
             with self.subTest(supplement=supplement), tempfile.TemporaryDirectory() as folder:
-                agent = MLESolverAgent("model", "key")
+                agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
                 with patch.object(AgentRuntime, "run", return_value=SimpleNamespace(value={} )) as run, patch(
-                    "mlesolver.execute_code", side_effect=[
+                    "agents.execute_code", side_effect=[
                         execution_result("", False, "missing_result"),
                         execution_result("[CODE EXECUTION ERROR] literal text"),
                     ],
@@ -381,7 +404,7 @@ class MLESolverSolveTest(unittest.TestCase):
                         agent.solve(state, folder)
                     registry = run.call_args.kwargs["registry"]
                     provider = run.call_args.kwargs["tool_names_provider"]
-                    replace = "replace_supplement_code" if supplement else "replace_experiment_code"
+                    replace = "write_supplement_code" if supplement else "write_experiment_code"
                     execute_name = "execute_supplement_code" if supplement else "execute_experiment_code"
                     submit = "submit_supplementary_experiment" if supplement else "submit_experiment"
                     registry.execute(replace, {"code": "print(data)"})
@@ -395,6 +418,51 @@ class MLESolverSolveTest(unittest.TestCase):
                     self.assertEqual(provider(), {submit})
                     self.assertTrue(registry.execute(submit, {})["success"])
                     self.assertTrue(execute.call_args.kwargs["return_details"])
+                    self.assertEqual(execute.call_count, 2)
+                    for execution_call in execute.call_args_list:
+                        self.assertEqual(execution_call.kwargs["timeout"], 123)
+
+    def test_main_and_supplement_cache_timeouts_and_require_replacement(self):
+        state = SimpleNamespace(
+            topic="topic", plan="plan", dataset_selection={}, seeds={},
+            dataset_code="data = [1]", literature_review="review",
+            experiment_code="print(data)", experiment_output="1",
+            supplementary_experiments=[],
+        )
+        for supplement in (False, True):
+            with self.subTest(supplement=supplement), tempfile.TemporaryDirectory() as folder:
+                agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
+                with patch.object(
+                    AgentRuntime, "run", return_value=SimpleNamespace(value={}),
+                ) as run, patch(
+                    "agents.execute_code",
+                    return_value=execution_result("limit exceeded", False, "timeout"),
+                ) as execute:
+                    if supplement:
+                        agent.supplement(state, {
+                            "objective": "check", "reason": "check",
+                            "required_outputs": [], "constraints": [],
+                        }, folder, 1)
+                    else:
+                        agent.solve(state, folder)
+                    registry = run.call_args.kwargs["registry"]
+                    provider = run.call_args.kwargs["tool_names_provider"]
+                    replace = "write_supplement_code" if supplement else "write_experiment_code"
+                    execute_name = "execute_supplement_code" if supplement else "execute_experiment_code"
+                    for version in (1, 2):
+                        registry.execute(replace, {"code": f"value = {version}"})
+                        failed = registry.execute(execute_name, {})
+                        self.assertEqual(failed["failure_category"], "timeout")
+                        self.assertEqual(failed["same_category_count"], version)
+                    self.assertTrue(failed["full_replacement_required"])
+                    self.assertEqual(provider(), {replace})
+                    rejected = registry.execute(replace, {"code": "value = 1"})
+                    self.assertFalse(rejected["success"])
+                    original = rejected["original_execution_diagnostic"]
+                    self.assertEqual(original["failure_category"], "timeout")
+                    self.assertEqual(original["code_hash"], rejected["code_hash"])
+                    self.assertEqual(original["same_category_count"], 1)
+                    self.assertEqual(execute.call_count, 2)
 
     def test_solver_escalates_repeated_error_category_to_full_replacement(self):
         state = SimpleNamespace(
@@ -405,12 +473,12 @@ class MLESolverSolveTest(unittest.TestCase):
             dataset_code="dataset_code",
             literature_review="review",
         )
-        agent = MLESolverAgent("model", "key")
+        agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
         completed = SimpleNamespace(value={"success": True})
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             AgentRuntime, "run", return_value=completed
         ) as run, patch(
-            "mlesolver.execute_code",
+            "agents.execute_code",
             side_effect=[
                 execution_result("could not convert string to float: 'tcp'", False, "python_exception"),
                 execution_result("could not convert string to float: 'udp'", False, "python_exception"),
@@ -419,7 +487,7 @@ class MLESolverSolveTest(unittest.TestCase):
             agent.solve(state, temp_dir)
             registry = run.call_args.kwargs["registry"]
             provider = run.call_args.kwargs["tool_names_provider"]
-            registry.execute("replace_experiment_code", {"code": "version_a = 1"})
+            registry.execute("write_experiment_code", {"code": "version_a = 1"})
             first = registry.execute("execute_experiment_code", {})
             registry.execute(
                 "edit_experiment_code",
@@ -433,7 +501,7 @@ class MLESolverSolveTest(unittest.TestCase):
         self.assertEqual(first["failure_category"], "non_numeric_model_input")
         self.assertEqual(second["same_category_count"], 2)
         self.assertTrue(second["full_replacement_required"])
-        self.assertEqual(provider(), {"replace_experiment_code"})
+        self.assertEqual(provider(), {"write_experiment_code"})
         self.assertIn("do not patch only one model call", second["repair_hint"])
 
     def test_solver_escalates_repeated_ragged_input_to_full_replacement(self):
@@ -446,12 +514,12 @@ class MLESolverSolveTest(unittest.TestCase):
             literature_review="review",
         )
         failure = "ValueError: expected sequence of length 3 at dim 3 (got 4)"
-        agent = MLESolverAgent("model", "key")
+        agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
         completed = SimpleNamespace(value={"success": True})
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             AgentRuntime, "run", return_value=completed
         ) as run, patch(
-            "mlesolver.execute_code",
+            "agents.execute_code",
             side_effect=[
                 execution_result(failure, False, "python_exception"),
                 execution_result(failure, False, "python_exception"),
@@ -460,7 +528,7 @@ class MLESolverSolveTest(unittest.TestCase):
             agent.solve(state, temp_dir)
             registry = run.call_args.kwargs["registry"]
             provider = run.call_args.kwargs["tool_names_provider"]
-            registry.execute("replace_experiment_code", {"code": "version_a = 1"})
+            registry.execute("write_experiment_code", {"code": "version_a = 1"})
             first = registry.execute("execute_experiment_code", {})
             registry.execute(
                 "edit_experiment_code",
@@ -474,7 +542,7 @@ class MLESolverSolveTest(unittest.TestCase):
         self.assertEqual(first["failure_category"], "ragged_array_input")
         self.assertEqual(second["same_category_count"], 2)
         self.assertTrue(second["full_replacement_required"])
-        self.assertEqual(provider(), {"replace_experiment_code"})
+        self.assertEqual(provider(), {"write_experiment_code"})
         self.assertIn("np.stack", second["repair_hint"])
 
     def test_runtime_data_categories_have_specific_repair_hints(self):
@@ -486,9 +554,9 @@ class MLESolverSolveTest(unittest.TestCase):
         }
         for error, category in cases.items():
             with self.subTest(error=error):
-                self.assertEqual(_execution_failure_category(error), category)
+                self.assertEqual(classify_runtime_data_failure(error), category)
                 self.assertNotIn(
-                    "Use the traceback", _failure_repair_hint(category)
+                    "Use the traceback", runtime_data_repair_hint(category)
                 )
 
     def test_solver_rejects_any_previously_failed_code_version(self):
@@ -500,12 +568,12 @@ class MLESolverSolveTest(unittest.TestCase):
             dataset_code="dataset_code",
             literature_review="review",
         )
-        agent = MLESolverAgent("model", "key")
+        agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
         completed = SimpleNamespace(value={"success": True})
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             AgentRuntime, "run", return_value=completed
         ) as run, patch(
-            "mlesolver.execute_code",
+            "agents.execute_code",
             side_effect=[
                 execution_result("first failure", False, "python_exception"),
                 execution_result("list index out of range", False, "python_exception"),
@@ -513,7 +581,7 @@ class MLESolverSolveTest(unittest.TestCase):
         ):
             agent.solve(state, temp_dir)
             registry = run.call_args.kwargs["registry"]
-            registry.execute("replace_experiment_code", {"code": "version_a = 1"})
+            registry.execute("write_experiment_code", {"code": "version_a = 1"})
             registry.execute("execute_experiment_code", {})
             registry.execute(
                 "edit_experiment_code",
@@ -557,17 +625,17 @@ class MLESolverSolveTest(unittest.TestCase):
             literature_review="literature_review",
         )
         completed = SimpleNamespace(value={"success": True})
-        agent = MLESolverAgent("model", "key")
+        agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
 
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             AgentRuntime, "run", return_value=completed
-        ) as run, patch("mlesolver.execute_code") as execute_code:
+        ) as run, patch("agents.execute_code") as execute_code:
             agent.solve(state, temp_dir)
             registry = run.call_args.kwargs["registry"]
             provider = run.call_args.kwargs["tool_names_provider"]
 
             invalid = registry.execute(
-                "replace_experiment_code",
+                "write_experiment_code",
                 {"code": "print('unterminated)"},
             )
             self.assertFalse(invalid["success"])
@@ -576,10 +644,10 @@ class MLESolverSolveTest(unittest.TestCase):
             self.assertIn("Syntax source context:", invalid["error"])
             self.assertIn("-> 1: print('unterminated)", invalid["error"])
             self.assertIn("^", invalid["error"])
-            self.assertEqual(provider(), {"replace_experiment_code"})
+            self.assertEqual(provider(), {"write_experiment_code"})
 
             registry.execute(
-                "replace_experiment_code",
+                "write_experiment_code",
                 {"code": "result = {'accuracy': 1.0}"},
             )
             invalid_edit = registry.execute(
@@ -606,7 +674,7 @@ class MLESolverSolveTest(unittest.TestCase):
             + "\nnearby = 2\nFAR_AWAY_SENTINEL = True\n"
         )
 
-        feedback = _python_syntax_error(source)
+        feedback = python_syntax_error(source)
 
         self.assertIn("Syntax source context:", feedback)
         self.assertIn("-> 2: print(f'Entry:", feedback)
@@ -639,7 +707,7 @@ class MLESolverSolveTest(unittest.TestCase):
                 "",
                 [ModelToolCall(
                     "invalid",
-                    "replace_experiment_code",
+                    "write_experiment_code",
                     json.dumps({"code": invalid_code}),
                 )],
             ),
@@ -647,7 +715,7 @@ class MLESolverSolveTest(unittest.TestCase):
                 "",
                 [ModelToolCall(
                     "valid",
-                    "replace_experiment_code",
+                    "write_experiment_code",
                     json.dumps({"code": "result = 1"}),
                 )],
             ),
@@ -664,10 +732,10 @@ class MLESolverSolveTest(unittest.TestCase):
             "agent_runtime.query_model_with_tools",
             side_effect=respond,
         ), patch(
-            "mlesolver.execute_code",
+            "agents.execute_code",
             return_value=execution_result("final output"),
         ) as execute_code:
-            result = MLESolverAgent("model", "key").solve(state, temp_dir)
+            result = MLESolverAgent("model", "key", code_execution_timeout_seconds=123).solve(state, temp_dir)
 
         recovery = json.dumps(requested_messages[1])
         self.assertTrue(result["success"])
@@ -693,13 +761,13 @@ class MLESolverSolveTest(unittest.TestCase):
             "run",
             return_value=completed,
         ) as run, patch(
-            "mlesolver.execute_code",
+            "agents.execute_code",
             return_value=execution_result("experiment_output"),
         ) as execute_code:
-            MLESolverAgent("model", "key").solve(state, temp_dir)
+            MLESolverAgent("model", "key", code_execution_timeout_seconds=123).solve(state, temp_dir)
             registry = run.call_args.kwargs["registry"]
             registry.execute(
-                "replace_experiment_code",
+                "write_experiment_code",
                 {"code": "alpha = 1\nbeta = 2\n"},
             )
             edited = registry.execute(
@@ -723,7 +791,6 @@ class MLESolverSolveTest(unittest.TestCase):
         self.assertFalse(failed["success"])
         self.assertIn("edit 2", failed["error"])
         self.assertTrue(executed["success"])
-        self.assertFalse(registry.allows_multiple("edit_experiment_code"))
         coalescer = registry.batch_coalescer_for("edit_experiment_code")
         self.assertIsNotNone(coalescer)
         self.assertEqual(
@@ -744,6 +811,11 @@ class MLESolverSolveTest(unittest.TestCase):
             if item["function"]["name"] == "edit_experiment_code"
         )
         self.assertEqual(schema["parameters"]["required"], ["edits"])
+        self.assertEqual(set(schema["parameters"]["properties"]), {"edits"})
+        self.assertEqual(
+            schema["parameters"]["properties"]["edits"]["items"]["required"],
+            ["old_text", "new_text"],
+        )
         self.assertEqual(schema["parameters"]["properties"]["edits"]["maxItems"], 6)
         combined = execute_code.call_args.args[0]
         self.assertIn("alpha = 10", combined)
@@ -762,14 +834,14 @@ class MLESolverSolveTest(unittest.TestCase):
             literature_review="literature_review",
         )
         completed = SimpleNamespace(value={"success": True})
-        agent = MLESolverAgent("model", "key")
+        agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
 
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             AgentRuntime,
             "run",
             return_value=completed,
         ) as run, patch(
-            "mlesolver.execute_code",
+            "agents.execute_code",
             side_effect=[execution_result("broken", False, "python_exception"), execution_result("experiment_output")],
         ) as execute_code:
             agent.solve(state, temp_dir)
@@ -783,15 +855,15 @@ class MLESolverSolveTest(unittest.TestCase):
                 {"execute_experiment_code", "submit_experiment"},
             )
 
-            self.assertEqual(available_tools(), {"replace_experiment_code"})
+            self.assertEqual(available_tools(), {"write_experiment_code"})
 
-            registry.execute("replace_experiment_code", {"code": "broken_code"})
+            registry.execute("write_experiment_code", {"code": "broken_code"})
             self.assertEqual(
                 available_tools(),
                 {"execute_experiment_code"},
             )
             unchanged = registry.execute(
-                "replace_experiment_code",
+                "write_experiment_code",
                 {"code": "broken_code"},
             )
             self.assertFalse(unchanged["success"])
@@ -801,7 +873,7 @@ class MLESolverSolveTest(unittest.TestCase):
             self.assertFalse(failed["success"])
             self.assertEqual(
                 available_tools(),
-                {"edit_experiment_code", "replace_experiment_code"},
+                {"edit_experiment_code", "write_experiment_code"},
             )
 
             registry.execute(
@@ -829,7 +901,11 @@ class MLESolverSupplementTest(unittest.TestCase):
         state = SimpleNamespace(
             topic="topic",
             plan="plan",
-            dataset_selection={"dataset_id": "owner/data"},
+            dataset_selection={
+                "dataset_id": "owner/data", "revision": "r1",
+                "config_name": "default", "split": "train",
+                "dataset_schema": {"row_count": 1, "columns": {"value": "int64"}},
+            },
             seeds={"sklearn": 4001},
             dataset_code="dataset_code",
             experiment_code="original_experiment_code",
@@ -843,14 +919,14 @@ class MLESolverSupplementTest(unittest.TestCase):
             "constraints": ["preserve original experiment"],
         }
         completed = SimpleNamespace(value={"success": True})
-        agent = MLESolverAgent("model", "key")
+        agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
 
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             AgentRuntime,
             "run",
             return_value=completed,
         ) as run, patch(
-            "mlesolver.execute_code",
+            "agents.execute_code",
             return_value=execution_result("supplement_output"),
         ) as execute_code:
             agent.supplement(state, request, temp_dir, 1)
@@ -862,10 +938,13 @@ class MLESolverSupplementTest(unittest.TestCase):
             self.assertIn(request["reason"], kwargs["user_prompt"])
             registry = kwargs["registry"]
             available_tools = kwargs["tool_names_provider"]
+            edit_schema = registry.schemas_for({"edit_supplement_code"})[0]["function"]["parameters"]
+            self.assertEqual(edit_schema["required"], ["old_text", "new_text"])
+            self.assertEqual(set(edit_schema["properties"]), {"old_text", "new_text"})
             self.assertEqual(
                 registry.names,
                 {
-                    "replace_supplement_code",
+                    "write_supplement_code",
                     "edit_supplement_code",
                     "execute_supplement_code",
                     "submit_supplementary_experiment",
@@ -875,9 +954,9 @@ class MLESolverSupplementTest(unittest.TestCase):
                 kwargs["terminal_tools"],
                 {"submit_supplementary_experiment"},
             )
-            self.assertEqual(available_tools(), {"replace_supplement_code"})
+            self.assertEqual(available_tools(), {"write_supplement_code"})
             registry.execute(
-                "replace_supplement_code",
+                "write_supplement_code",
                 {"code": "print('supplement')"},
             )
             self.assertEqual(available_tools(), {"execute_supplement_code"})
@@ -893,9 +972,10 @@ class MLESolverSupplementTest(unittest.TestCase):
             )
             execute_code.assert_called_with(
                 "dataset_code\n\nprint('supplement')",
-                timeout=EXPERIMENT_EXECUTION_TIMEOUT_SECONDS,
+                timeout=123,
                 workdir=expected_workdir,
                 return_details=True,
+                expected_hf_dataset=state.dataset_selection,
             )
             self.assertEqual(execute_code.call_count, 1)
             self.assertTrue(execution["success"])
@@ -920,18 +1000,18 @@ class MLESolverSupplementTest(unittest.TestCase):
             supplementary_experiments=[],
         )
         completed = SimpleNamespace(value={"success": True})
-        agent = MLESolverAgent("model", "key")
+        agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             AgentRuntime, "run", return_value=completed
         ) as run:
             agent.supplement(state, {"objective": "check"}, temp_dir, 1)
             registry = run.call_args.kwargs["registry"]
             registry.execute(
-                "replace_supplement_code",
+                "write_supplement_code",
                 {"code": "print('same')"},
             )
             unchanged = registry.execute(
-                "replace_supplement_code",
+                "write_supplement_code",
                 {"code": "print('same')"},
             )
 

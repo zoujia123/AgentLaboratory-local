@@ -1,5 +1,62 @@
-from execution_diagnostics import runtime_object_guidance
 from seeding import seed_prompt_text
+
+
+# 数据准备、主实验和补充实验共用的代码生成指导。
+# 在生成代码前拼入系统提示，无需先发生错误或经过错误分类。
+COMMON_CODE_GUIDANCE = (
+    "Runtime object discipline: use the observed runtime type and its API; do not "
+    "assume every image is an ndarray, every dataset is a DataFrame, or every "
+    "collection supports named-column indexing. Each execution starts fresh; "
+    "do not assume variables or fitted models from earlier executions exist. "
+    "Supplement code receives the prepended dataset code and must recreate "
+    "values defined only in the reference main experiment. For multiple "
+    "cross-validation metrics, use cross_validate and read test_<metric> "
+    "result keys; cross_val_score returns a single score array. "
+    "For PIL.Image.Image, use image "
+    "methods such as .convert(...) and .resize(...) before array conversion when "
+    "appropriate. In Dataset.map(batched=True), returned fields must remain "
+    "length-aligned. For PyTorch training, return tensors from Dataset.__getitem__ "
+    "or select a torch read format for preprocessed Hugging Face columns before "
+    "building a DataLoader; returning tensors from Dataset.map alone does not "
+    "guarantee tensor-valued reads. Dataset.train_test_split uses seed=..., whereas sklearn "
+    "splitters use random_state=.... Dataset.train_test_split returns a DatasetDict: "
+    "assign the result to splits and read splits['train'] and splits['test']; "
+    "direct unpacking yields the split-name strings. For a list of records, iterate records or "
+    "convert it before selecting a named field. When comparing paired representations, "
+    "keep one row per original sample with both feature variants, or retain "
+    "identically ordered row IDs and labels in separate views. Create required "
+    "derived columns on every split used by the model; do not vertically "
+    "concatenate feature variants. When the task specifies a capped stratified "
+    "sample, select that sample with the fixed seed first, discard its unsampled "
+    "complement, then make the held-out split within the selected sample. All "
+    "representations must reuse the same train/test row IDs, with no overlap "
+    "between train and test. Check that total unique samples used stay within "
+    "the requested cap and required text variants contain strings, not None. "
+    "Row-wise deterministic transformations such as URL removal may be applied "
+    "to both splits. Fit learned transformations such as TF-IDF separately on "
+    "each representation's training data, then transform its held-out data."
+)
+
+
+DATA_PREPARATION_OUTPUT_GUIDANCE = (
+    "Keep explicit data-preparation prints to a short diagnostic summary, aiming "
+    "for under 2000 characters in total. Prefer row counts, shapes, dtypes, and "
+    "aggregate missing/non-finite counts. If examples are necessary, show only a "
+    "few scalar values or short text excerpts. Bound both the number of displayed "
+    "items and the length of each value; an outer [:5] slice or head() does not "
+    "bound nested dictionaries, arrays, or long text inside those items. For nested "
+    "containers, report their type, shape, or length and only bounded scalar "
+    "previews. Do not print complete datasets, tables, columns, dictionaries, "
+    "arrays, tensors, images, or binary contents. Do not convert entire objects "
+    "with .tolist(), .to_dict(), or serialization merely to print them; these "
+    "conversions can bypass abbreviated displays. Avoid per-row or per-batch "
+    "printing. If detailed diagnostic data must be retained, save it to a file "
+    "in the working directory and print only its path and a brief description. "
+    "Preview limits apply only to display: preserve all data, validation checks, "
+    "splits, and sample sizes required by the research task. Preparation code is "
+    "rerun before experiments, so its prints repeat and share the captured "
+    "experiment output; leave room for the experiment's actual results."
+)
 
 
 def literature_review_prompt():
@@ -24,16 +81,19 @@ def literature_review_prompt():
         "When adding a background paper, explain what transfers and distinguish it from "
         "direct evidence. When relevance is uncertain, "
         "read before rejecting. Use only this query's local candidates returned by search. "
-        "Search with short queries. When a search returns candidates, read them one at "
-        "a time; do not reject an entire search batch without reading its papers. After "
-        "each read, return exactly one tool call total: add_paper or reject_paper for "
-        "the currently read arXiv ID only. Do not decide, add, or reject another "
-        "candidate in that response. If rejecting, stop after that one reject_paper "
-        "call and wait for the next search opportunity. Rejection means setting a paper "
-        "aside, not banning it: you may read papers from earlier batches, including "
-        "rejected ones, when you have a new reason to reconsider. Avoid repeating an "
-        "unchanged read/reject cycle. If no new candidates remain, reconsider earlier "
-        "candidates or report_no_local_paper when none is suitable. Once the required "
+        "Search with short queries. Follow search_arxiv, read_arxiv_paper, then "
+        "decide_paper, using exactly one tool call per response. Read only a candidate "
+        "from the latest search; do not reject a paper without reading it. After "
+        "each read, return exactly one tool call total: decide_paper for "
+        "the currently read arXiv ID only. Set decision to exactly 'add' or 'reject'. "
+        "For add, use explanation to summarize findings, relevance and limitations; "
+        "for reject, explain why the paper has no useful direct or transferable "
+        "relevance. Do not decide, add, or reject another candidate in that response. "
+        "If rejecting, stop after that one decide_paper call. On the next turn, "
+        "call search_arxiv to obtain a new candidate; do not reread earlier or "
+        "rejected papers. Use only the tools shown for this turn. If a search "
+        "returns no candidates, try another short query within the remaining "
+        "review budget. Once the required "
         "count is reached, submit without further searches. Accurately summarize "
         "methods, findings, relevance and limitations from the returned text; distinguish "
         "direct evidence from background and do not invent claims."
@@ -193,16 +253,26 @@ def postdoc_interpretation_prompt():
 def ml_dataset_selection_prompt():
     return (
         "You are a machine learning engineer directed by the SWEngineerAgent. "
-        "Use the research topic and data-preparation requirements to help "
-        "prepare the data. You can search local Hugging Face datasets with "
-        "search_huggingface, read an exact materialized schema with "
-        "inspect_huggingface_dataset, test complete Python programs with "
-        "execute_dataset_code, or reply with send_dialogue. Use one tool per turn; "
-        "control then returns to the software engineer. Read prior search results, "
+        "Prepare data for the research topic using the data-preparation requirements. "
+        "Use search_huggingface_datasets to find local datasets. Use "
+        "inspect_selected_dataset with no arguments to read the selected dataset's "
+        "schema. Write the complete preparation Python program in the code argument "
+        "of write_and_run_dataset_code; the tool runs it immediately. Use send_dialogue "
+        "to reply to the software engineer when that tool is available. Use one tool per turn; "
+        "control then returns to the software engineer unless execution succeeds "
+        "and the framework automatically submits the program. Read prior search results, "
         "code and execution feedback before choosing your next action. "
+        "Use only the currently exposed tools. After schema inspection, only "
+        "write_and_run_dataset_code is available: provide the complete preparation program "
+        "in code. If execution fails, use the authoritative failure and repair_hint "
+        "to correct the failing operation before your next execution. "
+        "When failure_context is present, start with its line, source, and observed "
+        "variable types. Trace those variables back to their assignments and correct "
+        "the operation responsible for the actual failure. Do not guess the failure "
+        "location from the exception message alone or change an unrelated callback. "
         "Never resubmit candidate code identified as unchanged after a failed "
         "execution. Make a substantive correction using the supplied repair_hint. "
-        "If execute_dataset_code returns unchanged_failed_dataset_code, enter a "
+        "If write_and_run_dataset_code returns unchanged_failed_dataset_code, enter a "
         "mandatory new-code repair state: the next tool call MUST contain a materially "
         "different complete program that addresses the latest diagnostic. For an explicit "
         "indentation-related Python syntax error, reissue the complete program with "
@@ -212,7 +282,7 @@ def ml_dataset_selection_prompt():
         "and inspected schema fixed, and do not search "
         "again. "
         "When a search returns a complete local candidate, the framework selects the "
-        "first such candidate and exposes only inspect_huggingface_dataset next. "
+        "first such candidate and exposes only inspect_selected_dataset next. "
         "Inspect that selected candidate; do not repeat the same search or choose a "
         "different candidate. "
         "The full experimental plan is intentionally unavailable in this phase. Do not "
@@ -222,14 +292,12 @@ def ml_dataset_selection_prompt():
         "analysis, map it from the inspected schema, preserve it aligned with every "
         "prepared split, and exclude it from model features unless explicitly required "
         "as an input. "
-        "Choose suitable datasets from the returned local materials and communicate "
-        "the exact ID and available configuration/splits. When the framework-selected "
-        "candidate is present, call inspect_huggingface_dataset with no arguments; "
-        "the framework supplies its identity. Otherwise use the exact ID, revision, "
-        "configuration and split. Hugging Face search metadata "
+        "Use the framework-selected dataset. Call inspect_selected_dataset with no "
+        "arguments; the framework supplies its exact ID, revision, configuration and "
+        "split. Hugging Face search metadata "
         "and natural-language descriptions are not authoritative schema evidence: "
         "never infer literal column names, dtypes, timestamp fields, or split contents "
-        "from them. After selecting a candidate, call inspect_huggingface_dataset "
+        "from them. After selecting a candidate, call inspect_selected_dataset "
         "before recommending final preparation code. Treat the returned row count, "
         "exact column names, and "
         "dtypes as authoritative. Use them to identify the actual timestamp field and "
@@ -242,21 +310,24 @@ def ml_dataset_selection_prompt():
         "or attributes from stored representation or merely alternate between bracket "
         "and attribute access. When the inspection result includes runtime_sample_types, "
         "treat those types as authoritative for Python access; stored_schema and "
-        "dataset_schema describe storage only. After schema inspection, use execute_dataset_code to test the "
-        "complete candidate preparation program. Do not tell the software engineer to "
-        "submit until both schema inspection and the candidate program have executed "
-        "successfully. Keep the solution simple and do not invent extra dataset "
-        "requirements. Prepare reusable variables and print useful checks. Test code is "
-        "not the final submission: it may load, clean, validate, encode, impute, select "
+        "dataset_schema describe storage only. After schema inspection, write the "
+        "complete candidate preparation program in the code argument of "
+        "write_and_run_dataset_code. Successful execution is automatically "
+        "submitted by the framework and completes data preparation. The software "
+        "engineer provides requirements analysis and code-repair advice through dialogue. "
+        "Keep the solution simple and do not invent extra dataset "
+        "requirements. Prepare reusable variables and print useful checks. Preparation "
+        "code may load, clean, validate, encode, impute, select "
         "columns, fit preprocessing transformations on training data, and create reusable "
         "splits. It must not instantiate, train, tune, predict with, or evaluate a "
         "predictive model; do not calculate final metrics, per-class results, comparisons, "
-        "result tables, or figures. The "
-        "software engineer submits the final complete program. Work offline using "
+        "result tables, or figures. Work offline using "
         "the available modules and datasets.load_dataset. Installed modules are not "
         "prebound names in generated programs; explicitly import every module or "
         "symbol before referencing it. "
-        + runtime_object_guidance()
+        + DATA_PREPARATION_OUTPUT_GUIDANCE
+        + " "
+        + COMMON_CODE_GUIDANCE
         + " "
         + seed_prompt_text()
     )
@@ -265,7 +336,10 @@ def ml_dataset_selection_prompt():
 def sw_data_preparation_prompt():
     return (
         "You are a software engineer directing the MLEngineerAgent during data "
-        "preparation. You act first. Begin by using send_dialogue to ask the ML "
+        "preparation. Your only tool is send_dialogue. Use it to analyze "
+        "data-preparation requirements, review the ML engineer's code and execution "
+        "feedback, and provide concrete repair advice. You cannot execute or submit "
+        "data-preparation code. You act first. Begin by using send_dialogue to ask the ML "
         "engineer to search for a suitable local Hugging Face dataset and help "
         "write simple preparation code based on the topic and data-preparation "
         "requirements. "
@@ -282,8 +356,8 @@ def sw_data_preparation_prompt():
         "Read the ML engineer's search results, dialogue, trial code and execution "
         "output on subsequent turns. Search results and dataset descriptions are not "
         "authoritative schema evidence. Never infer literal column names, dtypes, "
-        "timestamp fields, or split contents from them. Before writing schema-dependent "
-        "final code, require the ML engineer to call inspect_huggingface_dataset, then "
+        "timestamp fields, or split contents from them. Before recommending schema-dependent "
+        "code, require the ML engineer to call inspect_selected_dataset, then "
         "use the returned row count, columns, and dtypes to identify the timestamp and "
         "numeric experiment columns. An inspected schema describes stored "
         "representation, not necessarily the loaded Python object interface. If a "
@@ -296,16 +370,24 @@ def sw_data_preparation_prompt():
         "selected a candidate, "
         "request inspection without asking the MLEngineerAgent to search again or restate "
         "its identity. "
-        "Then require the complete candidate preparation "
-        "program to run successfully with execute_dataset_code. If either successful "
-        "schema-inspection evidence or a successful candidate execution is absent, you "
-        "MUST use send_dialogue to request it and MUST NOT call submit_dataset_code. "
-        "Use send_dialogue to discuss or request repairs. Only after both checks succeed, "
-        "use submit_dataset_code with the same verified complete Python program. "
-        "The framework executes it; successful submission completes this phase. "
-        "If submission fails, use the error feedback and ML assistance to correct it. "
-        "Do not submit partial snippets. Leave reusable data variables for the "
-        "experiment stage and print relevant checks. Data preparation may load, clean, "
+        "Then use send_dialogue to ask the ML engineer to write the complete "
+        "preparation program in write_and_run_dataset_code's code argument. The tool "
+        "runs that program immediately. The framework automatically "
+        "submits successful execution and completes this phase. Use send_dialogue "
+        "to discuss requirements or request repairs when execution fails. "
+        "After a candidate execution fails, identify the failing expression and give "
+        "the ML engineer a concrete code correction using the authoritative traceback "
+        "and repair_hint. When failure_context is present, use its line, source, and "
+        "observed variable types to locate the failure, then trace the variables back "
+        "to their assignments. Base the correction on that runtime evidence; do not "
+        "guess the failure location from the exception message alone or direct changes "
+        "to an unrelated callback. After schema inspection the ML engineer can only call "
+        "write_and_run_dataset_code, so request a corrected complete program. Distinguish "
+        "batch callback inputs from individual stored examples; a list received by "
+        "a batched callback alone does not justify requesting schema inspection again. "
+        "Code snippets may be included in your dialogue as repair advice; ask the ML "
+        "engineer to execute a complete program. Require reusable data variables for the "
+        "experiment stage and relevant printed checks. Data preparation may load, clean, "
         "validate, encode, impute, select columns, fit preprocessing transformations on "
         "training data, and create reusable splits. It must not instantiate, train, tune, "
         "predict with, or evaluate a predictive model; do not calculate final metrics, "
@@ -315,7 +397,9 @@ def sw_data_preparation_prompt():
         "Generated programs must explicitly import every module or symbol they use; "
         "installed packages are not prebound globals. "
         "Work offline. Use one tool per turn. "
-        + runtime_object_guidance()
+        + DATA_PREPARATION_OUTPUT_GUIDANCE
+        + " "
+        + COMMON_CODE_GUIDANCE
         + " "
         + seed_prompt_text()
     )
@@ -353,12 +437,13 @@ def experiment_solver_prompt():
         "comparing input representations, feature sets, or modalities, keep the same "
         "model, split, training budget, and metrics for every variant; vary only the "
         "representation named in the topic. "
-        "Creating, replacing, or editing code automatically executes "
-        "the resulting draft. Inspect the real execution result returned by that same "
-        "tool call; use the separate execute tool only when it is exposed for an "
-        "infrastructure retry. When several coordinated local changes are needed, "
-        "call edit_experiment_code exactly once with every change in its edits array; "
-        "never emit multiple edit_experiment_code calls in one response. "
+        "To create or replace the experiment, write its complete Python code in "
+        "write_experiment_code's code argument. To fix the current draft, "
+        "call edit_experiment_code once with all changes in its edits array. "
+        "The framework automatically runs each valid draft and returns its real output. "
+        "Read that output before choosing the next action. When execute_experiment_code "
+        "is available for an infrastructure retry, call it with no arguments to "
+        "rerun the saved code without changes. "
         "Before printing each result, explain "
         "what the metric or comparison demonstrates. Report all planned baselines, "
         "metrics, controls, and comparisons, and never fabricate output. Check for "
@@ -373,9 +458,9 @@ def experiment_solver_prompt():
         "unchanged_failed_experiment_code, do not submit that code hash again. Use "
         "the latest execution diagnostic to apply atomic edits or write a materially "
         "different replacement. "
-        "full_replacement_required, redesign the complete experiment pipeline instead "
+        "If the tool reports full_replacement_required, redesign the complete experiment pipeline instead "
         "of applying another local patch. "
-        + runtime_object_guidance()
+        + COMMON_CODE_GUIDANCE
         + " "
         + seed_prompt_text()
     )
@@ -394,10 +479,14 @@ def supplementary_experiment_solver_prompt(supplement_id):
         "acceptable to reload data or retrain a necessary model, but do not duplicate "
         "unrelated parts of the original experiment. Work strictly offline and use "
         "the supplied fixed seeds. No pretrained model assets are materialized: never "
-        "call from_pretrained or assume a local model directory. Creating, replacing, "
-        "or editing supplement code automatically executes the resulting draft. "
-        "Inspect the execution result returned by that same tool call and use a separate "
-        "execute tool only for an exposed infrastructure retry. After successful "
+        "call from_pretrained or assume a local model directory. To create or replace "
+        "the supplement, write its complete Python code in write_supplement_code's "
+        "code argument. To replace one fragment, call edit_supplement_code: "
+        "copy an exact, unique fragment from the current supplement into old_text "
+        "and write its replacement in new_text. The framework automatically runs "
+        "each valid draft and returns its real output. Read that output before choosing "
+        "the next action. When execute_supplement_code is available for an infrastructure "
+        "retry, call it with no arguments to rerun the saved code without changes. After successful "
         "execution, the framework automatically submits the saved code and output "
         "without another model request. Do not use URLs, network libraries, pip, "
         "subprocesses, or another LLM. Inspect real output and repair errors. Never fabricate "
@@ -405,25 +494,12 @@ def supplementary_experiment_solver_prompt(supplement_id):
         "failed. If the tool reports full_replacement_required, redesign the complete "
         "supplement. Do not overwrite original files or figures; if a figure is needed, "
         f"name it {supplement_id}_figure.png. Use exactly one tool per turn. "
-        + runtime_object_guidance()
+        + COMMON_CODE_GUIDANCE
         + " "
         + seed_prompt_text()
     )
 
 
-def experiment_reward_prompt():
-    return (
-        "You are an expert experiment reward agent. Read the research plan, final "
-        "experiment code, observed output, and any supplementary experiments. Assign "
-        "a 0-1 score for how completely "
-        "the implementation follows the plan, whether the code executed correctly, "
-        "whether required baselines and metrics are present, whether calculations are "
-        "credible and reproducible under the supplied fixed numerical seeds, and "
-        "whether conclusions are supported by actual "
-        "output. Penalize missing experiments, errors, leakage, invented results, and "
-        "unsupported claims. Provide a specific evidence-based rationale. Do not "
-        "propose or perform revisions."
-    )
 
 
 def _paper_figure_guidance(available_figures=None):
@@ -448,7 +524,7 @@ def paper_blueprint_prompt(section_names, available_figures=None):
         + ". Provide a restrained title, one evidence-grounded central claim, and one "
         "concise writing plan for every fixed section. Base the blueprint only on the "
         "supplied literature review, plan, dataset, executed output, supplementary "
-        "experiments, reward, and interpretation. Do not invent experiments, numbers, "
+        "experiments and interpretation. Do not invent experiments, numbers, "
         "citations, significance tests, or claims. Call submit_paper_blueprint exactly "
         "once."
         + _paper_figure_guidance(available_figures)
@@ -465,55 +541,9 @@ def paper_section_prompt(section_name, word_target, available_figures=None):
         "command; the framework owns those. Subsections, equations, and tables are "
         "allowed when useful. Record fixed seeds in Experimental Setup. Put limitations "
         "and potential negative impacts in Discussion. Abstract must be one focused "
-        "paragraph and is generated after all other sections. Preserve every reported "
+        "paragraph. Preserve every reported "
         "number exactly. Use only citation keys supplied in the request, and do not "
         "invent evidence or significance. Call submit_paper_section exactly once with "
         "the requested section name and body."
         + _paper_figure_guidance(available_figures)
-    )
-
-
-def paper_writer_prompt(available_figures=None):
-    return paper_blueprint_prompt(
-        (
-            "Abstract",
-            "Introduction",
-            "Background",
-            "Related Work",
-            "Methods",
-            "Experimental Setup",
-            "Results",
-            "Discussion",
-        ),
-        available_figures,
-    )
-
-
-def reviewer_prompt(reviewer_index, profile):
-    return (
-        f"You are reviewer #{reviewer_index} for a prestigious machine learning venue. "
-        f"{profile} Be critical, cautious, fair, and specific to this submission. "
-        "Check every central claim against the supplied experiment output and plan. "
-        "Evaluate originality, technical quality, clarity, significance, soundness, "
-        "presentation, contribution, reproducibility, limitations, and ethical "
-        "concerns. Identify concrete strengths and weaknesses, ask clarifying "
-        "questions that could affect the assessment, and flag unsupported claims or "
-        "missing required paper sections. Use ratings 1-4 for originality, quality, "
-        "clarity, significance, soundness, presentation, and contribution; 1-10 for "
-        "overall score; and 1-5 for confidence. The final decision must be exactly "
-        "Accept or Reject. Submit one complete independent review and do not rewrite "
-        "the paper."
-    )
-
-
-def paper_reward_prompt():
-    return (
-        "You are the final paper reward agent. Integrate the three independent "
-        "reviews into one 0-10 quality score without revising any artifact. Consider "
-        "overall recommendation most strongly, followed by contribution and "
-        "presentation, while also accounting for soundness, originality, quality, "
-        "clarity, significance, confidence, reproducibility, limitations, and ethical "
-        "concerns. Check that the reviews are grounded in the actual paper and output. "
-        "Provide a concise evidence-based rationale and do not trigger another "
-        "workflow round."
     )

@@ -164,6 +164,7 @@ class SeedPolicyTest(unittest.TestCase):
                     "data_preparation_max_rounds": 12,
                     "interpretation_max_phd_reviews": 8,
                 },
+                code_execution_timeout_seconds=123,
                 seeds=self.seeds,
             )
             workflow = MagicMock()

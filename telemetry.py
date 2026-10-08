@@ -202,7 +202,6 @@ def traced_call(category, name=None, metadata_factory=None, success_predicate=No
             success = False
             error_type = None
             error_message = None
-            result = None
             try:
                 result = function(*args, **kwargs)
                 success = True if success_predicate is None else bool(success_predicate(result))

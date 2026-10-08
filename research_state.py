@@ -20,12 +20,9 @@ class ResearchState:
     experiment_output: str = ""
     supplementary_experiments: list = field(default_factory=list)
     interpretation_history: list = field(default_factory=list)
-    experiment_score: dict = field(default_factory=dict)
     interpretation: str = ""
     paper: str = ""
     readme: str = ""
-    reviews: list = field(default_factory=list)
-    paper_score: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)

@@ -44,6 +44,7 @@ class BatchRunnerTest(unittest.TestCase):
                 jobs,
                 output_root=str(Path(temp_dir, "runs")),
                 collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+                code_execution_timeout_seconds=123,
             )
             summary = run_batch(config, "model", "key")
 
@@ -70,6 +71,7 @@ class BatchRunnerTest(unittest.TestCase):
                 jobs,
                 output_root=str(output_root),
                 collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+                code_execution_timeout_seconds=123,
             )
             summary = run_batch(config, "model", "key")
             saved_summary = json.loads(
@@ -93,6 +95,7 @@ class BatchRunnerTest(unittest.TestCase):
             (QueryJob("query_001"),),
             output_root="D:/results",
             collaboration_rounds=COLLABORATION_ROUNDS.copy(),
+            code_execution_timeout_seconds=123,
         )
         summary = {
             "success_count": 0,

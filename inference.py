@@ -3,6 +3,7 @@ import contextvars
 import json
 import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from openai import OpenAI
@@ -140,6 +141,62 @@ def _field(value, name, default=None):
     return getattr(value, name, default)
 
 
+def _response_choice_and_message(completion):
+    choices = _field(completion, "choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes, bytearray)):
+        raise ToolResponseError("Model response choices must be a non-empty sequence")
+    if not choices:
+        raise ToolResponseError("Model response has no choices")
+    choice = choices[0]
+    missing = object()
+    message = _field(choice, "message", missing)
+    if message is missing:
+        raise ToolResponseError("Model response first choice has no message")
+    message_fields = ("role", "content", "tool_calls", "refusal")
+    if message is None or not any(
+        _field(message, name, missing) is not missing for name in message_fields
+    ):
+        raise ToolResponseError("Model response first choice has an invalid message")
+    content = _field(message, "content")
+    if content is not None and not isinstance(content, str):
+        raise ToolResponseError("Model response message content must be a string or null")
+    return choice, message
+
+
+def _response_structure_summary(completion):
+    """Record bounded response metadata, never message bodies or request credentials."""
+    summary = {"response_type": type(completion).__name__}
+    try:
+        response_id = _field(completion, "id")
+        if isinstance(response_id, str):
+            summary["response_id"] = response_id[:120]
+        choices = _field(completion, "choices")
+        summary["choices_type"] = type(choices).__name__
+        if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes, bytearray)):
+            summary["choices_count"] = len(choices)
+            if choices:
+                choice = choices[0]
+                summary["first_choice_type"] = type(choice).__name__
+                finish_reason = _field(choice, "finish_reason")
+                if isinstance(finish_reason, str):
+                    summary["finish_reason"] = finish_reason[:80]
+                message = _field(choice, "message")
+                summary["message_type"] = type(message).__name__
+                content = _field(message, "content")
+                summary["content_type"] = type(content).__name__
+                if isinstance(content, str):
+                    summary["content_chars"] = len(content)
+                tool_calls = _field(message, "tool_calls")
+                summary["tool_calls_type"] = type(tool_calls).__name__
+                if isinstance(tool_calls, (list, tuple)):
+                    summary["tool_calls_count"] = len(tool_calls)
+        summary["error_field_type"] = type(_field(completion, "error")).__name__
+    except Exception as exc:
+        # Diagnostics must not hide the original request/response failure.
+        summary["summary_error_type"] = type(exc).__name__
+    return json.dumps(summary, ensure_ascii=True)[:2000]
+
+
 def _response_usage(completion):
     usage = _field(completion, "usage")
     if usage is None:
@@ -243,21 +300,16 @@ def query_model_with_tools(
         try:
             workflow_attempt = budget.consume() if budget else None
         except LLMHTTPAttemptLimitError:
-            logger.error(
-                f"[LLM HTTP][attempt={attempt}/{tries}] BLOCKED "
-                f"request_limit={budget.used}/{budget.limit}"
-            )
+            logger.error(f"[LLM HTTP][attempt={attempt}/{tries}] BLOCKED request_limit={budget.used}/{budget.limit}")
             raise
         started = time.perf_counter()
         budget_suffix = (
             f" workflow_http_requests={workflow_attempt}/{budget.limit}"
             if budget else ""
         )
-        logger.info(
-            f"[LLM HTTP][attempt={attempt}/{tries}] BEGIN "
-            f"model={effective_model} timeout={request_timeout}s{budget_suffix} "
-            f"llm_sampling={json.dumps(sampling, sort_keys=True)}"
-        )
+        logger.info(f"[LLM HTTP][attempt={attempt}/{tries}] BEGIN model={effective_model} timeout={request_timeout}s{budget_suffix} llm_sampling={json.dumps(sampling, sort_keys=True)}")
+        completion = None
+        failure_stage = "request"
         try:
             client_kwargs = {
                 "api_key": api_key,
@@ -276,27 +328,15 @@ def query_model_with_tools(
                 **sampling,
                 extra_body={"enable_thinking": False},
             )
-            choice = completion.choices[0]  # 代码只读取第一个候选答案
-            message = choice.message
+            failure_stage = "parse_response"
+            choice, message = _response_choice_and_message(completion)
             finish_reason = _field(choice, "finish_reason")
             usage = _response_usage(completion)
             reasoning_content = _reasoning_content(message)
             response_id = _field(completion, "id")
             content = _field(message, "content") or ""
             returned_tool_calls = list(_field(message, "tool_calls", []) or [])
-            logger.info(
-                f"[LLM HTTP][attempt={attempt}/{tries}] RESPONSE "
-                f"response_id={response_id or 'None'} "
-                f"finish_reason={finish_reason or 'None'} "
-                f"prompt_tokens={usage.get('prompt_tokens', 'None')} "
-                f"completion_tokens={usage.get('completion_tokens', 'None')} "
-                f"total_tokens={usage.get('total_tokens', 'None')} "
-                f"reasoning_tokens={usage.get('reasoning_tokens', 'None')} "
-                f"cached_tokens={usage.get('cached_tokens', 'None')} "
-                f"reasoning_content_chars={len(reasoning_content)} "
-                f"content_chars={len(content)} "
-                f"tool_calls={len(returned_tool_calls)}"
-            )
+            logger.info(f"[LLM HTTP][attempt={attempt}/{tries}] RESPONSE response_id={response_id or 'None'} finish_reason={finish_reason or 'None'} prompt_tokens={usage.get('prompt_tokens', 'None')} completion_tokens={usage.get('completion_tokens', 'None')} total_tokens={usage.get('total_tokens', 'None')} reasoning_tokens={usage.get('reasoning_tokens', 'None')} cached_tokens={usage.get('cached_tokens', 'None')} reasoning_content_chars={len(reasoning_content)} content_chars={len(content)} tool_calls={len(returned_tool_calls)}")
             if not returned_tool_calls and not return_on_no_tool_call:
                 error_type = (
                     ToolResponseLengthError
@@ -325,43 +365,32 @@ def query_model_with_tools(
                 response_id=response_id,
             )
             elapsed = time.perf_counter() - started
-            logger.info(
-                f"[LLM HTTP][attempt={attempt}/{tries}] SUCCESS "
-                f"elapsed={elapsed:.2f}s"
-            )
+            logger.info(f"[LLM HTTP][attempt={attempt}/{tries}] SUCCESS elapsed={elapsed:.2f}s")
             return response
         except Exception as exc:
             elapsed = time.perf_counter() - started
             last_error = exc
-            logger.error(
-                f"[LLM HTTP][attempt={attempt}/{tries}] FAILED "
-                f"error_type={type(exc).__name__} elapsed={elapsed:.2f}s "
-                f"error={exc}"
-            )
+            logger.exception(f"[LLM HTTP][attempt={attempt}/{tries}] FAILED error_type={type(exc).__name__} elapsed={elapsed:.2f}s stage={failure_stage} error={exc}")
+            if failure_stage == "parse_response":
+                summary = _response_structure_summary(completion)
+                if api_key:
+                    summary = summary.replace(api_key, "[REDACTED]")
+                logger.error(f"[LLM HTTP][attempt={attempt}/{tries}] RESPONSE STRUCTURE {summary}")
             if attempt < tries:
                 if isinstance(exc, ToolResponseLengthError):
                     if length_repair_applied:
-                        logger.error(
-                            f"[LLM HTTP][attempt={attempt}/{tries}] "
-                            "LENGTH REPAIR EXHAUSTED"
-                        )
+                        logger.error(f"[LLM HTTP][attempt={attempt}/{tries}] LENGTH REPAIR EXHAUSTED")
                         break
                     if budget is not None and budget.remaining == 0:
                         break
                     length_repair_applied = True
                     request_messages = _length_repair_messages(messages, tools)
-                    logger.info(
-                        f"[LLM HTTP][attempt={attempt}/{tries}] RETRYING "
-                        "mode=length_repair"
-                    )
+                    logger.info(f"[LLM HTTP][attempt={attempt}/{tries}] RETRYING mode=length_repair")
                     continue
                 if budget is not None and budget.remaining == 0:
                     continue
-                logger.info(
-                    f"[LLM HTTP][attempt={attempt}/{tries}] RETRYING "
-                    f"after={retry_delay:g}s"
-                )
+                logger.info(f"[LLM HTTP][attempt={attempt}/{tries}] RETRYING after={retry_delay:g}s")
                 time.sleep(retry_delay)
     raise RuntimeError(
         f"Tool-calling model request failed after {attempts_made} attempts: {last_error}"
-    )
+    ) from last_error

@@ -1,7 +1,8 @@
 material-root: "D:/work/HUST/MASLab_v2"
-output-root: "research_runs_v3"
+output-root: "research_runs_glm"
 max-concurrent-queries: 1
 max-llm-http-attempts-per-query: 100
+code_execution_timeout_seconds: 2000  # 单次代码执行上限（秒），用于数据准备、主实验和补充实验
 console-log: false
 compile-latex: false
 
@@ -24,11 +25,54 @@ collaboration_rounds:
   data_preparation_max_rounds: 12
   interpretation_max_phd_reviews: 8
 
-queries:
-queries: 
+paper_writing:
+  # sections 的排列顺序就是最终论文中的章节顺序。
+  # word_target 是提示词中的目标单词数，max_chars 是工具参数中的最大字符数。
+  sections:
+    - name: Abstract
+      word_target: 250
+      max_chars: 2500
+    - name: Introduction
+      word_target: 600
+      max_chars: 6500
+    - name: Background
+      word_target: 450
+      max_chars: 5500
+    - name: Related Work
+      word_target: 500
+      max_chars: 5500
+    - name: Methods
+      word_target: 700
+      max_chars: 7000
+    - name: Experimental Setup
+      word_target: 650
+      max_chars: 6500
+    - name: Results
+      word_target: 600
+      max_chars: 6500
+    - name: Discussion
+      word_target: 650
+      max_chars: 6500
 
-  - query-id: query_005
-    recording-id: latest   
+  # 模型实际生成正文的顺序；必须包含上面所有章节且各出现一次。
+  generation_order:
+    - Introduction
+    - Background
+    - Related Work
+    - Methods
+    - Experimental Setup
+    - Results
+    - Discussion
+    - Abstract
+
+queries:
+  - query-id: query_003
+    recording-id: latest
+  - query-id: query_008
+    recording-id: latest
+  - query-id: query_020
+    recording-id: latest
+
 
 
 
