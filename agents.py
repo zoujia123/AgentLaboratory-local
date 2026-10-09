@@ -22,6 +22,7 @@ from execution_diagnostics import python_syntax_error
 from prompts import (
     LITERATURE_BACKGROUND_LIMITATIONS,
     LITERATURE_RELEVANCE_RULE,
+    LITERATURE_RETRY_RELEVANCE_RULE,
     experiment_solver_prompt,
     literature_review_prompt,
     ml_dataset_selection_prompt,
@@ -36,6 +37,7 @@ from prompts import (
     sw_data_preparation_prompt,
 )
 from tools import ArxivSearch, HFDataSearch, execute_code, execution_capabilities
+from run_logging import current_run_logger
 from utils import compile_latex
 
 
@@ -60,35 +62,83 @@ class BaseResearchAgent:
 class PhDStudentAgent(BaseResearchAgent):
     role = "computer science PhD student"
 
+    # 外层 conduct_literature_review()：管理最多两轮。
     def conduct_literature_review(self, topic):
         search = ArxivSearch()
+        if search.remaining_candidate_count() == 0: # 当前本地候选池是不是空的
+            raise RuntimeError("No usable local paper candidates are available for this query")
+
+        logger = current_run_logger()
+        for review_round in (1, 2): # 这两轮是顺序执行的，第一轮结束后才可能进入第二轮。
+            logger.info(f"[literature review] SCREENING ROUND START round={review_round}/2")
+            review = self._conduct_literature_review_round(topic, search, review_round)
+            if review is not None:
+                return review
+            logger.info(
+                f"[literature review] SCREENING ROUND END round={review_round}/2 "
+                + ("restarting with broader background relevance" if review_round == 1
+                   else "stopping after the final screening round")
+            )
+        raise RuntimeError(
+            "No relevant local paper was selected after 2 literature-review rounds; "
+            "each round exhausted its candidates or reached the consecutive empty-search limit"
+        )
+
+    # _conduct_literature_review_round()：执行其中一轮。这一轮里可以搜索、阅读、拒绝多篇论文。
+    def _conduct_literature_review_round(self, topic, search, review_round):
+        """
+            Return a review, or None when candidates or productive searches run out.
+            topic 是研究题目，search 是查找和读取本地论文的工具对象，review_round 是当前轮次，取值为 1 或 2。
+        """
+        class RoundEnded(Exception):
+            """Internal signal to leave the runtime before its next model request."""
+
+        # Each round gets fresh decisions and a fresh runtime conversation.
+        relevance_rule = (
+            LITERATURE_RETRY_RELEVANCE_RULE if review_round == 2 else LITERATURE_RELEVANCE_RULE
+        )   # 当前轮次使用的论文相关性标准.第一轮普通标准，第二轮宽松标准
 
         papers = [] # 保存已纳入综述的论文：arxiv_id、摘要、全文。纳入一篇后即可提交。
         pending_read = {"arxiv_id": None}   # 记录“刚读完、但尚未决定添加还是拒绝”的论文 ID。
-        rejected_papers = set() # 本轮拒绝过的论文不再返回或重新阅读。
-        candidate_batch = {"query": None, "ids": []}    # ids 是最新一次搜索中尚待处理的候选；决定当前应继续读还是继续搜索。
+        rejected_papers = set() # 仅在当前筛选轮内排除；第二轮重新创建。
+        candidate_batch = {"query": None, "ids": []}    # ids 是最新一次搜索中尚待处理的候选；决定当前应继续读还是继续搜索。candidate_batch 只代表“最近一次搜到什么”，并不代表整个本地论文库。
+        consecutive_empty_searches = 0  # 连续空搜索次数。
+        max_empty_searches = 3
 
         def unavailable_paper_ids():
             return rejected_papers | {item["arxiv_id"] for item in papers}
 
         def search_arxiv(query):
+            nonlocal consecutive_empty_searches
             details = search.find_papers(
                 query,
                 excluded_ids=unavailable_paper_ids(),
             )
             candidate_batch["query"] = query
             candidate_batch["ids"] = list(details["candidate_ids"])
+            consecutive_empty_searches = (
+                0 if candidate_batch["ids"] else consecutive_empty_searches + 1
+            )
             return {
                 "success": True,
                 "results": details["text"],
                 "candidate_ids": list(candidate_batch["ids"]),
                 "candidate_count": len(candidate_batch["ids"]),
+                "remaining_candidate_count": search.remaining_candidate_count(unavailable_paper_ids()),
+                "review_round": review_round,
+                "consecutive_empty_searches": consecutive_empty_searches,
                 "decision_required": bool(candidate_batch["ids"]),
                 "next_action_hint": (
                     "Read a candidate from this search, then call decide_paper once with the "
                     "matching arXiv ID and decision 'add' or 'reject'."
                     if candidate_batch["ids"]
-                    else "No candidates were returned. Search once more with a new query."
+                    else (
+                        "The consecutive empty-search limit was reached. This screening "
+                        "round will end."
+                        if consecutive_empty_searches >= max_empty_searches else
+                        "No candidates matched this query. Try a different short query "
+                        "about the underlying research background."
+                    )
                 ),
             }
 
@@ -125,7 +175,7 @@ class PhDStudentAgent(BaseResearchAgent):
                 "decision_required": True,
                 "next_action_hint": (
                     "Call decide_paper exactly once for this arXiv ID. "
-                    f"{LITERATURE_RELEVANCE_RULE}"
+                    f"{relevance_rule}"
                 ),
             }
 
@@ -177,14 +227,24 @@ class PhDStudentAgent(BaseResearchAgent):
             rejected_papers.add(arxiv_id)
             pending_read["arxiv_id"] = None
             candidate_batch["ids"] = []  # 拒绝后结束当前批次，下一步必须重新搜索。
+            remaining = search.remaining_candidate_count(unavailable_paper_ids())
             return {
                 "success": True,
                 "arxiv_id": arxiv_id,
                 "reason": reason,
                 "rejected_paper_count": len(rejected_papers),
+                "remaining_candidate_count": remaining,
+                "review_round": review_round,
                 "next_action_hint": (
                     "The paper was rejected. Call search_arxiv next to find a new "
-                    "candidate; rejected papers cannot be reread in this review."
+                    "candidate; rejected papers cannot be reread within this screening round."
+                    if remaining else (
+                        "All candidates were rejected. Screening will restart once with "
+                        "broader background relevance."
+                        if review_round == 1 else
+                        "All candidates were rejected in the final screening round. "
+                        "The literature-review stage will stop."
+                    )
                 ),
             }
 
@@ -228,6 +288,17 @@ class PhDStudentAgent(BaseResearchAgent):
                 return {"submit_literature_review"}
             if candidate_batch["ids"]:
                 return {"read_arxiv_paper"}
+            remaining = search.remaining_candidate_count(unavailable_paper_ids())   
+            if remaining == 0 or consecutive_empty_searches >= max_empty_searches:  # 本轮没有剩余候选。连续空搜索达到上限，这里的 max_empty_searches = 3。
+                reason = "candidates_exhausted" if remaining == 0 else "empty_search_limit"
+                current_run_logger().info(
+                    f"[literature review] SCREENING ROUND STOP round={review_round}/2 "
+                    f"reason={reason} remaining_candidates={remaining} "
+                    f"consecutive_empty_searches={consecutive_empty_searches}"
+                )
+                # Raise outside a tool handler so ToolRegistry cannot turn exhaustion
+                # into a recoverable tool failure and send the model back to search.
+                raise RoundEnded
             return {"search_arxiv"}
 
         registry = ToolRegistry()
@@ -235,7 +306,7 @@ class PhDStudentAgent(BaseResearchAgent):
             "search_arxiv",
             (
                 "Search local arXiv papers for query. Return candidate IDs and search "
-                "results, excluding papers already added or rejected in this review."
+                "results, excluding papers already added or rejected in this screening round."
             ),
             _object_schema(
                 {
@@ -251,7 +322,7 @@ class PhDStudentAgent(BaseResearchAgent):
             "read_arxiv_paper",
             (
                 "Read one unreviewed candidate from the latest search_arxiv result. "
-                "Rejected papers cannot be read again in this review. Then "
+                "Rejected papers cannot be read again within the same screening round. Then "
                 "call decide_paper once for the same arxiv_id."
             ),
             _object_schema(
@@ -263,7 +334,7 @@ class PhDStudentAgent(BaseResearchAgent):
             "decide_paper",
             (
                 "Make exactly one decision for the paper just read. "
-                f"{LITERATURE_RELEVANCE_RULE} "
+                f"{relevance_rule} "
                 f"{LITERATURE_BACKGROUND_LIMITATIONS} "
                 "Do not infer that the paper lacks a method or analysis merely "
                 "because it is absent from a truncated excerpt."
@@ -281,8 +352,8 @@ class PhDStudentAgent(BaseResearchAgent):
                         "transferable method, or direct evidence, then summarize "
                         "supported findings and limitations. Background relevance "
                         "does not require evidence for this experiment's outcome. "
-                        "For reject, explain why none of the three relevance "
-                        "conditions applies."
+                        "For reject, explain why the current round's relevance "
+                        "criteria do not apply."
                     ),
                 },
                 ["arxiv_id", "decision", "explanation"],
@@ -300,19 +371,23 @@ class PhDStudentAgent(BaseResearchAgent):
             ),
             submit_literature_review,
         )
-        result = self.runtime("literature review").run(
-            system_prompt=literature_review_prompt(),
-            user_prompt=(
-                f"Research topic: {topic}\n"
-                "For literature selection, matching the underlying research "
-                "background is sufficient; matching every experimental detail "
-                "is unnecessary.\n"
-                "Required papers for this review: 1."
-            ),
-            registry=registry,
-            terminal_tools={"submit_literature_review"},
-            tool_names_provider=available_tools,
-        )
+        try:
+            result = self.runtime("literature review").run(
+                system_prompt=literature_review_prompt(review_round=review_round),
+                user_prompt=(
+                    f"Research topic: {topic}\n"
+                    f"Screening round: {review_round}/2.\n"
+                    "For literature selection, matching the underlying research "
+                    "background is sufficient; matching every experimental detail "
+                    "is unnecessary.\n"
+                    "Required papers for this review: 1."
+                ),
+                registry=registry,
+                terminal_tools={"submit_literature_review"},
+                tool_names_provider=available_tools,
+            )
+        except RoundEnded:
+            return None
         return result.value
 
     def plan_feedback(self, topic, literature_review, postdoc_message):

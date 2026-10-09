@@ -88,14 +88,35 @@ LITERATURE_BACKGROUND_LIMITATIONS = (
 )
 
 
-def literature_review_prompt():
+LITERATURE_RETRY_RELEVANCE_RULE = (
+    "This is the second and final screening round. The first round ended without "
+    "selecting a reference, either after rejecting its candidates or after repeated "
+    "searches returned no new candidates. Revisit previously rejected papers with broader "
+    "background relevance rather than repeating the previous rejection criteria. "
+    "The goal is to select one useful background reference. Choose 'add' when "
+    "you can explain a concrete connection through the research object, task "
+    "family, problem setting, phenomenon, features, or transferable method. "
+    "The paper need not answer the exact research question or perform the same "
+    "experiment. Missing the requested comparison, a particular baseline, "
+    "or another requested ablation is a limitation, not sufficient grounds for "
+    "rejection. Explain the background connection and distinguish it from direct "
+    "evidence about this experiment's outcome. Choose 'reject' only when no "
+    "defensible background connection exists; do not invent relevance from a "
+    "generic field or shared keyword alone."
+)
+
+
+def literature_review_prompt(review_round=1):
+    relevance_rule = (
+        LITERATURE_RETRY_RELEVANCE_RULE if review_round == 2 else LITERATURE_RELEVANCE_RULE
+    )
     return (
         "You are a PhD student writing a literature review. "
         "Add exactly 1 relevant paper, then submit_literature_review.\n\n"
         "Use the topic's underlying task, problem setting, or phenomenon as the "
         "background scope. Experimental details are not mandatory paper-matching "
         "criteria.\n"
-        f"{LITERATURE_RELEVANCE_RULE}\n"
+        f"{relevance_rule}\n"
         f"{LITERATURE_BACKGROUND_LIMITATIONS}\n\n"
         "Base relevance and claims on the provided text. Identify the shared "
         "background, transferable method, or direct evidence before stating "
@@ -107,7 +128,8 @@ def literature_review_prompt():
         "Follow search_arxiv, read_arxiv_paper, then decide_paper for the currently "
         "read arXiv ID, using exactly one tool call per response. Read only a "
         "candidate from the latest search. After rejection, search again on the "
-        "next turn; do not reread rejected papers. After adding one paper, submit "
+        "next turn; do not reread rejected papers within the same screening round. "
+        "A new screening round resets earlier rejections. After adding one paper, submit "
         "without further searches."
     )
 

@@ -136,6 +136,11 @@ class ArxivSearch:
             return_details=True,
         )
 
+    def remaining_candidate_count(self, excluded_ids=None) -> int:
+        """Count eligible local papers independently of search keyword matches."""
+        excluded_ids = {str(item) for item in (excluded_ids or [])}
+        return len(self.replay.arxiv_candidates - excluded_ids)
+
     @traced_call("tool", "arxiv.full_text")
     def retrieve_full_paper_text(self, query, MAX_LEN=50000):
         text = self.replay.replay_arxiv_full_text(query, MAX_LEN)

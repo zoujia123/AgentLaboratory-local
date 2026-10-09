@@ -218,6 +218,27 @@ class LocalReplayTest(unittest.TestCase):
         self.assertIn("Second Paper", result["text"])
         self.assertEqual(session.events[-1]["match_kind"], "local_bm25")
 
+    def test_remaining_arxiv_candidates_do_not_depend_on_search_matches(self):
+        session = self.make_session()
+        with local_replay_scope(session):
+            search = ArxivSearch()
+            self.assertEqual(search.remaining_candidate_count(), 3)
+            self.assertEqual(search.find_papers("unmatchedkeyword")["candidate_ids"], [])
+            self.assertEqual(search.remaining_candidate_count(), 3)
+            self.assertEqual(search.find_papers("first")["candidate_ids"], ["1111.00001v1"])
+            self.assertEqual(search.remaining_candidate_count(), 3)
+
+    def test_remaining_arxiv_candidates_only_subtract_known_exclusions(self):
+        session = self.make_session()
+        with local_replay_scope(session):
+            search = ArxivSearch()
+            self.assertEqual(
+                search.remaining_candidate_count(["1111.00001v1", "1111.00001v1", "unknown"]),
+                2,
+            )
+            self.assertEqual(search.remaining_candidate_count(session.arxiv_candidates), 0)
+            self.assertEqual(search.remaining_candidate_count(["unknown"]), 3)
+
     def test_arxiv_search_uses_deterministic_synthetic_latency_when_exhausted(self):
         session = self.make_session()
         with local_replay_scope(session):
@@ -280,8 +301,12 @@ class LocalReplayTest(unittest.TestCase):
         session = self.make_session()
         self.assertNotIn("3333.00003v1", session.arxiv_candidates)
         with local_replay_scope(session):
+            search = ArxivSearch()
+            self.assertEqual(search.remaining_candidate_count(session.arxiv_candidates), 0)
+            self.assertEqual(search.remaining_candidate_count(), 2)
+            self.assertEqual(search.find_papers("quantum")["candidate_ids"], [])
             with self.assertRaisesRegex(LocalReplayMismatch, "was excluded"):
-                ArxivSearch().retrieve_full_paper_text("3333.00003v1")
+                search.retrieve_full_paper_text("3333.00003v1")
 
     def test_hf_search_replays_recorded_candidates(self):
         session = self.make_session()
