@@ -13,7 +13,12 @@ from agents import (
 )
 from data_preparation import _run_preparation_code
 from execution_diagnostics import runtime_data_repair_hint
-from prompts import ml_dataset_selection_prompt, sw_data_preparation_prompt
+from prompts import (
+    LITERATURE_BACKGROUND_LIMITATIONS,
+    LITERATURE_RELEVANCE_RULE,
+    ml_dataset_selection_prompt,
+    sw_data_preparation_prompt,
+)
 from tools import ArxivSearch
 
 with patch("dotenv.load_dotenv"):
@@ -1286,22 +1291,22 @@ class AgentPromptTest(unittest.TestCase):
 
         prompt = run.call_args.kwargs["system_prompt"]
         self.assertIn("exactly 1 relevant paper", prompt)
-        self.assertIn("read before rejecting", prompt)
-        self.assertIn("decide_paper", prompt)
+        self.assertIn("search_arxiv, read_arxiv_paper, then decide_paper", prompt)
         self.assertNotIn("add_paper", prompt)
         self.assertNotIn("reject_paper", prompt)
         self.assertIn("submit without further searches", prompt)
-        self.assertIn("meaningful methodological background", prompt)
-        self.assertIn("dataset identity is not a requirement", prompt)
-        self.assertIn("Do not reject it solely because these details differ", prompt)
-        self.assertIn("prefer adding it as methodological background", prompt)
-        self.assertIn("Reserve rejection for papers with no meaningful connection", prompt)
-        self.assertIn("Reading a paper does not imply acceptance", prompt)
-        self.assertIn("Never add a paper merely to satisfy the required paper count", prompt)
-        self.assertIn("return exactly one tool call total", prompt)
-        self.assertIn("currently read arXiv ID only", prompt)
+        self.assertIn(LITERATURE_RELEVANCE_RULE, prompt)
+        self.assertIn(LITERATURE_BACKGROUND_LIMITATIONS, prompt)
+        self.assertIn("Shared research background alone is sufficient", prompt)
+        self.assertIn("no additional methodological contribution is required", prompt)
+        self.assertIn("Choose 'reject' only if none applies", prompt)
+        self.assertIn("Base relevance and claims on the provided text", prompt)
+        self.assertIn("exactly one tool call per response", prompt)
+        self.assertIn("currently read arXiv ID", prompt)
+        self.assertIn("candidate from the latest search", prompt)
+        self.assertIn("do not reread rejected papers", prompt)
         self.assertNotIn("including rejected ones", prompt)
-        self.assertIn("Use only the tools shown for this turn", prompt)
+        self.assertIn("Use only this query's local candidates and the tools shown for this turn", prompt)
         self.assertNotIn("report_no_local_paper", prompt)
 
         registry = run.call_args.kwargs["registry"]
@@ -1338,10 +1343,18 @@ class AgentPromptTest(unittest.TestCase):
         self.assertNotIn("reject_arxiv_candidates", registry.names)
         self.assertNotIn("add_paper", registry.names)
         self.assertNotIn("reject_paper", registry.names)
+        self.assertIn(LITERATURE_RELEVANCE_RULE, schemas["decide_paper"]["description"])
+        self.assertIn(LITERATURE_BACKGROUND_LIMITATIONS, schemas["decide_paper"]["description"])
+        self.assertNotIn("concrete contribution", schemas["decide_paper"]["description"])
         decision_schema = schemas["decide_paper"]["parameters"]
         self.assertEqual(set(decision_schema["properties"]), {"arxiv_id", "decision", "explanation"})
         self.assertEqual(set(decision_schema["required"]), {"arxiv_id", "decision", "explanation"})
         self.assertEqual(decision_schema["properties"]["decision"]["enum"], ["add", "reject"])
+        explanation = decision_schema["properties"]["explanation"]["description"]
+        self.assertIn("shared research background, transferable method, or direct evidence", explanation)
+        self.assertIn("Background relevance does not require evidence for this experiment's outcome", explanation)
+        self.assertIn("none of the three relevance conditions applies", explanation)
+        self.assertNotIn("concrete contribution", explanation)
         premature = registry.execute("submit_literature_review", {"review": "review"})
         self.assertFalse(premature["success"])
         registry.execute("search_arxiv", {"query": "short"})
@@ -1360,6 +1373,7 @@ class AgentPromptTest(unittest.TestCase):
             {"arxiv_id": "1234.5678"},
         )
         self.assertTrue(read["decision_required"])
+        self.assertIn(LITERATURE_RELEVANCE_RULE, read["next_action_hint"])
         self.assertEqual(
             tool_names_provider(),
             {"decide_paper"},
@@ -1674,7 +1688,7 @@ class AgentPromptTest(unittest.TestCase):
         agent = PostdocAgent("model", "key")
         completed = SimpleNamespace(value={"message": "question"})
         with patch.object(
-            AgentRuntime, "run_one", return_value=completed
+            AgentRuntime, "run", return_value=completed
         ) as run:
             agent.plan_turn("topic", "literature", "")
 
@@ -1701,6 +1715,7 @@ class AgentPromptTest(unittest.TestCase):
         self.assertIn("do not open another consultation solely to confirm", prompt)
         self.assertIn("Do not ask the PhDStudentAgent to confirm field names", prompt)
         self.assertIn("consultation_required", user_prompt)
+        self.assertEqual(run.call_args.kwargs["tool_names_provider"](), {"send_dialogue"})
 
         registry = run.call_args.kwargs["registry"]
         schemas = {item["function"]["name"]: item["function"] for item in registry.schemas}
@@ -1715,12 +1730,6 @@ class AgentPromptTest(unittest.TestCase):
         self.assertFalse(
             registry.execute(
                 "submit_plan",
-                {"plan": "full plan", "data_requirements": " "},
-            )["success"]
-        )
-        self.assertTrue(
-            registry.execute(
-                "submit_plan",
                 {"plan": "full plan", "data_requirements": "abstract requirements"},
             )["success"]
         )
@@ -1729,10 +1738,95 @@ class AgentPromptTest(unittest.TestCase):
         agent = PostdocAgent("model", "key")
         completed = SimpleNamespace(value={"plan": "plan"})
         with patch.object(
-            AgentRuntime, "run_one", return_value=completed
+            AgentRuntime, "run", return_value=completed
         ) as run:
             agent.plan_turn("topic", "literature", "PhD feedback")
         self.assertIn("feedback_received", run.call_args.kwargs["user_prompt"])
+        self.assertEqual(
+            run.call_args.kwargs["tool_names_provider"](),
+            {"send_dialogue", "submit_plan"},
+        )
+        registry = run.call_args.kwargs["registry"]
+        self.assertFalse(registry.execute(
+            "submit_plan", {"plan": "full plan", "data_requirements": " "},
+        )["success"])
+        self.assertTrue(registry.execute(
+            "submit_plan", {"plan": "full plan", "data_requirements": "abstract requirements"},
+        )["success"])
+
+    def test_postdoc_plan_does_not_unlock_submission_without_nonempty_phd_feedback(self):
+        for dialogue in ("", " \n\t ", None, True):
+            with self.subTest(dialogue=dialogue), patch.object(AgentRuntime, "run") as run:
+                PostdocAgent("model", "key").plan_turn("topic", "literature", dialogue)
+
+                kwargs = run.call_args.kwargs
+                registry = kwargs["registry"]
+                self.assertIn("consultation_required", kwargs["user_prompt"])
+                self.assertIn("Latest PhD feedback: None", kwargs["user_prompt"])
+                self.assertEqual(kwargs["tool_names_provider"](), {"send_dialogue"})
+                registry.execute("send_dialogue", {"message": "Please review the plan"})
+                rejected = registry.execute("submit_plan", {
+                    "plan": "full plan", "data_requirements": "abstract requirements",
+                })
+                self.assertFalse(rejected["success"])
+                self.assertIn("PhD feedback", rejected["error"])
+                self.assertEqual(kwargs["tool_names_provider"](), {"send_dialogue"})
+
+    def test_postdoc_plan_runtime_waits_for_phd_feedback_before_submission(self):
+        from agent_runtime import ToolRegistry
+        from inference import ModelToolCall, ToolModelResponse
+
+        plan = {"plan": "reviewed plan", "data_requirements": "abstract requirements"}
+        feedback = "Keep the classifier and evaluation split fixed."
+
+        def tool_call(call_id, name, arguments):
+            return ModelToolCall(call_id, name, json.dumps(arguments))
+
+        responses = [
+            ToolModelResponse("", [tool_call("premature", "submit_plan", plan)]),
+            ToolModelResponse("", [
+                tool_call("mixed_dialogue", "send_dialogue", {"message": "Premature consultation"}),
+                tool_call("mixed_submit", "submit_plan", plan),
+            ]),
+            ToolModelResponse("", [tool_call(
+                "consult", "send_dialogue", {"message": "Please review this plan"},
+            )]),
+            ToolModelResponse("", [tool_call(
+                "feedback", "send_dialogue", {"message": feedback},
+            )]),
+            ToolModelResponse("", [tool_call("submit", "submit_plan", plan)]),
+        ]
+        executed_tools = []
+        original_execute = ToolRegistry.execute
+
+        def execute(registry, name, arguments):
+            executed_tools.append(name)
+            return original_execute(registry, name, arguments)
+
+        with patch(
+            "agent_runtime.query_model_with_tools", side_effect=responses,
+        ) as query, patch.object(ToolRegistry, "execute", new=execute):
+            postdoc = PostdocAgent("model", "key")
+            consultation = postdoc.plan_turn("topic", "literature", "")
+            self.assertEqual(consultation.tool_name, "send_dialogue")
+            self.assertEqual(executed_tools, ["send_dialogue"])
+            actual_feedback = PhDStudentAgent("model", "key").plan_feedback(
+                "topic", "literature", consultation.value["message"],
+            )
+            result = postdoc.plan_turn("topic", "literature", actual_feedback)
+
+        self.assertEqual(result.tool_name, "submit_plan")
+        self.assertEqual(result.value, {"success": True, **plan})
+        self.assertEqual(executed_tools, ["send_dialogue", "send_dialogue", "submit_plan"])
+        exposed_tools = [
+            {tool["function"]["name"] for tool in invocation.kwargs["tools"]}
+            for invocation in query.call_args_list
+        ]
+        self.assertEqual(exposed_tools, [
+            {"send_dialogue"}, {"send_dialogue"}, {"send_dialogue"},
+            {"send_dialogue"}, {"send_dialogue", "submit_plan"},
+        ])
+        self.assertIn(feedback, query.call_args_list[-1].kwargs["messages"][1]["content"])
 
     def test_phd_plan_feedback_restores_research_planning_role(self):
         agent = PhDStudentAgent("model", "key")

@@ -707,7 +707,14 @@ _RUNTIME_DATA_REPAIR_HINTS = {
         "successful model forward pass before full training. This replacement "
         "must preserve the classifier, split, and augmentation comparison."
     ),
-    "seed_policy": "Use the exact symbolic fixed seed required by the seed policy.",
+    "seed_policy": (
+        "Use the exact symbolic fixed seed required by the seed policy. Prefer "
+        "explicit keywords at the call: random_state=SKLEARN_SEED for sklearn, "
+        "seed=SKLEARN_SEED for datasets.Dataset.train_test_split, and "
+        "seed=NUMPY_SEED for np.random.default_rng. If **kwargs cannot be "
+        "verified, move the seed out of the parameter dictionary and pass it "
+        "explicitly in the same edit; do not remove the seed or pass it twice."
+    ),
     "pandas_positional_indexing_error": (
         "Use the traceback to identify the failing pandas object and indexer. "
         ".iloc selects zero-based positions within that object's current length; "

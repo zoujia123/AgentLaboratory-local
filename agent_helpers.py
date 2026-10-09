@@ -162,6 +162,8 @@ def _latest_experiment_failure_messages(
             "error_type": action_rejection.get("error_type"),
             "error": action_rejection.get("error"),
             "repair_hint": action_rejection.get("repair_hint"),
+            "identical_failed_call_count": action_rejection.get("identical_failed_call_count"),
+            "full_replacement_required": action_rejection.get("full_replacement_required"),
             "original_error_type": action_rejection.get("original_error_type"),
             "original_error": action_rejection.get("original_error"),
             "original_failure_category": action_rejection.get(

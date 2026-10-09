@@ -674,7 +674,7 @@ class AgentRuntime:
                 },
             )
 
-    def run(self,system_prompt,user_prompt,registry,terminal_tools,tool_names_provider=None,return_after_tool=False,failure_history_compactor=None,):
+    def run(self,system_prompt,user_prompt,registry,terminal_tools,tool_names_provider=None,return_after_tool=False,failure_history_compactor=None,stop_on_repeated_failure=True,):
         # Alternating collaborators hand back each tool result, including failures.
         # Other agents retain the default loop-until-success behavior.
 
@@ -804,6 +804,20 @@ class AgentRuntime:
             )
 
             tool_failed = isinstance(value, dict) and value.get("success") is False # 只有返回字典且明确包含 "success": False 才算失败
+            # Compute the unchanged signature before adding recovery feedback.
+            if tool_failed:
+                failed_signature = self._failed_call_signature(tool_call.name, arguments, value)
+                if failed_signature == last_failed_call_signature:
+                    identical_failed_call_count += 1
+                else:
+                    last_failed_call_signature = failed_signature
+                    identical_failed_call_count = 1
+                if not stop_on_repeated_failure:
+                    value = {**value, "identical_failed_call_count": identical_failed_call_count}
+            else:
+                last_failed_call_signature = None
+                identical_failed_call_count = 0
+
             if tool_failed:
                 compacted = self._compact_failed_arguments(arguments)   # 失败时检查参数是否过长。超过 2000 个序列化字符时，会把大段代码、列表等替换成摘要和哈希。避免失败的大参数在后续对话里重复占用上下文。
                 if compacted is not None:
@@ -825,24 +839,19 @@ class AgentRuntime:
                 step,
             )
 
-            # 如果连续发生完全相同的失败，就累加次数；否则重新计数
-            if tool_failed:
-                failed_signature = self._failed_call_signature(tool_call.name,arguments,value,)
-                if failed_signature == last_failed_call_signature:
-                    identical_failed_call_count += 1
-                else:
-                    last_failed_call_signature = failed_signature
-                    identical_failed_call_count = 1
-                if identical_failed_call_count >= MAX_IDENTICAL_FAILED_TOOL_CALLS:
+            if tool_failed and identical_failed_call_count >= MAX_IDENTICAL_FAILED_TOOL_CALLS:
+                if stop_on_repeated_failure:
                     logger.error(f"[{self.agent_name}][{self.phase}][step={step}] FAILED identical failed tool-call limit tool={tool_call.name} count={identical_failed_call_count} signature={failed_signature[:12]}")
                     raise ToolProtocolError(
                         f"{self.agent_name} repeated the same failed tool call "
                         f"{tool_call.name!r} {identical_failed_call_count} times "
                         f"(signature={failed_signature[:12]})"
                     )
-            else:
-                last_failed_call_signature = None
-                identical_failed_call_count = 0
+                logger.info(
+                    f"[{self.agent_name}][{self.phase}][step={step}] "
+                    f"CONTINUE repeated failed tool call tool={tool_call.name} "
+                    f"count={identical_failed_call_count} signature={failed_signature[:12]}"
+                )
             # 检查工具调用是否成功
             terminal_success = not (
                 isinstance(value, dict) and value.get("success") is False

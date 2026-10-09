@@ -16,10 +16,12 @@ from agent_helpers import (
     _stale_diagnostic_marker,
     _string,
 )
-from agent_runtime import AgentRuntime, ToolRegistry
+from agent_runtime import AgentRuntime, MAX_IDENTICAL_FAILED_TOOL_CALLS, ToolRegistry
 from data_preparation import _run_preparation_code
 from execution_diagnostics import python_syntax_error
 from prompts import (
+    LITERATURE_BACKGROUND_LIMITATIONS,
+    LITERATURE_RELEVANCE_RULE,
     experiment_solver_prompt,
     literature_review_prompt,
     ml_dataset_selection_prompt,
@@ -122,9 +124,8 @@ class PhDStudentAgent(BaseResearchAgent):
                 "full_text": full_text,
                 "decision_required": True,
                 "next_action_hint": (
-                    "Call decide_paper exactly once for this arXiv ID. Choose "
-                    "decision 'add' for useful direct or methodological relevance, "
-                    "or 'reject' when neither applies, and provide an explanation."
+                    "Call decide_paper exactly once for this arXiv ID. "
+                    f"{LITERATURE_RELEVANCE_RULE}"
                 ),
             }
 
@@ -238,7 +239,10 @@ class PhDStudentAgent(BaseResearchAgent):
             ),
             _object_schema(
                 {
-                    "query": _string("Write a short English query for papers relevant to the research topic."),
+                    "query": _string(
+                        "Write a short English query about the underlying research "
+                        "task or relevant methods; avoid requiring every experimental detail."
+                    ),
                 },
                 ["query"],
             ),
@@ -259,18 +263,8 @@ class PhDStudentAgent(BaseResearchAgent):
             "decide_paper",
             (
                 "Make exactly one decision for the paper just read. "
-                "Choose 'add' for either direct evidence OR useful methodological "
-                "or conceptual background. Background relevance is sufficient "
-                "when you can identify a concrete contribution to the current "
-                "study's hypothesis, feature or model choice, experimental design, "
-                "evaluation, or interpretation. "
-                "The paper need not answer the entire research question or use "
-                "the same dataset, model, settings, or exact comparison. "
-                "Missing the exact ablation or baseline comparison is not by "
-                "itself a reason to reject. "
-                "Shared keywords or a broad topic alone are insufficient. "
-                "Choose 'reject' only when no substantive direct or background "
-                "connection can be identified. "
+                f"{LITERATURE_RELEVANCE_RULE} "
+                f"{LITERATURE_BACKGROUND_LIMITATIONS} "
                 "Do not infer that the paper lacks a method or analysis merely "
                 "because it is absent from a truncated excerpt."
             ),
@@ -283,11 +277,12 @@ class PhDStudentAgent(BaseResearchAgent):
                         "description": "Choose exactly one: add the paper or reject it.",
                     },
                     "explanation": _string(
-                        "For add, identify the concrete contribution to this study, "
-                        "summarize the supporting findings, and state limitations. "
-                        "For reject, explain why neither direct evidence nor useful "
-                        "background applies; dataset or setting differences alone "
-                        "are insufficient."
+                        "For add, first identify the shared research background, "
+                        "transferable method, or direct evidence, then summarize "
+                        "supported findings and limitations. Background relevance "
+                        "does not require evidence for this experiment's outcome. "
+                        "For reject, explain why none of the three relevance "
+                        "conditions applies."
                     ),
                 },
                 ["arxiv_id", "decision", "explanation"],
@@ -309,6 +304,9 @@ class PhDStudentAgent(BaseResearchAgent):
             system_prompt=literature_review_prompt(),
             user_prompt=(
                 f"Research topic: {topic}\n"
+                "For literature selection, matching the underlying research "
+                "background is sufficient; matching every experimental detail "
+                "is unnecessary.\n"
                 "Required papers for this review: 1."
             ),
             registry=registry,
@@ -384,7 +382,14 @@ class PostdocAgent(BaseResearchAgent):
     role = "computer science postdoctoral researcher"
 
     def plan_turn(self, topic, literature_review, dialogue):
+        feedback_received = isinstance(dialogue, str) and bool(dialogue.strip())
+
         def submit_plan(plan, data_requirements):
+            if not feedback_received:
+                return {
+                    "success": False,
+                    "error": "Receive PhD feedback before submitting the plan",
+                }
             if not str(plan).strip() or not str(data_requirements).strip():
                 return {
                     "success": False,
@@ -395,6 +400,11 @@ class PostdocAgent(BaseResearchAgent):
                 "plan": plan,
                 "data_requirements": data_requirements,
             }
+
+        def available_tools():
+            if not feedback_received:
+                return {"send_dialogue"}
+            return {"send_dialogue", "submit_plan"}
 
         registry = ToolRegistry().register(
             "send_dialogue",
@@ -426,15 +436,17 @@ class PostdocAgent(BaseResearchAgent):
             ),
             submit_plan,
         )
-        return self.runtime("plan formulation").run_one(
+        return self.runtime("plan formulation").run(
             system_prompt=postdoc_plan_prompt(),
             user_prompt=(
                 f"Topic: {topic}\nLiterature review: {literature_review}\n"
                 f"Planning consultation status: "
-                f"{'feedback_received' if dialogue else 'consultation_required'}\n"
-                f"Latest PhD feedback: {dialogue or 'None'}"
+                f"{'feedback_received' if feedback_received else 'consultation_required'}\n"
+                f"Latest PhD feedback: {dialogue if feedback_received else 'None'}"
             ),
             registry=registry,
+            terminal_tools=registry.names,
+            tool_names_provider=available_tools,
         )
 
     def interpretation_turn(self,topic,plan,code,output,dialogue,literature_review="",supplementary_experiments=None,interpretation_history=None,phd_review_required=None,supplement_required=None,force_submit=False,workflow_notice="",):
@@ -795,9 +807,14 @@ class SWEngineerAgent(BaseResearchAgent):
     ):
         registry = ToolRegistry().register(
             "send_dialogue",
-            "Send MLEngineerAgent your data requirements analysis or a specific code-fix instruction.",
+            "Send MLEngineerAgent requirements analysis or specific repair recommendations "
+            "for it to apply. This tool only sends advice; it does not modify or execute code.",
             _object_schema({"message": _string(
-                "Your analysis and next requested action. For a failure, identify the failing code and the fix."
+                "Address the ML engineer with advice and its next action; do not promise "
+                "to fix the program yourself. For syntax errors, include the location, "
+                "exact original snippet, suggested replacement, and reason. Ask the ML "
+                "engineer to apply the recommendation and submit its complete program "
+                "for validation and execution."
             )}, ["message"]),
             lambda message: {"success": True, "message": message},
         )
@@ -863,8 +880,10 @@ class MLESolverAgent(BaseResearchAgent):
                         "This exact experiment code previously failed and was not executed again."
                     ),
                     "repair_hint": (
-                        "Do not submit this code hash again. Apply atomic edits or "
-                        "write a materially different replacement that resolves the "
+                        "Do not submit this code hash again. For a one-fragment fix, use "
+                        "one edit_experiment_code call with exactly one replacement item. "
+                        "For changes to separate fragments, use write_experiment_code "
+                        "with a materially different complete program that resolves the "
                         f"original failure: {original_error}"
                     ),
                     "original_error_type": original_failure.get("error_type"),
@@ -917,9 +936,9 @@ class MLESolverAgent(BaseResearchAgent):
             if not current["code"]: # 如果目前还没有代码，就无法修改，直接返回失败。
                 return {"success": False, "error": "Create experiment code first"}
             if not isinstance(edits, list) or not edits:    # edits 必须是列表。列表不能为空。列表不能为空。列表不能为空。edit：当前修改字典，例如 {"old_text": "...", "new_text": "..."}。
-                return {"success": False,"error": "edits must contain at least one edit object",}
+                return {"success": False,"error": "Submit exactly one replacement object in edits.",}
             if len(edits) > 6:  # 限制一次最多提交 6 处修改。
-                return {"success": False,"error": "edits may contain at most 6 changes",}
+                return {"success": False,"error": "Too many replacement items. Submit exactly one item in edits, or use write_experiment_code for changes to separate fragments.",}
 
             source = current["code"]    # 把当前代码取出来，保存为 source。这一批修改都以这份原代码为匹配依据。
             seen_old_text = set()    # 建立集合，记录本批次已经出现过哪些 old_text，用于检查重复。
@@ -935,7 +954,7 @@ class MLESolverAgent(BaseResearchAgent):
                 if not old_text:    # 旧片段不能为空，否则无法明确定位修改位置。
                     return {"success": False,"error": f"edit {index} old_text must not be empty",}
                 if old_text in seen_old_text:   # 如果本批次已经处理过相同的旧片段，就拒绝重复修改。
-                    return {"success": False,"error": "Each edit old_text must be unique within one batch",}
+                    return {"success": False,"error": "Repeated old_text fragments. Submit exactly one replacement item, or use write_experiment_code for a complete replacement.",}
                 seen_old_text.add(old_text)
 
                 occurrences = source.count(old_text)    # 统计旧片段在原代码中的匹配次数。
@@ -949,7 +968,7 @@ class MLESolverAgent(BaseResearchAgent):
             planned_edits.sort(key=lambda item: item[0])    # 按照每处修改的起始位置排序。
             for previous, following in zip(planned_edits, planned_edits[1:]):
                 if following[0] < previous[1]:    # 如果后续修改的起始位置在前一个修改的结束位置之前，说明重叠，就拒绝修改。
-                    return {"success": False,"error": "Batch edits overlap in the current experiment code",}
+                    return {"success": False,"error": "Replacement ranges overlap. Submit exactly one replacement item, or use write_experiment_code for a complete replacement.",}
 
             edited = source
             for start, end, new_text in reversed(planned_edits):    # 按位置从后往前处理修改。
@@ -970,8 +989,8 @@ class MLESolverAgent(BaseResearchAgent):
             return {
                 "success": True,
                 "message": (
-                    f"Applied {len(planned_edits)} experiment edits atomically; "
-                    "Call execute_experiment_code to run the saved draft."
+                    "Updated experiment code saved. "
+                    "Call execute_experiment_code in the next response to run the saved draft."
                 ),
                 "code_hash": fingerprint,
                 "edit_count": len(planned_edits),
@@ -985,15 +1004,13 @@ class MLESolverAgent(BaseResearchAgent):
             return {"success": True,"code": current["code"],"output": current["output"],}
 
         def available_tools():
-            if not current["code"]:
+            if not current["code"] or current["force_replace"]:
                 return {"write_experiment_code"}
             if current["success"] is True:
                 return {"submit_experiment"}
             if current["success"] is False:
                 if current["last_failure_category"] == "execution_infrastructure_error":    # 当前 _process_execution_result() 遇到子进程异常退出、结果传输失败等被归为基础设施故障的情况，不会把代码加入失败集合，以便允许重试。
                     return {"execute_experiment_code", "edit_experiment_code", "write_experiment_code"}
-                if current["force_replace"]:
-                    return {"write_experiment_code"}
                 return {"edit_experiment_code", "write_experiment_code"}
             return {"execute_experiment_code"}
 
@@ -1001,13 +1018,25 @@ class MLESolverAgent(BaseResearchAgent):
         registry.register(
             "write_experiment_code",
             (
-                "Save the full experiment program from code, replacing the current draft. "
-                "Call execute_experiment_code next, then submit_experiment after successful execution."
+                "Create a complete experiment program, or repair and replace the failed draft. "
+                "If a previous version failed, first diagnose the latest error and modify the "
+                "affected logic, then submit the complete program with those fixes already applied. "
+                "Do not resubmit unchanged failed code, make cosmetic-only changes that leave "
+                "the error unresolved, or submit "
+                "the old program intending to repair it with a later edit call. Preserve correct "
+                "code and the planned experiment design. This tool checks syntax and saves "
+                "an accepted draft; it does not repair or execute it for you. After it succeeds, "
+                "call execute_experiment_code in the next response, then submit_experiment "
+                "after successful execution."
             ),
             _object_schema(
                 {"code": _string(
-                    "Complete experiment-only Python source with imports. Reuse prepared data variables; "
-                    "do not repeat data-preparation code. No Markdown fences."
+                    "Complete experiment-only Python source with imports. If repairing a failure, "
+                    "include substantive changes that address the latest execution or validation "
+                    "error, already integrated into this program. Do not copy the failed draft "
+                    "unchanged or provide a patch, placeholder, or promise of a later fix. "
+                    "Preserve correct code and the planned experiment design. Reuse prepared "
+                    "data variables; do not repeat data-preparation code. No Markdown fences."
                 )},
                 ["code"],
             ),
@@ -1015,14 +1044,16 @@ class MLESolverAgent(BaseResearchAgent):
         ).register(
             "edit_experiment_code",
             (
-                "Provide 1 exact replacements in edits. The tool applies all edits "
-                "or none. Call execute_experiment_code to run the updated experiment."
+                "Replace one exact, unique fragment in the saved experiment. Call this "
+                "tool only once per response, with exactly one item in edits. For changes "
+                "to separate fragments, use write_experiment_code instead. After this tool "
+                "succeeds, call execute_experiment_code in the next response."
             ),
             _object_schema(
                 {
                     "edits": {
                         "type": "array",
-                        "description": "All changes to the current experiment code in one call. The matched fragments must not overlap.",
+                        "description": "Exactly one replacement object for one contiguous fragment of the current experiment code.",
                         "minItems": 1,
                         "maxItems": 1,
                         "items": {
@@ -1082,13 +1113,34 @@ class MLESolverAgent(BaseResearchAgent):
             # diagnostic：最近一次程序运行为什么失败。
             # value：刚才这次工具调用返回了什么。
             del arguments
-            if not current.get("code") or tool_call.name not in {
+            if tool_call.name not in {
                 "execute_experiment_code", "write_experiment_code", "edit_experiment_code",
             }:
                 return None
+            repeated_count = value.get("identical_failed_call_count", 0)
+            if repeated_count >= MAX_IDENTICAL_FAILED_TOOL_CALLS:
+                current["force_replace"] = True
             diagnostic = current.get("latest_execution_failure")    # 获取最近一次真实执行失败的诊断。
+            if current["force_replace"]:
+                value = {
+                    **value,
+                    "full_replacement_required": True,
+                    "repair_hint": (
+                        "Only write_experiment_code is available. Submit a new, "
+                        "materially different complete program that fixes the original "
+                        "failure; do not resubmit the current or any previously failed "
+                        "code version. " + (value.get("original_repair_hint")
+                                           or value.get("repair_hint") or "")
+                    ),
+                }
+                # Keep cached execution diagnostics immutable; this is recovery state.
+                diagnostic = {
+                    **(diagnostic or {}), "full_replacement_required": True,
+                    "next_action_hint": value["repair_hint"],
+                }
             if not diagnostic:
                 return None
+            diagnostic = {**diagnostic, "identical_failed_call_count": repeated_count}
             return _latest_experiment_failure_messages(
                 system_prompt,
                 user_prompt,
@@ -1106,6 +1158,7 @@ class MLESolverAgent(BaseResearchAgent):
             terminal_tools={"submit_experiment"},
             tool_names_provider=available_tools,
             failure_history_compactor=compact_experiment_failure,
+            stop_on_repeated_failure=False,
         )
         return result.value
 
@@ -1302,7 +1355,9 @@ class MLESolverAgent(BaseResearchAgent):
             "edit_supplement_code",
             (
                 "Provide one exact text replacement for the saved supplement. "
-                "The tool applies it. Call execute_supplement_code to run the updated supplement."
+                "Call this tool only once per response. For changes to separate fragments, "
+                "use write_supplement_code instead. After this tool succeeds, call "
+                "execute_supplement_code in the next response."
             ),
             _object_schema(
                 {

@@ -837,7 +837,7 @@ class MLESolverSolveTest(unittest.TestCase):
             schema["parameters"]["properties"]["edits"]["items"]["required"],
             ["old_text", "new_text"],
         )
-        self.assertEqual(schema["parameters"]["properties"]["edits"]["maxItems"], 6)
+        self.assertEqual(schema["parameters"]["properties"]["edits"]["maxItems"], 1)
         combined = execute_code.call_args.args[0]
         self.assertIn("alpha = 10", combined)
         self.assertIn("beta = 20", combined)
@@ -912,6 +912,159 @@ class MLESolverSolveTest(unittest.TestCase):
             self.assertEqual(submitted["code"], "fixed_code")
             self.assertEqual(submitted["output"], "experiment_output")
             self.assertEqual(execute_code.call_count, 2)
+
+
+class MLESolverRepeatedFailureTest(unittest.TestCase):
+    def run_scenario(self, actions, outputs):
+        import json
+        from inference import ModelToolCall, ToolModelResponse
+
+        state = SimpleNamespace(
+            topic="topic", plan="plan", dataset_selection={}, seeds={},
+            dataset_code="data = [1]", literature_review="review",
+        )
+        requests = []
+
+        def respond(**kwargs):
+            index = len(requests)
+            name, arguments = actions[index]
+            names = {tool["function"]["name"] for tool in kwargs["tools"]}
+            self.assertIn(name, names)
+            requests.append({
+                "tools": names,
+                "text": "\n".join(
+                    message.get("content") or "" for message in kwargs["messages"]
+                ),
+            })
+            return ToolModelResponse("", [ModelToolCall(
+                f"call-{index}", name, json.dumps(arguments),
+            )])
+
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "agent_runtime.query_model_with_tools", side_effect=respond,
+        ), patch("agents.execute_code", side_effect=outputs) as execute:
+            result = MLESolverAgent(
+                "model", "key", code_execution_timeout_seconds=123,
+            ).solve(state, folder)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(requests), len(actions))
+        self.assertEqual(execute.call_count, len(outputs))
+        return result, requests, execute
+
+    def test_noop_edits_force_replacement_and_repeated_old_writes_can_recover(self):
+        noop = {"edits": [{"old_text": "draft = 1", "new_text": "draft = 1"}]}
+        actions = [
+            ("write_experiment_code", {"code": "draft = 1"}),
+            ("execute_experiment_code", {}),
+        ] + [("edit_experiment_code", noop)] * 3 + [
+            ("write_experiment_code", {"code": "draft = 1"}),
+        ] * 4 + [
+            ("write_experiment_code", {"code": "fixed = 1"}),
+            ("execute_experiment_code", {}),
+            ("submit_experiment", {}),
+        ]
+
+        result, requests, execute = self.run_scenario(actions, [
+            execution_result("unclassified experiment failure", False, "python_exception"),
+            execution_result("final output"),
+        ])
+
+        self.assertEqual(result["code"], "fixed = 1")
+        self.assertEqual(execute.call_count, 2)
+        for index in range(2, 5):
+            self.assertEqual(requests[index]["tools"], {
+                "edit_experiment_code", "write_experiment_code",
+            })
+        for index in range(5, 10):
+            self.assertEqual(requests[index]["tools"], {"write_experiment_code"})
+            self.assertIn('"full_replacement_required": true', requests[index]["text"])
+            self.assertIn("unclassified experiment failure", requests[index]["text"])
+        self.assertIn('"identical_failed_call_count": 3', requests[5]["text"])
+        self.assertIn('"identical_failed_call_count": 4', requests[9]["text"])
+        self.assertEqual(requests[10]["tools"], {"execute_experiment_code"})
+        self.assertEqual(requests[11]["tools"], {"submit_experiment"})
+
+    def test_existing_category_replacement_requirement_survives_repeated_old_writes(self):
+        actions = [
+            ("write_experiment_code", {"code": "version = 1"}),
+            ("execute_experiment_code", {}),
+            ("write_experiment_code", {"code": "version = 2"}),
+            ("execute_experiment_code", {}),
+        ] + [("write_experiment_code", {"code": "version = 1"})] * 4 + [
+            ("write_experiment_code", {"code": "version = 3"}),
+            ("execute_experiment_code", {}),
+            ("submit_experiment", {}),
+        ]
+        failure = execution_result(
+            "Seed policy violations: LogisticRegression() is missing "
+            "random_state=SKLEARN_SEED", False, "python_exception",
+        )
+
+        result, requests, _ = self.run_scenario(actions, [
+            failure, failure, execution_result("final output"),
+        ])
+
+        self.assertEqual(result["code"], "version = 3")
+        for index in range(4, 9):
+            self.assertEqual(requests[index]["tools"], {"write_experiment_code"})
+            self.assertIn('"full_replacement_required": true', requests[index]["text"])
+            self.assertIn("SKLEARN_SEED", requests[index]["text"])
+        self.assertIn('"same_category_count": 2', requests[4]["text"])
+        self.assertIn('"identical_failed_call_count": 4', requests[8]["text"])
+        self.assertEqual(requests[9]["tools"], {"execute_experiment_code"})
+
+    def test_repeated_infrastructure_failure_requires_replacement_before_retry(self):
+        actions = [
+            ("write_experiment_code", {"code": "draft = 1"}),
+            ("execute_experiment_code", {}),
+            ("execute_experiment_code", {}),
+            ("execute_experiment_code", {}),
+            ("write_experiment_code", {"code": "fixed = 1"}),
+            ("execute_experiment_code", {}),
+            ("submit_experiment", {}),
+        ]
+        outputs = [execution_result("worker result missing", False, "missing_result")] * 3
+
+        _, requests, _ = self.run_scenario(
+            actions, outputs + [execution_result("final output")],
+        )
+
+        for index in (2, 3):
+            self.assertIn("execute_experiment_code", requests[index]["tools"])
+        self.assertEqual(requests[4]["tools"], {"write_experiment_code"})
+        self.assertIn('"full_replacement_required": true', requests[4]["text"])
+        self.assertIn('"identical_failed_call_count": 3', requests[4]["text"])
+        self.assertIn("execution_infrastructure_error", requests[4]["text"])
+        self.assertEqual(requests[5]["tools"], {"execute_experiment_code"})
+
+    def test_initial_repeated_syntax_errors_recover_and_new_write_resets_count(self):
+        actions = [("write_experiment_code", {"code": "value = ("})] * 4 + [
+            ("write_experiment_code", {"code": "draft = 1"}),
+            ("execute_experiment_code", {}),
+            ("write_experiment_code", {"code": "fixed = 1"}),
+            ("execute_experiment_code", {}),
+            ("submit_experiment", {}),
+        ]
+
+        _, requests, _ = self.run_scenario(actions, [
+            execution_result("unclassified experiment failure", False, "python_exception"),
+            execution_result("final output"),
+        ])
+
+        for index in (3, 4):
+            self.assertEqual(requests[index]["tools"], {"write_experiment_code"})
+            self.assertIn('"full_replacement_required": true', requests[index]["text"])
+            self.assertIn("syntax_error", requests[index]["text"])
+            self.assertRegex(requests[index]["text"].lower(), "new.*version|materially different")
+        self.assertIn('"identical_failed_call_count": 4', requests[4]["text"])
+        self.assertEqual(requests[5]["tools"], {"execute_experiment_code"})
+        self.assertEqual(requests[6]["tools"], {
+            "edit_experiment_code", "write_experiment_code",
+        })
+        self.assertIn('"identical_failed_call_count": 1', requests[6]["text"])
+        self.assertNotIn('"identical_failed_call_count": 4', requests[6]["text"])
+        self.assertIn('"full_replacement_required": false', requests[6]["text"])
 
 
 class MLESolverSupplementTest(unittest.TestCase):

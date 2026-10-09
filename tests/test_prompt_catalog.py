@@ -62,7 +62,7 @@ class PromptCatalogTest(unittest.TestCase):
         self.assertIn("list of records", prompt)
         self.assertIn("write_experiment_code's code argument", prompt)
         self.assertIn("edit_experiment_code", prompt)
-        self.assertIn("all changes in its edits array", prompt)
+        self.assertIn("exactly one replacement item in its edits array", prompt)
         self.assertIn("execute_experiment_code", prompt)
         self.assertIn("no arguments", prompt)
 

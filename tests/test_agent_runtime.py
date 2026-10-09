@@ -200,6 +200,33 @@ class AgentRuntimeTest(unittest.TestCase):
 
         self.assertEqual(query.call_count, 3)
 
+    def test_repeated_failures_can_continue_until_shared_http_budget(self):
+        work = MagicMock(return_value={
+            "success": False, "error": "source rejected", "code_hash": "same",
+        })
+        registry = ToolRegistry().register("work", "Work", schema(), work)
+        client = MagicMock()
+        client.chat.completions.create.return_value = completion("work")
+        counts = []
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
+
+        with llm_http_attempt_budget_scope(100) as budget, patch(
+            "inference.OpenAI", return_value=client,
+        ):
+            with self.assertRaisesRegex(LLMHTTPAttemptLimitError, "100/100 attempts used"):
+                runtime.run(
+                    "system", "user", registry, set(),
+                    stop_on_repeated_failure=False,
+                    failure_history_compactor=lambda **kwargs: counts.append(
+                        kwargs["value"]["identical_failed_call_count"]
+                    ),
+                )
+
+        self.assertEqual(counts, list(range(1, 101)))
+        self.assertEqual(work.call_count, 100)
+        self.assertEqual(client.chat.completions.create.call_count, 100)
+        self.assertTrue(budget.request_blocked)
+
     def test_changed_code_hash_counts_as_failed_tool_progress(self):
         code_hashes = iter(["version-1", "version-2", "version-3"])
         registry = ToolRegistry().register(
