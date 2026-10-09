@@ -135,19 +135,13 @@ class ToolRegistry:
 
 
 class AgentRuntime:
-    def __init__(self,model,api_key,agent_name,phase,max_tool_steps=8,max_tokens=8192,max_protocol_repairs=3,max_rounds=None,):
+    def __init__(self,model,api_key,agent_name,phase,*,max_tokens=8192,max_protocol_repairs=3,):
         self.model = model
         self.api_key = api_key
         self.agent_name = agent_name
         self.phase = phase
-        self.max_tool_steps = max(1, int(max_tool_steps))
         self.max_tokens = max(256, int(max_tokens))
         self.max_protocol_repairs = max(0, int(max_protocol_repairs))
-        default_max_rounds = self.max_tool_steps + self.max_protocol_repairs
-        self.max_rounds = max(
-            1,
-            int(default_max_rounds if max_rounds is None else max_rounds),
-        )
 
     # @staticmethod
     def _tool_output(self, value):
@@ -344,7 +338,6 @@ class AgentRuntime:
         response,
         active_tool_names,
         step,
-        round_index,
     ):
         logger = current_run_logger()
         recorder = current_prompt_recorder()
@@ -361,12 +354,11 @@ class AgentRuntime:
                 "Available tools: " + ", ".join(available_tools)
             ),
         })
-        logger.info(f"[{self.agent_name}][{self.phase}][round={round_index}][step={step}] PROTOCOL RECOVERY reason=no_tool_calls available_tools={available_tools} executed_tools=0")
+        logger.info(f"[{self.agent_name}][{self.phase}][step={step}] PROTOCOL RECOVERY reason=no_tool_calls available_tools={available_tools} executed_tools=0")
         recorder.record({
             "event": "tool_protocol_recovery",
             "agent": self.agent_name,
             "phase": self.phase,
-            "round": round_index,
             "step": step,
             "reason": "no_tool_calls",
             "available_tools": available_tools,
@@ -385,7 +377,6 @@ class AgentRuntime:
                 metadata={
                     "agent": self.agent_name,
                     "phase": self.phase,
-                    "round": round_index,
                     "available_tools": available_tools,
                     "executed_tools": [],
                 },
@@ -397,7 +388,6 @@ class AgentRuntime:
         response,
         active_tool_names,
         step,
-        round_index,
     ):
         logger = current_run_logger()
         recorder = current_prompt_recorder()
@@ -441,12 +431,11 @@ class AgentRuntime:
                     "retryable": True,
                 }),
             })
-        logger.info(f"[{self.agent_name}][{self.phase}][round={round_index}][step={step}] PROTOCOL RECOVERY reason=tool_not_available requested_tools={requested_tools} unavailable_tools={unavailable_tools} executed_tools=0")
+        logger.info(f"[{self.agent_name}][{self.phase}][step={step}] PROTOCOL RECOVERY reason=tool_not_available requested_tools={requested_tools} unavailable_tools={unavailable_tools} executed_tools=0")
         recorder.record({
             "event": "tool_protocol_recovery",
             "agent": self.agent_name,
             "phase": self.phase,
-            "round": round_index,
             "step": step,
             "reason": "tool_not_available",
             "requested_tools": requested_tools,
@@ -468,7 +457,6 @@ class AgentRuntime:
                 metadata={
                     "agent": self.agent_name,
                     "phase": self.phase,
-                    "round": round_index,
                     "requested_tools": requested_tools,
                     "unavailable_tools": unavailable_tools,
                     "available_tools": available_tools,
@@ -482,7 +470,6 @@ class AgentRuntime:
         response,
         invalid_json_by_call_id,
         step,
-        round_index,
     ):
         logger = current_run_logger()
         recorder = current_prompt_recorder()
@@ -513,12 +500,11 @@ class AgentRuntime:
                     "retryable": True,
                 }),
             })
-        logger.info(f"[{self.agent_name}][{self.phase}][round={round_index}][step={step}] PROTOCOL RECOVERY reason=invalid_json_arguments requested_tools={requested_tools} executed_tools=0")
+        logger.info(f"[{self.agent_name}][{self.phase}][step={step}] PROTOCOL RECOVERY reason=invalid_json_arguments requested_tools={requested_tools} executed_tools=0")
         recorder.record({
             "event": "tool_protocol_recovery",
             "agent": self.agent_name,
             "phase": self.phase,
-            "round": round_index,
             "step": step,
             "reason": "invalid_json_arguments",
             "requested_tools": requested_tools,
@@ -539,7 +525,6 @@ class AgentRuntime:
                 metadata={
                     "agent": self.agent_name,
                     "phase": self.phase,
-                    "round": round_index,
                     "requested_tools": requested_tools,
                     "invalid_json_by_call_id": dict(invalid_json_by_call_id),
                     "executed_tools": [],
@@ -689,13 +674,13 @@ class AgentRuntime:
                 },
             )
 
-    def run(self,system_prompt,user_prompt,registry,terminal_tools,tool_names_provider=None,return_after_tool=False,automatic_tools=(),failure_history_compactor=None,):
+    def run(self,system_prompt,user_prompt,registry,terminal_tools,tool_names_provider=None,return_after_tool=False,failure_history_compactor=None,):
         # Alternating collaborators hand back each tool result, including failures.
         # Other agents retain the default loop-until-success behavior.
 
         logger = current_run_logger()   
         prompt_recorder = current_prompt_recorder()
-        logger.info(f"[{self.agent_name}][{self.phase}] START "f"max_steps={self.max_tool_steps} "f"max_rounds={self.max_rounds} "f"max_protocol_repairs={self.max_protocol_repairs}")
+        logger.info(f"[{self.agent_name}][{self.phase}] START "f"max_protocol_repairs={self.max_protocol_repairs}")
         logger.debug(f"[{self.agent_name}][{self.phase}] SYSTEM PROMPT\n{system_prompt}")
         logger.debug(f"[{self.agent_name}][{self.phase}] USER PROMPT\n{user_prompt}")
 
@@ -705,44 +690,18 @@ class AgentRuntime:
         ]   # messages会保存完整执行上下文,这里是初始化对话历史
 
         step = 0    # 已经执行的工具轮次
-        round_index = 0    # 已经发起的LLM轮次，包括协议纠错轮次
         protocol_repairs = 0    # LLM违反多工具调用规则协议后，已经修复几次
         last_failed_call_signature = None   # 用于检测模型是否反复调用同一个失败工具
         identical_failed_call_count = 0
 
         terminal_tools = set(terminal_tools)
-        automatic_tools = set(automatic_tools)  # 调用方明确授权框架跳过 LLM 自动执行什么工具
 
-        while step < self.max_tool_steps:
-            current_round = round_index
-
+        while True:
             # 计算当前可用工具
             active_tool_names = set(tool_names_provider() if tool_names_provider is not None else registry.names)   # 当前状态机允许什么工具
             tool_schemas = registry.schemas_for(active_tool_names)  # 从完整注册表里取出当前工具的名称、描述和参数Schema
 
-            automatic_candidates = active_tool_names & automatic_tools  # 当前既允许、又被授权自动执行的工具
-            if len(active_tool_names) == 1 and len(automatic_candidates) == 1:  # 要求当前状态机只开放一个工具，并且它正好是自动候选。
-                tool_name = next(iter(automatic_candidates))    # 取出唯一工具名
-                if not registry.missing_required_arguments(tool_name, {}):  # 检查空参数 {} 是否满足该工具 schema。只有无参数工具才能自动执行。
-                    tool_call = ModelToolCall(call_id=(f"automatic-{self.agent_name}-{self.phase}-{current_round}-{step}"), name=tool_name,arguments="{}",) # 框架构造一个“伪造但合法”的工具调用对象，使后续日志、消息历史、追踪格式与模型真实调用工具时一致。
-                    logger.info(f"[{self.agent_name}][{self.phase}][round={current_round}][step={step}] AUTOMATIC TOOL {tool_name}")
-                    messages.append({"role": "assistant", "content": "", "tool_calls": [self._assistant_tool_call(tool_call)],})  # 向消息历史写入一条 assistant tool call。即使没有请求模型，后续上下文仍知道“框架已经调用了该工具”。
-                    value = self._execute_tool(registry, tool_call, {}, step)
-                    if isinstance(value, dict):
-                        value = {**value, "automatic_execution": True}
-                    messages.append({"role": "tool","tool_call_id": tool_call.call_id,"content": self._tool_output(value),})  # 把执行结果写入 tool message，与前面的伪造 assistant tool call 配对。
-                    self._apply_failure_history_compactor(messages,failure_history_compactor,tool_call,{},value,step,)   # 若自动工具失败，压缩失败历史，避免后续模型上下文不断堆积重复报错。
-                    terminal_success = not (isinstance(value, dict) and value.get("success") is False)   # 判断自动工具是否真正成功。
-                    if return_after_tool or (tool_name in terminal_tools and terminal_success):
-                        return AgentRunResult(tool_name=tool_name,arguments={},value=value,messages=messages,)   # 两种情况直接返回：1.return_after_tool=True：协作阶段每执行一次工具就交回外层状态机。2. 工具属于终止工具且成功：例如成功提交计划、提交论文、自动提交已验证数据代码。
-                    step += 1
-                    continue
-
-            if round_index >= self.max_rounds:
-                break
-            round_index += 1
-
-            logger.info(f"[{self.agent_name}][{self.phase}][round={current_round}]"f"[step={step}] "f"LLM REQUEST tools={len(tool_schemas)} "f"names={sorted(active_tool_names)}")
+            logger.info(f"[{self.agent_name}][{self.phase}][step={step}] "f"LLM REQUEST tools={len(tool_schemas)} "f"names={sorted(active_tool_names)}")
             logger.debug(f"[{self.agent_name}][{self.phase}][step={step}] ""LLM REQUEST PAYLOAD\n"+ json.dumps({"messages": messages, "tools": tool_schemas},ensure_ascii=False,indent=2,default=str,))
             
             request_messages = list(messages)
@@ -761,7 +720,7 @@ class AgentRuntime:
             except Exception as exc:
                 elapsed = time.perf_counter() - started
                 logger.exception(f"[{self.agent_name}][{self.phase}][step={step}] "f"LLM FAILED elapsed={elapsed:.2f}s")
-                prompt_recorder.record({"event": "llm_exchange","agent": self.agent_name,"phase": self.phase,"round": current_round,"step": step,"messages": request_messages,"tool_schemas": tool_schemas,"error": str(exc),"duration_seconds": round(elapsed, 6),})
+                prompt_recorder.record({"event": "llm_exchange","agent": self.agent_name,"phase": self.phase,"step": step,"messages": request_messages,"tool_schemas": tool_schemas,"error": str(exc),"duration_seconds": round(elapsed, 6),})
                 
                 raise   # run()在这里终止
 
@@ -777,17 +736,17 @@ class AgentRuntime:
 
             logger.info(f"[{self.agent_name}][{self.phase}][step={step}] "f"LLM RESPONSE tool_calls={len(returned_calls)} "f"names={[call['name'] for call in returned_calls]} "f"finish_reason={response.finish_reason or 'None'} "f"reasoning_content_chars={response.reasoning_content_chars} "f"elapsed={elapsed:.2f}s")
             logger.debug(f"[{self.agent_name}][{self.phase}][step={step}] LLM RESPONSE PAYLOAD\n" + json.dumps({"content": response.content,"tool_calls": returned_calls,"response_metadata": {"response_id": response.response_id,"finish_reason": response.finish_reason,"usage": response.usage,"reasoning_content_chars": response.reasoning_content_chars}}, ensure_ascii=False, indent=2, default=str))
-            prompt_recorder.record({"event": "llm_exchange","agent": self.agent_name,"phase": self.phase,"round": current_round,"step": step,"messages": request_messages, "tool_schemas": tool_schemas,"response_content": response.content,"returned_tool_calls": returned_calls,"response_metadata": { "response_id": response.response_id,"finish_reason": response.finish_reason, "usage": response.usage,"reasoning_content_chars": response.reasoning_content_chars,},"duration_seconds": round(elapsed, 6),})
+            prompt_recorder.record({"event": "llm_exchange","agent": self.agent_name,"phase": self.phase,"step": step,"messages": request_messages, "tool_schemas": tool_schemas,"response_content": response.content,"returned_tool_calls": returned_calls,"response_metadata": { "response_id": response.response_id,"finish_reason": response.finish_reason, "usage": response.usage,"reasoning_content_chars": response.reasoning_content_chars,},"duration_seconds": round(elapsed, 6),})
 
             # 检查是否返回工具调用
             if not response.tool_calls:
-                self._append_no_tool_call_rejection(messages, response, active_tool_names, step, current_round,)
+                self._append_no_tool_call_rejection(messages, response, active_tool_names, step,)
                 continue
 
             unavailable = sorted({call.name for call in response.tool_calls if call.name not in active_tool_names})  # 检查工具当前是否开放
             if unavailable:
                 self._append_unavailable_tool_rejection(
-                    messages, response, active_tool_names, step, current_round,
+                    messages, response, active_tool_names, step,
                 )
                 continue
 
@@ -813,7 +772,7 @@ class AgentRuntime:
             try:
                 arguments = self._parse_arguments(tool_call)
             except ToolProtocolError as exc:
-                self._append_invalid_json_rejection(messages,response,{tool_call.call_id: str(exc)},step,current_round,)
+                self._append_invalid_json_rejection(messages,response,{tool_call.call_id: str(exc)},step,)
                 continue
 
             # 修复缺少参数的调用
@@ -899,15 +858,6 @@ class AgentRuntime:
                     messages=messages,
                 )   
             step += 1
-        if round_index >= self.max_rounds:
-            logger.error(f"[{self.agent_name}][{self.phase}] FAILED LLM round budget exhausted")
-            raise ToolProtocolError(
-                f"{self.agent_name} exceeded its {self.max_rounds} LLM-round budget"
-            )
-        logger.error(f"[{self.agent_name}][{self.phase}] FAILED tool budget exhausted")
-        raise ToolProtocolError(
-            f"{self.agent_name} exceeded its {self.max_tool_steps} tool-call budget"
-        )
 
     def run_one(self, system_prompt, user_prompt, registry):
         return self.run(

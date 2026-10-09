@@ -191,6 +191,13 @@ class SolverDiagnosticTest(unittest.TestCase):
         for category, errors in cases:
             with self.subTest(category=category):
                 codes = ["draft = 1", "draft = 2", "fixed = 3"]
+                actions = []
+                for code in codes:
+                    actions.extend([
+                        ("write_experiment_code", {"code": code}),
+                        ("execute_experiment_code", {}),
+                    ])
+                actions.append(("submit_experiment", {}))
                 requested_messages = []
                 state_snapshots = []
                 executions = [{
@@ -204,14 +211,14 @@ class SolverDiagnosticTest(unittest.TestCase):
                 def respond(**kwargs):
                     requested_messages.append(deepcopy(kwargs["messages"]))
                     index = len(requested_messages) - 1
-                    if index == 2:
+                    if index == 4:
                         self.assertEqual(
                             {tool["function"]["name"] for tool in kwargs["tools"]},
                             {"write_experiment_code"},
                         )
+                    name, arguments = actions[index]
                     return ToolModelResponse("", [ModelToolCall(
-                        f"call-{index}", "write_experiment_code",
-                        json.dumps({"code": codes[index]}),
+                        f"call-{index}", name, json.dumps(arguments),
                     )])
 
                 def record_processed_state(current, *args, **kwargs):
@@ -233,10 +240,10 @@ class SolverDiagnosticTest(unittest.TestCase):
                 self.assertTrue(result["success"])
                 self.assertEqual(result["code"], codes[-1])
                 self.assertEqual(execute.call_count, 3)
-                self.assertEqual(len(requested_messages), 3)
+                self.assertEqual(len(requested_messages), 7)
                 hint = runtime_data_repair_hint(category)
                 self.assertTrue(hint)
-                for index, messages in enumerate(requested_messages[1:], start=1):
+                for index, messages in enumerate(requested_messages[2:5:2], start=1):
                     recovery = messages[-1]["content"]
                     diagnostic = json.loads(recovery.split("Latest execution diagnostic:\n", 1)[1])
                     self.assertEqual(diagnostic["failure_category"], category)
@@ -278,11 +285,14 @@ class SolverDiagnosticTest(unittest.TestCase):
         }
         actions = [
             ("write_experiment_code", {"code": draft}),
+            ("execute_experiment_code", {}),
             ("edit_experiment_code", {"edits": [{
                 "old_text": "images = missing_old_version",
                 "new_text": replacement,
             }]}),
             ("write_experiment_code", {"code": replacement}),
+            ("execute_experiment_code", {}),
+            ("submit_experiment", {}),
         ]
         requested_messages = []
 
@@ -304,10 +314,10 @@ class SolverDiagnosticTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["code"], replacement)
         self.assertEqual(execute.call_count, 2)
-        self.assertEqual(len(requested_messages), 3)
+        self.assertEqual(len(requested_messages), 6)
         hint = runtime_data_repair_hint("tensor_device_transfer_error")
         self.assertTrue(hint)
-        for messages in requested_messages[1:]:
+        for messages in requested_messages[2:4]:
             recovery = messages[-1]["content"]
             self.assertIn("Current experiment code:\n```python\n" + draft, recovery)
             diagnostic_text = recovery.split("Latest execution diagnostic:\n", 1)[1]
@@ -315,7 +325,7 @@ class SolverDiagnosticTest(unittest.TestCase):
             self.assertEqual(diagnostic["failure_category"], "tensor_device_transfer_error")
             self.assertEqual(diagnostic["repair_hint"], hint)
             self.assertEqual(diagnostic["error"], error)
-        self.assertIn("matched 0", requested_messages[2][-1]["content"])
+        self.assertIn("matched 0", requested_messages[3][-1]["content"])
 
     def test_old_failed_candidate_does_not_replace_current_execution_diagnostic(self):
         state = SimpleNamespace(
@@ -350,15 +360,24 @@ class SolverDiagnosticTest(unittest.TestCase):
             "success": True, "error_type": None, "error": None,
             "traceback": "", "exit_code": 0, "output": "completed",
         }
-        proposed_codes = [mapping_code, string_code, mapping_code, fixed_code]
+        actions = [
+            ("write_experiment_code", {"code": mapping_code}),
+            ("execute_experiment_code", {}),
+            ("write_experiment_code", {"code": string_code}),
+            ("execute_experiment_code", {}),
+            ("write_experiment_code", {"code": mapping_code}),
+            ("write_experiment_code", {"code": fixed_code}),
+            ("execute_experiment_code", {}),
+            ("submit_experiment", {}),
+        ]
         requested_messages = []
 
         def respond(**kwargs):
             requested_messages.append(deepcopy(kwargs["messages"]))
             index = len(requested_messages) - 1
+            name, arguments = actions[index]
             return ToolModelResponse("", [ModelToolCall(
-                f"call-{index}", "write_experiment_code",
-                json.dumps({"code": proposed_codes[index]}),
+                f"call-{index}", name, json.dumps(arguments),
             )])
 
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -372,7 +391,7 @@ class SolverDiagnosticTest(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["code"], fixed_code)
-        self.assertEqual(len(requested_messages), 4)
+        self.assertEqual(len(requested_messages), 8)
         self.assertEqual(
             [call.args[0] for call in execute.call_args_list],
             [state.dataset_code + "\n\n" + code for code in (
@@ -380,7 +399,7 @@ class SolverDiagnosticTest(unittest.TestCase):
             )],
         )
         for messages, code, category, error in zip(
-            requested_messages[1:],
+            [requested_messages[index] for index in (2, 4, 5)],
             (mapping_code, string_code, string_code),
             ("mapping_numeric_input", "non_numeric_model_input", "non_numeric_model_input"),
             (mapping_error, string_error, string_error),
@@ -394,7 +413,7 @@ class SolverDiagnosticTest(unittest.TestCase):
             self.assertTrue(hint)
             self.assertEqual(diagnostic["repair_hint"], hint)
             self.assertEqual(diagnostic["error"], error)
-        rejection = json.loads(requested_messages[3][-1]["content"].split(
+        rejection = json.loads(requested_messages[5][-1]["content"].split(
             "\n\nLatest code action rejection:\n", 1,
         )[1])
         self.assertEqual(rejection["error_type"], "unchanged_failed_experiment_code")

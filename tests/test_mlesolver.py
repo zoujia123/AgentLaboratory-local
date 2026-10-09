@@ -44,6 +44,7 @@ class MLESolverSolveTest(unittest.TestCase):
                     json.dumps({"code": "draft = 1"}),
                 )],
             ),
+            ToolModelResponse("", [ModelToolCall("execute", "execute_experiment_code", "{}")]),
             ToolModelResponse(
                 "",
                 [ModelToolCall(
@@ -52,6 +53,8 @@ class MLESolverSolveTest(unittest.TestCase):
                     json.dumps({"code": "fixed = 1"}),
                 )],
             ),
+            ToolModelResponse("", [ModelToolCall("execute-fixed", "execute_experiment_code", "{}")]),
+            ToolModelResponse("", [ModelToolCall("submit", "submit_experiment", "{}")]),
         ]
         requested_messages = []
 
@@ -84,8 +87,8 @@ class MLESolverSolveTest(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["code"], "fixed = 1")
-        self.assertEqual(len(requested_messages), 2)
-        recovery_messages = requested_messages[1]
+        self.assertEqual(len(requested_messages), 5)
+        recovery_messages = requested_messages[2]
         self.assertEqual(
             [message["role"] for message in recovery_messages],
             ["system", "user", "user"],
@@ -132,6 +135,7 @@ class MLESolverSolveTest(unittest.TestCase):
                     json.dumps({"code": "draft = 1"}),
                 )],
             ),
+            ToolModelResponse("", [ModelToolCall("execute", "execute_experiment_code", "{}")]),
             ToolModelResponse(
                 "",
                 [ModelToolCall(
@@ -148,6 +152,8 @@ class MLESolverSolveTest(unittest.TestCase):
                     json.dumps({"code": "fixed = 1"}),
                 )],
             ),
+            ToolModelResponse("", [ModelToolCall("execute-fixed", "execute_experiment_code", "{}")]),
+            ToolModelResponse("", [ModelToolCall("submit", "submit_experiment", "{}")]),
         ]
         requested_messages = []
 
@@ -182,8 +188,8 @@ class MLESolverSolveTest(unittest.TestCase):
             result = MLESolverAgent("model", "key", code_execution_timeout_seconds=123).solve(state, folder)
 
         self.assertTrue(result["success"])
-        self.assertEqual(len(requested_messages), 3)
-        duplicate_recovery = json.dumps(requested_messages[2])
+        self.assertEqual(len(requested_messages), 6)
+        duplicate_recovery = json.dumps(requested_messages[3])
         self.assertIn("unchanged_failed_experiment_code", duplicate_recovery)
         self.assertIn("original_error", duplicate_recovery)
         self.assertIn("LATEST_TRACEBACK", duplicate_recovery)
@@ -227,7 +233,7 @@ class MLESolverSolveTest(unittest.TestCase):
         self.assertEqual(result["failure_category"], "evaluation_subset_alignment")
         self.assertIn("one boolean mask", result["repair_hint"])
 
-    def test_main_and_supplement_auto_submit_without_another_model_request(self):
+    def test_main_and_supplement_request_execution_and_submission_from_model(self):
         import json
         from unittest.mock import MagicMock
         from inference import ModelToolCall, ToolModelResponse
@@ -250,6 +256,7 @@ class MLESolverSolveTest(unittest.TestCase):
                 with self.subTest(supplement=supplement, fail_first=fail_first), tempfile.TemporaryDirectory() as folder:
                     replace = "write_supplement_code" if supplement else "write_experiment_code"
                     edit = "edit_supplement_code" if supplement else "edit_experiment_code"
+                    execute_tool = "execute_supplement_code" if supplement else "execute_experiment_code"
                     submit = "submit_supplementary_experiment" if supplement else "submit_experiment"
                     edit_arguments = (
                         {
@@ -265,20 +272,32 @@ class MLESolverSolveTest(unittest.TestCase):
                         }
                     )
                     calls = []
-                    responses = [
-                        ToolModelResponse("", [ModelToolCall("write", replace, json.dumps({"code": "value = 1"}))]),
-                        ToolModelResponse("", [ModelToolCall("repair", edit, json.dumps(edit_arguments))]),
+                    actions = [
+                        (replace, {"code": "value = 1"}),
+                        (execute_tool, {}),
                     ]
+                    if fail_first:
+                        actions.extend([(edit, edit_arguments), (execute_tool, {})])
+                    actions.append((submit, {}))
+
                     def respond(**kwargs):
                         names = {tool["function"]["name"] for tool in kwargs["tools"]}
-                        self.assertNotIn(submit, names)
-                        if calls:
-                            self.assertTrue(fail_first)
+                        index = len(calls)
+                        name, arguments = actions[index]
+                        self.assertIn(name, names)
+                        if name in {execute_tool, submit}:
+                            self.assertEqual(names, {name})
+                        if name == edit:
                             self.assertIn(edit, names)
                             self.assertIn("broken", json.dumps(kwargs["messages"]))
+                        self.assertEqual(
+                            execute.call_count,
+                            sum(action == execute_tool for action, _ in actions[:index]),
+                        )
                         calls.append(kwargs)
-                        self.assertLessEqual(len(calls), 2 if fail_first else 1)
-                        return responses[len(calls) - 1]
+                        return ToolModelResponse("", [ModelToolCall(
+                            f"call-{index}", name, json.dumps(arguments),
+                        )])
 
                     outputs = (
                         [execution_result("broken", False, "python_exception")]
@@ -293,7 +312,7 @@ class MLESolverSolveTest(unittest.TestCase):
                             agent.supplement(state, request, folder, 1)
                             if supplement else agent.solve(state, folder)
                         )
-                    self.assertEqual(len(calls), 2 if fail_first else 1)
+                    self.assertEqual(len(calls), 5 if fail_first else 3)
                     self.assertEqual(execute.call_count, len(outputs))
                     for execution_call in execute.call_args_list:
                         self.assertEqual(execution_call.kwargs["timeout"], 123)
@@ -302,7 +321,7 @@ class MLESolverSolveTest(unittest.TestCase):
                             state.dataset_selection,
                         )
                     self.assertTrue(result["success"])
-                    self.assertTrue(result["automatic_execution"])
+                    self.assertNotIn("automatic_execution", result)
                     self.assertEqual(result["code"], "value = 2" if fail_first else "value = 1")
                     self.assertEqual(result["output"], "final_output")
                     events = [call.args[0] for call in recorder.record.call_args_list
@@ -719,6 +738,8 @@ class MLESolverSolveTest(unittest.TestCase):
                     json.dumps({"code": "result = 1"}),
                 )],
             ),
+            ToolModelResponse("", [ModelToolCall("execute", "execute_experiment_code", "{}")]),
+            ToolModelResponse("", [ModelToolCall("submit", "submit_experiment", "{}")]),
         ]
         requested_messages = []
 
@@ -850,10 +871,7 @@ class MLESolverSolveTest(unittest.TestCase):
             available_tools = kwargs["tool_names_provider"]
             self.assertIn("X_train", kwargs["user_prompt"])
             self.assertIn("analysis metadata incomplete", kwargs["user_prompt"])
-            self.assertEqual(
-                kwargs["automatic_tools"],
-                {"execute_experiment_code", "submit_experiment"},
-            )
+            self.assertNotIn("automatic_tools", kwargs)
 
             self.assertEqual(available_tools(), {"write_experiment_code"})
 

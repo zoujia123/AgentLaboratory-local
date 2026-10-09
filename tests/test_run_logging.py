@@ -55,7 +55,7 @@ class RunLoggingTest(unittest.TestCase):
                 reasoning_content_chars=7,
                 response_id="response-1",
             )
-            runtime = AgentRuntime("model", "key", "TestAgent", "test", 1)
+            runtime = AgentRuntime("model", "key", "TestAgent", "test")
             with run_log_scope(logger, prompts), patch(
                 "agent_runtime.query_model_with_tools", return_value=response
             ):

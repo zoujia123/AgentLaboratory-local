@@ -180,7 +180,11 @@ def run_query_job(batch, job, model, api_key, output_root):
                     "replay": replay_summary,
                 }
                 (workdir / "job_summary.json").write_text(json.dumps(job_summary,ensure_ascii=True,indent=2,default=str,),encoding="utf-8",)
-                run_logger.info(f"JOB END success={error is None} workflow_log={run_logger.path} prompts={prompt_recorder.path}")
+                run_logger.info(
+                    f"JOB END success={error is None} "
+                    f"workflow_http_requests={llm_http_budget.used}/{llm_http_budget.limit} "
+                    f"workflow_log={run_logger.path} prompts={prompt_recorder.path}"
+                )
     finally:
         run_logger.close()
     return job_summary

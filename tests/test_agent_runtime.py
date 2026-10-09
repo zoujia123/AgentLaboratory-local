@@ -1,10 +1,16 @@
 import json
 import unittest
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent_runtime import AgentRuntime, ToolProtocolError, ToolRegistry
-from inference import ModelToolCall, ToolModelResponse
+from inference import (
+    LLMHTTPAttemptLimitError,
+    ModelToolCall,
+    ToolModelResponse,
+    llm_http_attempt_budget_scope,
+)
 
 
 def schema(properties=None, required=None):
@@ -16,7 +22,114 @@ def schema(properties=None, required=None):
     }
 
 
+def completion(tool_name=None):
+    return SimpleNamespace(choices=[SimpleNamespace(
+        finish_reason="tool_calls" if tool_name else "stop",
+        message=SimpleNamespace(
+            content="" if tool_name else "plain text",
+            tool_calls=[SimpleNamespace(
+                id="call-1",
+                function=SimpleNamespace(name=tool_name, arguments="{}"),
+            )] if tool_name else [],
+        ),
+    )])
+
+
 class AgentRuntimeTest(unittest.TestCase):
+    def test_executes_tools_until_submission_without_local_count_limits(self):
+        work = MagicMock(return_value={"success": True})
+        registry = ToolRegistry().register(
+            "work", "Work", schema(), work,
+        ).register(
+            "submit", "Submit", schema(), lambda: {"success": True},
+        )
+        responses = [
+            ToolModelResponse("", [ModelToolCall(f"work-{index}", "work", "{}")])
+            for index in range(60)
+        ] + [ToolModelResponse("", [ModelToolCall("submit", "submit", "{}")])]
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
+
+        with patch("agent_runtime.query_model_with_tools", side_effect=responses) as query:
+            result = runtime.run("system", "user", registry, {"submit"})
+
+        self.assertTrue(result.value["success"])
+        self.assertEqual(result.tool_name, "submit")
+        self.assertEqual(work.call_count, 60)
+        self.assertEqual(query.call_count, 61)
+
+    def test_single_available_tools_consume_http_attempt_budget(self):
+        state = {"started": False, "executions": 0}
+
+        def start():
+            state["started"] = True
+            return {"success": True}
+
+        def execute():
+            state["executions"] += 1
+            return {"success": True}
+
+        def available_tools():
+            if not state["started"]:
+                return {"start"}
+            if state["executions"] < 12:
+                return {"execute"}
+            return {"submit"}
+
+        registry = ToolRegistry().register(
+            "start", "Start", schema(), start,
+        ).register(
+            "execute", "Execute", schema(), execute,
+        ).register(
+            "submit", "Submit", schema(), lambda: {"success": True},
+        )
+        client = MagicMock()
+        client.chat.completions.create.side_effect = (
+            [completion("start")]
+            + [completion("execute") for _ in range(12)]
+            + [completion("submit")]
+        )
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
+
+        with llm_http_attempt_budget_scope(14) as budget, patch(
+            "inference.OpenAI", return_value=client,
+        ):
+            result = runtime.run(
+                "system", "user", registry, {"submit"},
+                tool_names_provider=available_tools,
+            )
+
+        self.assertTrue(result.value["success"])
+        self.assertEqual(result.tool_name, "submit")
+        self.assertEqual(state["executions"], 12)
+        self.assertEqual(client.chat.completions.create.call_count, 14)
+        self.assertEqual(budget.used, 14)
+        self.assertFalse(budget.request_blocked)
+
+    def test_http_attempt_budget_is_shared_across_runtime_runs(self):
+        work = MagicMock(return_value={"success": True})
+        submit_registry = ToolRegistry().register(
+            "submit", "Submit", schema(), lambda: {"success": True},
+        )
+        work_registry = ToolRegistry().register("work", "Work", schema(), work)
+        client = MagicMock()
+        client.chat.completions.create.return_value = completion("submit")
+        first = AgentRuntime("model", "key", "FirstAgent", "first phase")
+        second = AgentRuntime("model", "key", "SecondAgent", "second phase")
+
+        with llm_http_attempt_budget_scope(100) as budget, patch(
+            "inference.OpenAI", return_value=client,
+        ):
+            result = first.run_one("system", "user", submit_registry)
+            self.assertTrue(result.value["success"])
+            client.chat.completions.create.return_value = completion("work")
+            with self.assertRaisesRegex(LLMHTTPAttemptLimitError, "100/100 attempts used"):
+                second.run("system", "user", work_registry, set())
+
+        self.assertEqual(work.call_count, 99)
+        self.assertEqual(client.chat.completions.create.call_count, 100)
+        self.assertEqual(budget.used, 100)
+        self.assertTrue(budget.request_blocked)
+
     def test_compacts_large_failed_tool_arguments_in_next_llm_request(self):
         observed_messages = []
         large_code = "x" * 8000
@@ -43,7 +156,7 @@ class AgentRuntimeTest(unittest.TestCase):
             observed_messages.append(deepcopy(kwargs["messages"]))
             return responses[len(observed_messages) - 1]
 
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=2)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         recorder = MagicMock()
         with patch("agent_runtime.query_model_with_tools", side_effect=respond), patch(
             "agent_runtime.current_prompt_recorder", return_value=recorder
@@ -74,7 +187,7 @@ class AgentRuntimeTest(unittest.TestCase):
             "",
             [ModelToolCall("call", "replace", '{"code":"same"}')],
         )
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=8)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch(
             "agent_runtime.query_model_with_tools",
             side_effect=[failed, failed, failed],
@@ -111,7 +224,7 @@ class AgentRuntimeTest(unittest.TestCase):
             failed,
             ToolModelResponse("", [ModelToolCall("submit", "submit", "{}")]),
         ]
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=4)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
 
         with patch("agent_runtime.query_model_with_tools", side_effect=responses):
             result = runtime.run("system", "user", registry, {"submit"})
@@ -155,7 +268,7 @@ class AgentRuntimeTest(unittest.TestCase):
                 tool_calls=[ModelToolCall("call-2", "submit", json.dumps({"value": "done"}))],
             ),
         ]
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=2)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch("agent_runtime.query_model_with_tools", side_effect=responses):
             result = runtime.run("system", "user", registry, {"submit"})
         self.assertEqual(calls, [("search", "iris"), ("submit", "done")])
@@ -202,7 +315,7 @@ class AgentRuntimeTest(unittest.TestCase):
             observed_messages.append(deepcopy(kwargs["messages"]))
             return responses[len(observed_tools) - 1]
 
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=2)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch("agent_runtime.query_model_with_tools", side_effect=respond):
             result = runtime.run(
                 "system",
@@ -220,7 +333,7 @@ class AgentRuntimeTest(unittest.TestCase):
         self.assertEqual(observed_messages[1][-1]["role"], "tool")
         self.assertEqual(result.value["review"], "done")
 
-    def test_automatically_executes_unique_zero_argument_tool(self):
+    def test_requests_unique_zero_argument_tools_and_preserves_results(self):
         stage = {"value": "replace"}
         actions = []
         observed_messages = []
@@ -256,6 +369,7 @@ class AgentRuntimeTest(unittest.TestCase):
                 "",
                 [ModelToolCall("replace-call", "replace", '{"code":"x = 1"}')],
             ),
+            ToolModelResponse("", [ModelToolCall("execute-call", "execute", "{}")]),
             ToolModelResponse("", [ModelToolCall("submit-call", "submit", "{}")]),
         ]
 
@@ -263,7 +377,7 @@ class AgentRuntimeTest(unittest.TestCase):
             observed_messages.append(deepcopy(kwargs["messages"]))
             return responses[len(observed_messages) - 1]
 
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=3)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch("agent_runtime.query_model_with_tools", side_effect=respond) as query:
             result = runtime.run(
                 "system",
@@ -271,7 +385,6 @@ class AgentRuntimeTest(unittest.TestCase):
                 registry,
                 {"submit"},
                 tool_names_provider=lambda: {stage["value"]},
-                automatic_tools={"execute"},
             )
 
         self.assertTrue(result.value["success"])
@@ -279,10 +392,16 @@ class AgentRuntimeTest(unittest.TestCase):
             actions,
             [("replace", "x = 1"), ("execute", None), ("submit", None)],
         )
-        self.assertEqual(query.call_count, 2)
-        automatic_result = json.loads(observed_messages[1][-1]["content"])
-        self.assertTrue(automatic_result["automatic_execution"])
-        self.assertEqual(observed_messages[1][-2]["tool_calls"][0]["function"]["name"], "execute")
+        self.assertEqual(query.call_count, 3)
+        self.assertEqual(
+            [call.kwargs["tools"][0]["function"]["name"] for call in query.call_args_list],
+            ["replace", "execute", "submit"],
+        )
+        self.assertEqual(observed_messages[1][-1]["tool_call_id"], "replace-call")
+        execution_message = observed_messages[2][-1]
+        self.assertEqual(execution_message["tool_call_id"], "execute-call")
+        self.assertEqual(json.loads(execution_message["content"]), {"success": True, "output": "ok"})
+        self.assertEqual(observed_messages[2][-2]["tool_calls"][0]["id"], "execute-call")
 
     def test_recovers_from_tool_not_available_in_current_turn(self):
         actions = []
@@ -313,7 +432,7 @@ class AgentRuntimeTest(unittest.TestCase):
             observed_messages.append(deepcopy(kwargs["messages"]))
             return responses[len(observed_messages) - 1]
 
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
 
         with patch(
             "agent_runtime.query_model_with_tools",
@@ -368,7 +487,7 @@ class AgentRuntimeTest(unittest.TestCase):
             observed_messages.append(deepcopy(kwargs["messages"]))
             return responses[len(observed_messages) - 1]
 
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=2)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch("agent_runtime.query_model_with_tools", side_effect=respond), patch(
             "agent_runtime.record_trace_event"
         ) as record:
@@ -435,7 +554,7 @@ class AgentRuntimeTest(unittest.TestCase):
             observed_messages.append(deepcopy(kwargs["messages"]))
             return responses[len(observed_messages) - 1]
 
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         recorder = MagicMock()
         with patch("agent_runtime.query_model_with_tools", side_effect=respond), patch(
             "agent_runtime.current_prompt_recorder", return_value=recorder
@@ -501,7 +620,7 @@ class AgentRuntimeTest(unittest.TestCase):
             ],
         )
         recorder = MagicMock()
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch(
             "agent_runtime.query_model_with_tools",
             return_value=response,
@@ -542,7 +661,7 @@ class AgentRuntimeTest(unittest.TestCase):
                 "", [ModelToolCall("call-3", "edit", '{"edits":["corrected"]}')]
             ),
         ]
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch("agent_runtime.query_model_with_tools", side_effect=responses) as query:
             result = runtime.run_one("system", "user", registry)
 
@@ -573,7 +692,6 @@ class AgentRuntimeTest(unittest.TestCase):
             "key",
             "TestAgent",
             "test",
-            max_tool_steps=1,
             max_protocol_repairs=1,
         )
         with patch(
@@ -610,7 +728,7 @@ class AgentRuntimeTest(unittest.TestCase):
             observed_messages.append(deepcopy(kwargs["messages"]))
             return responses[len(observed_messages) - 1]
 
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch("agent_runtime.query_model_with_tools", side_effect=respond):
             result = runtime.run("system", "user", registry, {"submit"})
 
@@ -647,7 +765,6 @@ class AgentRuntimeTest(unittest.TestCase):
             "key",
             "TestAgent",
             "test",
-            max_tool_steps=1,
             max_protocol_repairs=1,
         )
 
@@ -693,7 +810,7 @@ class AgentRuntimeTest(unittest.TestCase):
             observed_messages.append(deepcopy(kwargs["messages"]))
             return responses[len(observed_messages) - 1]
 
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=2)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch("agent_runtime.query_model_with_tools", side_effect=respond):
             result = runtime.run("system", "user", registry, {"submit"})
 
@@ -735,7 +852,7 @@ class AgentRuntimeTest(unittest.TestCase):
                 [ModelToolCall("read-2", "read", '{"paper_id":"corrected"}')],
             ),
         ]
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch("agent_runtime.query_model_with_tools", side_effect=responses) as query:
             result = runtime.run(
                 "system", "user", registry, set(), return_after_tool=True,
@@ -750,7 +867,7 @@ class AgentRuntimeTest(unittest.TestCase):
         registry = ToolRegistry().register(
             "submit", "Submit", schema(), lambda: {"success": True}
         )
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
 
         responses = [
             ToolModelResponse("plain text", []),
@@ -801,7 +918,7 @@ class AgentRuntimeTest(unittest.TestCase):
             observed_messages.append(deepcopy(kwargs["messages"]))
             return responses[len(observed_messages) - 1]
 
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=1)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch("agent_runtime.query_model_with_tools", side_effect=respond):
             result = runtime.run_one("system", "user", registry)
 
@@ -812,31 +929,33 @@ class AgentRuntimeTest(unittest.TestCase):
         self.assertTrue(rejected["retryable"])
         self.assertIn("invalid JSON arguments", rejected["error"])
 
-    def test_protocol_recovery_rounds_are_bounded(self):
+    def test_protocol_recovery_uses_global_http_attempt_budget(self):
+        submit = MagicMock(return_value={"success": True})
         registry = ToolRegistry().register(
-            "submit", "Submit", schema(), lambda: {"success": True}
+            "submit", "Submit", schema(), submit,
         )
         runtime = AgentRuntime(
             "model",
             "key",
             "TestAgent",
             "test",
-            max_tool_steps=1,
-            max_rounds=2,
         )
-        empty = ToolModelResponse("plain text", [])
+        client = MagicMock()
+        client.chat.completions.create.return_value = completion()
 
-        with patch(
-            "agent_runtime.query_model_with_tools",
-            side_effect=[empty, empty],
-        ) as query:
+        with llm_http_attempt_budget_scope(100) as budget, patch(
+            "inference.OpenAI", return_value=client,
+        ):
             with self.assertRaisesRegex(
-                ToolProtocolError,
-                "exceeded its 2 LLM-round budget",
+                LLMHTTPAttemptLimitError,
+                "100/100 attempts used",
             ):
                 runtime.run_one("system", "user", registry)
 
-        self.assertEqual(query.call_count, 2)
+        submit.assert_not_called()
+        self.assertEqual(client.chat.completions.create.call_count, 100)
+        self.assertEqual(budget.used, 100)
+        self.assertTrue(budget.request_blocked)
 
     def test_failed_terminal_tool_allows_correction(self):
         attempts = []
@@ -855,7 +974,7 @@ class AgentRuntimeTest(unittest.TestCase):
             ToolModelResponse("", [ModelToolCall("one", "submit", '{"value":"bad"}')]),
             ToolModelResponse("", [ModelToolCall("two", "submit", '{"value":"valid"}')]),
         ]
-        runtime = AgentRuntime("model", "key", "TestAgent", "test", max_tool_steps=2)
+        runtime = AgentRuntime("model", "key", "TestAgent", "test")
         with patch("agent_runtime.query_model_with_tools", side_effect=responses):
             result = runtime.run("system", "user", registry, {"submit"})
         self.assertEqual(attempts, ["bad", "valid"])

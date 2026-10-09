@@ -1907,7 +1907,6 @@ class AgentPromptTest(unittest.TestCase):
                     self.assertEqual(kwargs["tool_names_provider"](), expected)
                     self.assertEqual(kwargs["terminal_tools"], all_tools)
                     self.assertFalse(kwargs.get("return_after_tool", False))
-                    self.assertFalse(kwargs.get("automatic_tools", ()))
 
     def test_interpretation_runtime_returns_each_action_and_rejects_unavailable_tool(self):
         from agent_runtime import ToolRegistry

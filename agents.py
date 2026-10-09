@@ -45,13 +45,12 @@ class BaseResearchAgent:
         self.api_key = api_key
         self.name = name or self.__class__.__name__
 
-    def runtime(self, phase, max_tool_steps=8, *, max_tokens=8192):
+    def runtime(self, phase, *, max_tokens=8192):
         return AgentRuntime(
             model=self.model,
             api_key=self.api_key,
             agent_name=self.name,
             phase=phase,
-            max_tool_steps=max_tool_steps,
             max_tokens=max_tokens,
         )
 
@@ -306,7 +305,7 @@ class PhDStudentAgent(BaseResearchAgent):
             ),
             submit_literature_review,
         )
-        result = self.runtime("literature review", max_tool_steps=20).run(
+        result = self.runtime("literature review").run(
             system_prompt=literature_review_prompt(),
             user_prompt=(
                 f"Research topic: {topic}\n"
@@ -328,7 +327,7 @@ class PhDStudentAgent(BaseResearchAgent):
             ),
             lambda message: {"success": True, "message": message},
         )
-        return self.runtime("plan formulation", max_tool_steps=1).run_one(
+        return self.runtime("plan formulation").run_one(
             system_prompt=phd_plan_feedback_prompt(),
             user_prompt=(
                 f"Topic: {topic}\nLiterature review: {literature_review}\n"
@@ -364,7 +363,7 @@ class PhDStudentAgent(BaseResearchAgent):
                 "supplement_required": supplement_required,
             },
         )
-        return self.runtime("results interpretation", max_tool_steps=1).run_one(
+        return self.runtime("results interpretation").run_one(
             system_prompt=phd_interpretation_feedback_prompt(),
             user_prompt=(
                 f"Topic: {topic}\nPlan: {plan}\n"
@@ -427,7 +426,7 @@ class PostdocAgent(BaseResearchAgent):
             ),
             submit_plan,
         )
-        return self.runtime("plan formulation", max_tool_steps=1).run_one(
+        return self.runtime("plan formulation").run_one(
             system_prompt=postdoc_plan_prompt(),
             user_prompt=(
                 f"Topic: {topic}\nLiterature review: {literature_review}\n"
@@ -539,7 +538,7 @@ class PostdocAgent(BaseResearchAgent):
             submit_schema,
             submit_handler,
         )
-        return self.runtime("results interpretation", max_tool_steps=1).run(
+        return self.runtime("results interpretation").run(
             system_prompt=postdoc_interpretation_prompt(),
             user_prompt=(
                 f"Topic: {topic}\nPlan: {plan}\n"
@@ -755,7 +754,7 @@ class MLEngineerAgent(BaseResearchAgent):
             )}, ["message"]),
             lambda message: {"success": True, "message": message},
         )
-        return self.runtime("data preparation collaboration", max_tool_steps=1).run(
+        return self.runtime("data preparation collaboration").run(
             system_prompt=ml_dataset_selection_prompt(),
             user_prompt=(
                 f"Topic: {topic}\n"
@@ -802,7 +801,7 @@ class SWEngineerAgent(BaseResearchAgent):
             )}, ["message"]),
             lambda message: {"success": True, "message": message},
         )
-        return self.runtime("data preparation collaboration", max_tool_steps=1).run(
+        return self.runtime("data preparation collaboration").run(
             system_prompt=sw_data_preparation_prompt(),
             user_prompt=(
                 f"Topic: {topic}\n"
@@ -912,7 +911,7 @@ class MLESolverAgent(BaseResearchAgent):
                 return rejected_experiment_code(fingerprint,"write_experiment_code")
 
             current.update(code=code,output="",success=None,code_hash=fingerprint,force_replace=False,) # 通过检查后，接受新代码
-            return {"success": True,"message": "Experiment code replaced; automatic execution is next","code_hash": fingerprint,}
+            return {"success": True,"message": "Experiment code replaced. Call execute_experiment_code to run the saved draft.","code_hash": fingerprint,}
 
         def edit_experiment_code(edits):
             if not current["code"]: # 如果目前还没有代码，就无法修改，直接返回失败。
@@ -972,7 +971,7 @@ class MLESolverAgent(BaseResearchAgent):
                 "success": True,
                 "message": (
                     f"Applied {len(planned_edits)} experiment edits atomically; "
-                    "automatic execution is next"
+                    "Call execute_experiment_code to run the saved draft."
                 ),
                 "code_hash": fingerprint,
                 "edit_count": len(planned_edits),
@@ -1003,7 +1002,7 @@ class MLESolverAgent(BaseResearchAgent):
             "write_experiment_code",
             (
                 "Save the full experiment program from code, replacing the current draft. "
-                "The framework then automatically executes it and submits successful results."
+                "Call execute_experiment_code next, then submit_experiment after successful execution."
             ),
             _object_schema(
                 {"code": _string(
@@ -1016,8 +1015,8 @@ class MLESolverAgent(BaseResearchAgent):
         ).register(
             "edit_experiment_code",
             (
-                "Provide 1 to 6 exact replacements in edits. The tool applies all edits "
-                "or none. The framework then automatically executes the updated experiment."
+                "Provide 1 exact replacements in edits. The tool applies all edits "
+                "or none. Call execute_experiment_code to run the updated experiment."
             ),
             _object_schema(
                 {
@@ -1025,7 +1024,7 @@ class MLESolverAgent(BaseResearchAgent):
                         "type": "array",
                         "description": "All changes to the current experiment code in one call. The matched fragments must not overlap.",
                         "minItems": 1,
-                        "maxItems": 6,
+                        "maxItems": 1,
                         "items": {
                             "type": "object",
                             "description": "One exact text replacement in the current experiment code.",
@@ -1060,7 +1059,7 @@ class MLESolverAgent(BaseResearchAgent):
             _object_schema({}, []),
             submit_experiment,
         )
-        runtime = self.runtime("running experiments", max_tool_steps=50)
+        runtime = self.runtime("running experiments")
         system_prompt = experiment_solver_prompt()
         user_prompt = (
             f"Topic: {state.topic}\nPlan: {state.plan}\n"
@@ -1106,7 +1105,6 @@ class MLESolverAgent(BaseResearchAgent):
             registry=registry,
             terminal_tools={"submit_experiment"},
             tool_names_provider=available_tools,
-            automatic_tools={"execute_experiment_code", "submit_experiment"},
             failure_history_compactor=compact_experiment_failure,
         )
         return result.value
@@ -1208,7 +1206,7 @@ class MLESolverAgent(BaseResearchAgent):
             )
             return {
                 "success": True,
-                "message": "Supplement code replaced; automatic execution is next",
+                "message": "Supplement code replaced. Call execute_supplement_code to run the saved draft.",
                 "code_hash": fingerprint,
             }
 
@@ -1252,7 +1250,7 @@ class MLESolverAgent(BaseResearchAgent):
             )
             return {
                 "success": True,
-                "message": "Supplement code edited; automatic execution is next",
+                "message": "Supplement code edited. Call execute_supplement_code to run the saved draft.",
                 "code_hash": fingerprint,
             }
 
@@ -1290,7 +1288,7 @@ class MLESolverAgent(BaseResearchAgent):
             "write_supplement_code",
             (
                 "Save the full supplementary experiment from code, replacing the current draft. "
-                "The framework then automatically executes it and submits successful results."
+                "Call execute_supplement_code next, then submit_supplementary_experiment after successful execution."
             ),
             _object_schema(
                 {"code": _string(
@@ -1304,7 +1302,7 @@ class MLESolverAgent(BaseResearchAgent):
             "edit_supplement_code",
             (
                 "Provide one exact text replacement for the saved supplement. "
-                "The tool applies it. The framework then automatically executes the updated supplement."
+                "The tool applies it. Call execute_supplement_code to run the updated supplement."
             ),
             _object_schema(
                 {
@@ -1332,7 +1330,7 @@ class MLESolverAgent(BaseResearchAgent):
             _object_schema({}, []),
             submit_supplementary_experiment,
         )
-        runtime = self.runtime("supplementary experiments", max_tool_steps=20)
+        runtime = self.runtime("supplementary experiments")
         result = runtime.run(
             system_prompt=supplementary_experiment_solver_prompt(supplement_id),
             user_prompt=(
@@ -1355,7 +1353,6 @@ class MLESolverAgent(BaseResearchAgent):
             registry=registry,
             terminal_tools={"submit_supplementary_experiment"},
             tool_names_provider=available_tools,
-            automatic_tools={"execute_supplement_code", "submit_supplementary_experiment"},
         )
         return result.value
 
@@ -1454,7 +1451,6 @@ class PaperSolverAgent(BaseResearchAgent):
         )
         blueprint = self.runtime(
             "report writing blueprint",
-            max_tool_steps=2,
             max_tokens=3000,
         ).run_one(
             system_prompt=paper_blueprint_prompt(sections, available_figures),
@@ -1584,7 +1580,6 @@ class PaperSolverAgent(BaseResearchAgent):
                 ]
             section_result = self.runtime(
                 f"report writing section {section}",
-                max_tool_steps=2,
                 max_tokens=4096,
             ).run_one(
                 system_prompt=paper_section_prompt(
@@ -1677,7 +1672,7 @@ class ProfessorAgent(BaseResearchAgent):
             ),
             lambda markdown: {"success": True, "markdown": markdown},
         )
-        return self.runtime("readme writing", max_tool_steps=1).run_one(
+        return self.runtime("readme writing").run_one(
             system_prompt=professor_readme_prompt(),
             user_prompt=(
                 f"Topic: {state.topic}\nPlan: {state.plan}\n"
