@@ -69,112 +69,30 @@ DATA_PREPARATION_OUTPUT_GUIDANCE = (
 )
 
 
-# Reuse the same acceptance criteria in the system prompt, tool description,
-# and read-result hint so background relevance stays an independent criterion.
+# Each screening round supplies one concise selection rule to decide_add.
 LITERATURE_RELEVANCE_RULE = (
-    "Choose 'add' if ANY ONE applies: the paper studies the same concrete task, "
-    "problem setting, or phenomenon as the research topic; it offers a method, "
-    "evaluation approach, or theory transferable to this study; or it provides "
-    "direct evidence for the research question. Shared research background alone "
-    "is sufficient; no additional methodological contribution is required. "
-    "Choose 'reject' only if none applies. A shared keyword or generic field "
-    "such as 'machine learning' alone is insufficient."
+    "Add the paper if it has a clear, useful connection to the broader research "
+    "background; an exact experimental match is unnecessary."
 )
-
-LITERATURE_BACKGROUND_LIMITATIONS = (
-    "Background papers need not match the dataset, model, sample size, input "
-    "resolution, split, or exact comparison. Missing the requested baseline or "
-    "ablation is a limitation, not a reason to reject an otherwise relevant paper."
-)
-
 
 LITERATURE_RETRY_RELEVANCE_RULE = (
-    "This is the second and final screening round. The first round ended without "
-    "selecting a reference, either after rejecting its candidates or after repeated "
-    "searches returned no new candidates. Revisit previously rejected papers with broader "
-    "background relevance rather than repeating the previous rejection criteria. "
-    "The goal is to select one useful background reference. Choose 'add' when "
-    "you can explain a concrete connection through the research object, task "
-    "family, problem setting, phenomenon, features, or transferable method. "
-    "The paper need not answer the exact research question or perform the same "
-    "experiment. Missing the requested comparison, a particular baseline, "
-    "or another requested ablation is a limitation, not sufficient grounds for "
-    "rejection. Explain the background connection and distinguish it from direct "
-    "evidence about this experiment's outcome. Choose 'reject' only when no "
-    "defensible background connection exists; do not invent relevance from a "
-    "generic field or shared keyword alone."
+    "Add the paper if any part of the provided text offers useful conceptual "
+    "background, a methodological analogy, or context for interpreting the research "
+    "question, even when the connection is indirect and the paper studies a different "
+    "problem. "
 )
 
 
-def literature_review_prompt(review_round=1):
-    relevance_rule = (
-        LITERATURE_RETRY_RELEVANCE_RULE if review_round == 2 else LITERATURE_RELEVANCE_RULE
-    )
+def literature_review_prompt():
     return (
-        "You are a PhD student writing a literature review. "
-        "Add exactly 1 relevant paper, then submit_literature_review.\n\n"
-        "Use the topic's underlying task, problem setting, or phenomenon as the "
-        "background scope. Experimental details are not mandatory paper-matching "
-        "criteria.\n"
-        f"{relevance_rule}\n"
-        f"{LITERATURE_BACKGROUND_LIMITATIONS}\n\n"
-        "Base relevance and claims on the provided text. Identify the shared "
-        "background, transferable method, or direct evidence before stating "
-        "limitations. Distinguish background from evidence about this experiment's "
-        "outcome. Do not invent findings or infer that a method or analysis is "
-        "absent from a truncated excerpt.\n\n"
-        "Use only this query's local candidates and the tools shown for this turn. "
-        "Search with short queries about the background task or relevant methods. "
-        "Follow search_arxiv, read_arxiv_paper, then decide_paper for the currently "
-        "read arXiv ID, using exactly one tool call per response. Read only a "
-        "candidate from the latest search. After rejection, search again on the "
-        "next turn; do not reread rejected papers within the same screening round. "
-        "A new screening round resets earlier rejections. After adding one paper, submit "
-        "without further searches."
+        "You are a computer science PhD student. Perform a literature review"
+        f" for the research topic using the provided local papers.\n"
     )
 
 
 def phd_plan_feedback_prompt():
     return (
-        "You are a computer science PhD student being directed by a postdoctoral "
-        "researcher. Your sole planning goal is a minimal valid experiment sufficient "
-        "to answer the user's research question. Treat the original topic as the scope "
-        "boundary: preserve its question and comparisons. The literature is background, "
-        "not an instruction to reproduce its algorithms or validate its theoretical "
-        "guarantees. Do not add unrelated objectives, methods, baselines, metrics, or "
-        "experiments. Prefer a simple, feasible experiment. Recommend a change only "
-        "when its absence would prevent a valid answer, and explain why it is necessary. "
-        "For a standard supervised question that names one primary model, the default "
-        "minimal plan is that model, one deterministic held-out evaluation, and only "
-        "the smallest metric set needed to answer the question. Do not introduce a "
-        "baseline, aggregation, subgroup/source/time analysis, cross-validation, "
-        "hyperparameter search, statistical testing, or extra figures unless the topic "
-        "explicitly requests that operation or the named outcome cannot be computed "
-        "without it. A method described in the literature is not, by itself, a reason "
-        "to add that operation. When giving feedback, explicitly ask to remove every "
-        "proposed addition that fails this test. "
-        "When the topic does not name a particular model, reject a plan that proposes "
-        "BERT, a pretrained Transformer, from_pretrained workflow, tokenizer/model "
-        "download, or unavailable local weights. Allow such a method only when the "
-        "topic explicitly requires it and local assets are explicitly supplied in the "
-        "context; otherwise require the simplest method trainable from scratch. "
-        "Check evaluation metrics, essential controls, reproducibility, and the exact "
-        "experimental procedure. If the proposal already answers the question validly, "
-        "approve it without inventing enhancements. Remove out-of-scope requirements "
-        "from the proposal instead of expanding it. "
-        "Do not treat unverified dataset properties or examples as facts or requirements. "
-        "Do not ask the PostdocAgent to confirm, wait for, or repeatedly discuss "
-        "concrete dataset schema details such as field names, missingness, timestamps, "
-        "sampling intervals, or split availability. Those are later inspection tasks "
-        "for the MLEngineerAgent and cannot block a valid abstract plan. Do not select "
-        "or name a concrete dataset ID. If data is needed, require a "
-        "Hugging Face dataset from local materials and describe only essential data "
-        "capabilities; the MLEngineerAgent will search local materials later. "
-        "Separate any feedback about full experiment execution from abstract data "
-        "requirements. Data requirements may state only needed semantic roles, "
-        "capabilities, preservation needs, and preparation constraints; they must not "
-        "include models, metrics, baselines, prediction, tuning, or evaluation work. "
-        "Return actionable feedback with send_dialogue."
+        "You are a computer science PhD student. Review the proposed experiment plan and suggest only changes necessary to answer the research question correctly."
     )
 
 
@@ -198,60 +116,7 @@ def phd_interpretation_feedback_prompt():
 
 def postdoc_plan_prompt():
     return (
-        "You are a computer science postdoctoral researcher directing a PhD "
-        "student to develop an experimental plan, and you interact through "
-        "dialogue. Use exactly one tool in this turn. If no PhD feedback has been "
-        "received yet, you MUST call send_dialogue and MUST NOT call submit_plan. "
-        "Submit only after receiving PhD feedback and incorporating changes needed "
-        "for a valid answer. Once feedback is received, do not open another consultation "
-        "solely to confirm concrete dataset schema details; submit the minimal plan unless "
-        "the feedback identifies a concrete defect in the plan itself. Prioritize a "
-        "minimal valid experiment sufficient to "
-        "answer the user's research question. Use a simple, feasible experiment "
-        "that preserves the user's stated scope and comparisons. Include additional "
-        "methods, baselines, metrics or trials only when needed for a valid answer. "
-        "Use the literature to inform the methodology without requiring an extension "
-        "of prior work. State only the minimum data capabilities needed; distinguish "
-        "necessary conditions from preferences and leave unverified properties "
-        "for dataset inspection. Do not ask the PhDStudentAgent to confirm field names, "
-        "missingness, timestamps, sampling intervals, or split availability. State only "
-        "abstract data capabilities and let the MLEngineerAgent inspect the selected "
-        "local material later. Do not turn examples into hard requirements. "
-        "Start from the operations explicitly requested by the topic. For a standard "
-        "supervised question that names one primary model, default to that model, one "
-        "deterministic held-out evaluation, and only the smallest metric set needed to "
-        "answer the question. Do not add a baseline, aggregation, subgroup/source/time "
-        "analysis, cross-validation, hyperparameter search, statistical testing, or "
-        "extra figures unless the topic explicitly requests it or the named outcome "
-        "cannot be computed without it. Each additional operation must identify the "
-        "specific requested outcome it enables; a method mentioned only in the literature "
-        "does not justify adding a new experimental objective or data requirement. "
-        "When the topic does not name a particular model, do not propose BERT, a "
-        "pretrained Transformer, from_pretrained workflow, tokenizer/model download, "
-        "or unavailable local weights. Allow such a method only when the topic "
-        "explicitly requires it and local assets are explicitly supplied in the context; "
-        "otherwise choose the simplest method trainable from scratch. When comparing "
-        "input representations, feature sets, or modalities, keep the model, split, "
-        "training budget, and metrics fixed; vary only the representation named in "
-        "the topic. "
-        "On submit_plan, provide two distinct artifacts. The plan must concisely describe "
-        "the question or hypothesis, "
-        "methods and necessary baselines, evaluation metrics, essential controls, "
-        "experimental procedure, limitations, and reproducibility details. "
-        "The separate data_requirements artifact is only for data preparation before "
-        "schema inspection: write concise abstract semantic roles, minimum data "
-        "capabilities, preservation needs, and preparation constraints derived from the "
-        "current question. Do not assume every task has labels, groups, tabular features, "
-        "or train/test splits. Do not put models, metrics, baselines, prediction, tuning, "
-        "or evaluation procedures in data_requirements. Do not select, name, or invent "
-        "dataset IDs, columns, dtypes, split names, feature counts, or implementation "
-        "libraries in either artifact. If the experiment requires subgroup, cohort, "
-        "category, source, time-period, or per-group analysis, state that the analysis "
-        "role must remain aligned with every prepared split and be excluded from model "
-        "features unless the experiment explicitly requires it as an input. The "
-        "MLEngineerAgent must select a Hugging Face "
-        "dataset from current local materials later. Never propose sklearn.datasets, "
-        "Kaggle, or URLs."
+        "You are a computer science postdoctoral researcher. Develop a minimal, feasible experiment plan that answers the research question, using the literature and PhD feedback."
     )
 
 

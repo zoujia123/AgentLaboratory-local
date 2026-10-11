@@ -20,7 +20,6 @@ from agent_runtime import AgentRuntime, MAX_IDENTICAL_FAILED_TOOL_CALLS, ToolReg
 from data_preparation import _run_preparation_code
 from execution_diagnostics import python_syntax_error
 from prompts import (
-    LITERATURE_BACKGROUND_LIMITATIONS,
     LITERATURE_RELEVANCE_RULE,
     LITERATURE_RETRY_RELEVANCE_RULE,
     experiment_solver_prompt,
@@ -62,349 +61,173 @@ class BaseResearchAgent:
 class PhDStudentAgent(BaseResearchAgent):
     role = "computer science PhD student"
 
-    # 外层 conduct_literature_review()：管理最多两轮。
     def conduct_literature_review(self, topic):
-        search = ArxivSearch()
-        if search.remaining_candidate_count() == 0: # 当前本地候选池是不是空的
-            raise RuntimeError("No usable local paper candidates are available for this query")
-
-        logger = current_run_logger()
-        for review_round in (1, 2): # 这两轮是顺序执行的，第一轮结束后才可能进入第二轮。
-            logger.info(f"[literature review] SCREENING ROUND START round={review_round}/2")
-            review = self._conduct_literature_review_round(topic, search, review_round)
-            if review is not None:
-                return review
-            logger.info(
-                f"[literature review] SCREENING ROUND END round={review_round}/2 "
-                + ("restarting with broader background relevance" if review_round == 1
-                   else "stopping after the final screening round")
-            )
-        raise RuntimeError(
-            "No relevant local paper was selected after 2 literature-review rounds; "
-            "each round exhausted its candidates or reached the consecutive empty-search limit"
-        )
-
-    # _conduct_literature_review_round()：执行其中一轮。这一轮里可以搜索、阅读、拒绝多篇论文。
-    def _conduct_literature_review_round(self, topic, search, review_round):
-        """
-            Return a review, or None when candidates or productive searches run out.
-            topic 是研究题目，search 是查找和读取本地论文的工具对象，review_round 是当前轮次，取值为 1 或 2。
-        """
+        """Read and optionally add papers in at most two screening rounds."""
         class RoundEnded(Exception):
-            """Internal signal to leave the runtime before its next model request."""
+            """Leave the runtime between tool calls."""
 
-        # Each round gets fresh decisions and a fresh runtime conversation.
-        relevance_rule = (
-            LITERATURE_RETRY_RELEVANCE_RULE if review_round == 2 else LITERATURE_RELEVANCE_RULE
-        )   # 当前轮次使用的论文相关性标准.第一轮普通标准，第二轮宽松标准
-
-        papers = [] # 保存已纳入综述的论文：arxiv_id、摘要、全文。纳入一篇后即可提交。
-        pending_read = {"arxiv_id": None}   # 记录“刚读完、但尚未决定添加还是拒绝”的论文 ID。
-        rejected_papers = set() # 仅在当前筛选轮内排除；第二轮重新创建。
-        candidate_batch = {"query": None, "ids": []}    # ids 是最新一次搜索中尚待处理的候选；决定当前应继续读还是继续搜索。candidate_batch 只代表“最近一次搜到什么”，并不代表整个本地论文库。
-        consecutive_empty_searches = 0  # 连续空搜索次数。
-        max_empty_searches = 3
-
-        def unavailable_paper_ids():
-            return rejected_papers | {item["arxiv_id"] for item in papers}
-
-        def search_arxiv(query):
-            nonlocal consecutive_empty_searches
-            details = search.find_papers(
-                query,
-                excluded_ids=unavailable_paper_ids(),
+        search = ArxivSearch()
+        logger = current_run_logger()
+        for review_round in (1, 4):
+            logger.info(f"[literature review] SCREENING ROUND START round={review_round}/2")
+            relevance_rule = (
+                LITERATURE_RETRY_RELEVANCE_RULE if review_round >= 2 else LITERATURE_RELEVANCE_RULE
             )
-            candidate_batch["query"] = query
-            candidate_batch["ids"] = list(details["candidate_ids"])
-            consecutive_empty_searches = (
-                0 if candidate_batch["ids"] else consecutive_empty_searches + 1
-            )
-            return {
-                "success": True,
-                "results": details["text"],
-                "candidate_ids": list(candidate_batch["ids"]),
-                "candidate_count": len(candidate_batch["ids"]),
-                "remaining_candidate_count": search.remaining_candidate_count(unavailable_paper_ids()),
-                "review_round": review_round,
-                "consecutive_empty_searches": consecutive_empty_searches,
-                "decision_required": bool(candidate_batch["ids"]),
-                "next_action_hint": (
-                    "Read a candidate from this search, then call decide_paper once with the "
-                    "matching arXiv ID and decision 'add' or 'reject'."
-                    if candidate_batch["ids"]
-                    else (
-                        "The consecutive empty-search limit was reached. This screening "
-                        "round will end."
-                        if consecutive_empty_searches >= max_empty_searches else
-                        "No candidates matched this query. Try a different short query "
-                        "about the underlying research background."
-                    )
-                ),
-            }
+            papers = []
+            readed_paper_id = set()  # 本轮已读论文 ID 集合。
+            current_paper_id = None
+            stage = "search"
+            consecutive_empty_searches = 0
+            max_empty_searches = 3
 
-        def read_arxiv_paper(arxiv_id):
-            if any(item["arxiv_id"] == arxiv_id for item in papers):
-                return {
-                    "success": False,
-                    "error": f"Paper {arxiv_id!r} is already included in the review",
-                }
-            if arxiv_id not in candidate_batch["ids"] or arxiv_id in rejected_papers:
-                return {
-                    "success": False,
-                    "error": (
-                        f"Paper {arxiv_id!r} is not an unread candidate from the latest search"
-                    ),
-                    "available_paper_ids": [
-                        item for item in candidate_batch["ids"] if item not in rejected_papers
-                    ],
-                }
-            if pending_read["arxiv_id"] is not None:
-                return {
-                    "success": False,
-                    "error": (
-                        "Resolve the previously read paper with decide_paper "
-                        "before reading another paper"
-                    ),
-                }
-            full_text = search.retrieve_full_paper_text(arxiv_id, MAX_LEN=4000)
-            pending_read["arxiv_id"] = arxiv_id
-            return {
-                "success": True,
-                "arxiv_id": arxiv_id,
-                "full_text": full_text,
-                "decision_required": True,
-                "next_action_hint": (
-                    "Call decide_paper exactly once for this arXiv ID. "
-                    f"{relevance_rule}"
-                ),
-            }
+            def search_arxiv(query):
+                nonlocal consecutive_empty_searches, stage, current_paper_id
 
-        def add_paper(arxiv_id, summary):
-            if pending_read["arxiv_id"] != arxiv_id:
-                return {
-                    "success": False,
-                    "error": (
-                        "Add the currently pending read paper with arXiv ID "
-                        f"{pending_read['arxiv_id']!r}"
-                    ),
-                }
-            full_text = search.get_cached_full_paper_text(arxiv_id)
-            if full_text is None:
-                return {
-                    "success": False,
-                    "error": "Read the paper with read_arxiv_paper before adding it",
-                }
-            if not any(item["arxiv_id"] == arxiv_id for item in papers):
-                papers.append({
-                    "arxiv_id": arxiv_id,
-                    "summary": summary,
-                    "full_text": full_text,
-                })
-            pending_read["arxiv_id"] = None
-            candidate_batch["ids"] = [
-                item for item in candidate_batch["ids"] if item != arxiv_id
-            ]
-            return {
-                "success": True,
-                "paper_count": len(papers),
-                "required_papers": 1,
-                "review_ready": True,
-                "next_action_hint": (
-                    "The required paper count is satisfied. "
-                    "Call submit_literature_review next."
-                ),
-            }
+                details = search.find_papers(query, excluded_ids=readed_paper_id.copy())
+                candidate_ids = details["candidate_ids"]
 
-        def reject_paper(arxiv_id, reason):
-            if pending_read["arxiv_id"] != arxiv_id:
+                if candidate_ids:
+                    current_paper_id = candidate_ids[0]
+                    consecutive_empty_searches = 0
+                    stage = "read"
+                else:
+                    consecutive_empty_searches += 1
+                    if consecutive_empty_searches >= max_empty_searches:
+                        stage = "ended"
                 return {
-                    "success": False,
-                    "error": (
-                        "Reject the currently pending read paper with arXiv ID "
-                        f"{pending_read['arxiv_id']!r}"
-                    ),
+                    "success": True,
+                    "results": details["text"],
+                    "candidate_ids": candidate_ids,
+                    "consecutive_empty_searches": consecutive_empty_searches,
                 }
-            rejected_papers.add(arxiv_id)
-            pending_read["arxiv_id"] = None
-            candidate_batch["ids"] = []  # 拒绝后结束当前批次，下一步必须重新搜索。
-            remaining = search.remaining_candidate_count(unavailable_paper_ids())
-            return {
-                "success": True,
-                "arxiv_id": arxiv_id,
-                "reason": reason,
-                "rejected_paper_count": len(rejected_papers),
-                "remaining_candidate_count": remaining,
-                "review_round": review_round,
-                "next_action_hint": (
-                    "The paper was rejected. Call search_arxiv next to find a new "
-                    "candidate; rejected papers cannot be reread within this screening round."
-                    if remaining else (
-                        "All candidates were rejected. Screening will restart once with "
-                        "broader background relevance."
-                        if review_round == 1 else
-                        "All candidates were rejected in the final screening round. "
-                        "The literature-review stage will stop."
-                    )
-                ),
-            }
 
-        def decide_paper(arxiv_id, decision, explanation):
-            if not isinstance(arxiv_id, str) or not arxiv_id.strip():
-                return {"success": False, "error": "arxiv_id must be a non-empty string"}
-            if not isinstance(decision, str) or decision not in {"add", "reject"}:
-                return {"success": False, "error": "decision must be exactly 'add' or 'reject'"}
-            if not isinstance(explanation, str) or not explanation.strip():
-                return {"success": False, "error": "explanation must be a non-empty string"}
-            if pending_read["arxiv_id"] is None:
-                return {"success": False, "error": "Read a paper before calling decide_paper"}
-            if arxiv_id != pending_read["arxiv_id"]:
-                return {
-                    "success": False,
-                    "error": (
-                        "Decide only the currently read paper with arXiv ID "
-                        f"{pending_read['arxiv_id']!r}"
-                    ),
+            def read_arxiv_paper():
+                nonlocal stage
+                full_text = search.retrieve_full_paper_text(current_paper_id, MAX_LEN=4000)
+                readed_paper_id.add(current_paper_id)
+                stage = "decide"
+                return {"success": True, "arxiv_id": current_paper_id, "full_text": full_text}
+
+            def decide_add(add, summary):
+                nonlocal stage, current_paper_id
+                if add:
+                    full_text = search.get_cached_full_paper_text(current_paper_id)
+                    papers.append({"arxiv_id": current_paper_id, "summary": summary.strip(), "full_text": full_text})
+                    stage = "submit"
+                else:
+                    current_paper_id = None
+                    stage = "search"
+                return {"success": True, "added": add, "paper_count": len(papers)}
+
+            def submit_literature_review(review):
+                return {"success": True, "review": review, "papers": papers}
+
+
+
+            def available_tools():
+                tools_by_stage = {
+                    "search": {"search_arxiv"},
+                    "read": {"read_arxiv_paper"},
+                    "decide": {"decide_add"},
+                    "submit": {"submit_literature_review"},
                 }
-            if decision == "add":
-                return add_paper(arxiv_id, summary=explanation.strip())
-            return reject_paper(arxiv_id, reason=explanation.strip())
+                if stage == "ended":
+                    raise RoundEnded
+                return tools_by_stage[stage]
 
-        def submit_literature_review(review):
-            if not papers:
-                return {
-                    "success": False,
-                    "error": "Add at least 1 reviewed paper(s) first",
-                }
-            return {
-                "success": True,
-                "review": review,
-                "papers": papers,
-            }
-
-        def available_tools():
-            if pending_read["arxiv_id"] is not None:
-                return {"decide_paper"}
-            if papers:
-                return {"submit_literature_review"}
-            if candidate_batch["ids"]:
-                return {"read_arxiv_paper"}
-            remaining = search.remaining_candidate_count(unavailable_paper_ids())   
-            if remaining == 0 or consecutive_empty_searches >= max_empty_searches:  # 本轮没有剩余候选。连续空搜索达到上限，这里的 max_empty_searches = 3。
-                reason = "candidates_exhausted" if remaining == 0 else "empty_search_limit"
-                current_run_logger().info(
-                    f"[literature review] SCREENING ROUND STOP round={review_round}/2 "
-                    f"reason={reason} remaining_candidates={remaining} "
-                    f"consecutive_empty_searches={consecutive_empty_searches}"
-                )
-                # Raise outside a tool handler so ToolRegistry cannot turn exhaustion
-                # into a recoverable tool failure and send the model back to search.
-                raise RoundEnded
-            return {"search_arxiv"}
-
-        registry = ToolRegistry()
-        registry.register(
-            "search_arxiv",
-            (
-                "Search local arXiv papers for query. Return candidate IDs and search "
-                "results, excluding papers already added or rejected in this screening round."
-            ),
-            _object_schema(
+            registry = ToolRegistry()
+            registry.register(
+                "search_arxiv",
+                "Search local arXiv papers with a short query",
                 {
-                    "query": _string(
-                        "Write a short English query about the underlying research "
-                        "task or relevant methods; avoid requiring every experimental detail."
-                    ),
-                },
-                ["query"],
-            ),
-            search_arxiv,
-        ).register(
-            "read_arxiv_paper",
-            (
-                "Read one unreviewed candidate from the latest search_arxiv result. "
-                "Rejected papers cannot be read again within the same screening round. Then "
-                "call decide_paper once for the same arxiv_id."
-            ),
-            _object_schema(
-                {"arxiv_id": _string("Use the exact candidate ID returned by the latest search_arxiv call.")},
-                ["arxiv_id"],
-            ),
-            read_arxiv_paper,
-        ).register(
-            "decide_paper",
-            (
-                "Make exactly one decision for the paper just read. "
-                f"{relevance_rule} "
-                f"{LITERATURE_BACKGROUND_LIMITATIONS} "
-                "Do not infer that the paper lacks a method or analysis merely "
-                "because it is absent from a truncated excerpt."
-            ),
-            _object_schema(
-                {
-                    "arxiv_id": _string("Use the exact ID of the paper just read."),
-                    "decision": {
-                        "type": "string",
-                        "enum": ["add", "reject"],
-                        "description": "Choose exactly one: add the paper or reject it.",
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Short query about the research task or methods."
+                        }
                     },
-                    "explanation": _string(
-                        "For add, first identify the shared research background, "
-                        "transferable method, or direct evidence, then summarize "
-                        "supported findings and limitations. Background relevance "
-                        "does not require evidence for this experiment's outcome. "
-                        "For reject, explain why the current round's relevance "
-                        "criteria do not apply."
-                    ),
+                    "required": ["query"]
                 },
-                ["arxiv_id", "decision", "explanation"],
-            ),
-            decide_paper,
-        ).register(
-            "submit_literature_review",
-            (
-                "Write the complete English literature review in review and submit it. "
-                "Add at least one read paper first; this completes the literature-review stage."
-            ),
-            _object_schema(
-                {"review": _string("Write the complete review, connecting the included papers to the research topic.")},
-                ["review"],
-            ),
-            submit_literature_review,
-        )
-        try:
-            result = self.runtime("literature review").run(
-                system_prompt=literature_review_prompt(review_round=review_round),
-                user_prompt=(
-                    f"Research topic: {topic}\n"
-                    f"Screening round: {review_round}/2.\n"
-                    "For literature selection, matching the underlying research "
-                    "background is sufficient; matching every experimental detail "
-                    "is unnecessary.\n"
-                    "Required papers for this review: 1."
-                ),
-                registry=registry,
-                terminal_tools={"submit_literature_review"},
-                tool_names_provider=available_tools,
+                search_arxiv,
+            ).register(
+                "read_arxiv_paper",
+                "Read the full text of the single paper selected by the latest search. ",
+                {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                },
+                read_arxiv_paper,
+            ).register(
+                "decide_add",
+                f"Decide whether to include the paper just read. {relevance_rule}",
+                {
+                    "type": "object",
+                    "properties": {
+                        "add": {
+                            "type": "boolean",
+                            "description": "Whether to include the current paper."
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "When add=true, summarize relevance, methods, findings, and limitations from the provided text. When add=False, use an empty string."
+                        }
+                    },
+                    "required": ["add","summary"]
+                },
+                decide_add,
+            ).register(
+                "submit_literature_review",
+                "Submit the complete English literature review to finish this stage.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "review": {
+                            "type": "string",
+                            "description": "Review connecting the selected paper to the research topic."
+                        }
+                    },
+                    "required": ["review"]
+                },
+                submit_literature_review,
             )
-        except RoundEnded:
-            return None
-        return result.value
+            try:
+                result = self.runtime("literature review").run(
+                    system_prompt=literature_review_prompt(),
+                    user_prompt=f"Research topic: {topic}\nScreening round: {review_round}/2.",
+                    registry=registry,
+                    terminal_tools={"submit_literature_review"},
+                    tool_names_provider=available_tools,
+                )
+            except RoundEnded:
+                logger.info(f"[literature review] SCREENING ROUND END round={review_round}/2")
+                continue
+            return result.value
 
     def plan_feedback(self, topic, literature_review, postdoc_message):
         registry = ToolRegistry().register(
             "send_dialogue",
-            "Write concise planning feedback in message and send it to PostdocAgent.",
-            _object_schema(
-                {"message": _string("Write feedback or corrections for the proposed experimental plan.")},
-                ["message"],
-            ),
+            "Review whether the proposed plan answers the research question. Request necessary corrections only, or approve it if sufficient.",
+            {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Give concise feedback to PostdocAgent; preserve the requested scope and use literature as background, not a requirement to reproduce its methods."
+                    }
+                },
+                "required": [
+                    "message"
+                ]
+            },
             lambda message: {"success": True, "message": message},
         )
         return self.runtime("plan formulation").run_one(
             system_prompt=phd_plan_feedback_prompt(),
             user_prompt=(
-                f"Topic: {topic}\nLiterature review: {literature_review}\n"
-                f"Postdoc message: {postdoc_message}"
+                f"Research topic: {topic}\nLiterature review: {literature_review}\n"
+                f"Proposed plan: {postdoc_message}"
             ),
             registry=registry,
         ).value["message"]
@@ -454,26 +277,22 @@ class PhDStudentAgent(BaseResearchAgent):
 
 
 class PostdocAgent(BaseResearchAgent):
+
     role = "computer science postdoctoral researcher"
 
     def plan_turn(self, topic, literature_review, dialogue):
-        feedback_received = isinstance(dialogue, str) and bool(dialogue.strip())
+        feedback_received = bool(dialogue.strip())
 
-        def submit_plan(plan, data_requirements):
-            if not feedback_received:
+        def submit_plan(experiment_plan, data_plan):
+            if not experiment_plan.strip() or not data_plan.strip():
                 return {
                     "success": False,
-                    "error": "Receive PhD feedback before submitting the plan",
-                }
-            if not str(plan).strip() or not str(data_requirements).strip():
-                return {
-                    "success": False,
-                    "error": "Both plan and data_requirements must be non-empty",
+                    "error": "Provide a non-empty experiment_plan and data_plan.",
                 }
             return {
                 "success": True,
-                "plan": plan,
-                "data_requirements": data_requirements,
+                "plan": experiment_plan,
+                "data_requirements": data_plan,
             }
 
         def available_tools():
@@ -484,39 +303,49 @@ class PostdocAgent(BaseResearchAgent):
         registry = ToolRegistry().register(
             "send_dialogue",
             (
-                "Write a proposed plan or focused question in message for PhDStudentAgent. "
-                "Request feedback before submitting the plan."
+                "Draft an experiment plan and send it to PhDStudentAgent for review."
             ),
-            _object_schema(
-                {"message": _string("Write the proposed plan or planning question for PhDStudentAgent.")},
-                ["message"],
-            ),
+            {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Describe a minimal, feasible plan preserving the requested model, comparisons, and evaluation conditions; use literature as background rather than expanding the task."
+                    }
+                },
+                "required": [
+                    "message"
+                ]
+            },
             lambda message: {"success": True, "message": message},
         ).register(
             "submit_plan",
             (
-                "Write the final experiment plan in plan and separate data-preparation "
-                "needs in data_requirements. Submit after PhD feedback; leave concrete "
-                "dataset selection to the engineers."
+                "Submit the final experiment plan and its data-preparation plan."
             ),
-            _object_schema(
-                {
-                    "plan": _string("Write the complete English experiment plan for MLESolverAgent."),
-                    "data_requirements": _string(
-                        "Write abstract data requirements only; omit dataset IDs and "
-                        "schema-dependent field names."
-                    ),
+            {
+                "type": "object",
+                "properties": {
+                    "experiment_plan": {
+                        "type": "string",
+                        "description": "Describe the minimal experiment in English: question, methods, controls, evaluation, steps, and reproducibility; preserve the requested model and comparisons."
+                    },
+                    "data_plan": {
+                        "type": "string",
+                        "description": "Describe the required local data and preparation steps, excluding modeling and evaluation. Omit dataset IDs and schema-dependent field names."
+                    }
                 },
-                ["plan", "data_requirements"],
-            ),
+                "required": [
+                    "experiment_plan",
+                    "data_plan"
+                ]
+            },
             submit_plan,
         )
         return self.runtime("plan formulation").run(
             system_prompt=postdoc_plan_prompt(),
             user_prompt=(
-                f"Topic: {topic}\nLiterature review: {literature_review}\n"
-                f"Planning consultation status: "
-                f"{'feedback_received' if feedback_received else 'consultation_required'}\n"
+                f"Research topic: {topic}\nLiterature review: {literature_review}\n"
                 f"Latest PhD feedback: {dialogue if feedback_received else 'None'}"
             ),
             registry=registry,

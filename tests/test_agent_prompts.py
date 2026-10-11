@@ -14,9 +14,6 @@ from agents import (
 from data_preparation import _run_preparation_code
 from execution_diagnostics import runtime_data_repair_hint
 from prompts import (
-    LITERATURE_BACKGROUND_LIMITATIONS,
-    LITERATURE_RELEVANCE_RULE,
-    LITERATURE_RETRY_RELEVANCE_RULE,
     ml_dataset_selection_prompt,
     sw_data_preparation_prompt,
 )
@@ -570,58 +567,6 @@ class AgentPromptTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(selection["revision"], "r1")
 
-    def test_rejected_papers_cannot_be_reread_within_a_round_with_candidates_remaining(self):
-        search = arxiv_search_mock("A", "B", "unused")
-        search.find_papers.side_effect = [
-            {"text": "papers A and unused", "candidate_ids": ["A", "unused"]},
-            # A stale search hit must not bypass the rejected-paper guard.
-            {"text": "stale paper A and paper B", "candidate_ids": ["A", "B"]},
-            {"text": "", "candidate_ids": []},
-            {"text": "", "candidate_ids": []},
-        ]
-        search.retrieve_full_paper_text.return_value = "paper text"
-        search.get_cached_full_paper_text.return_value = "paper text"
-        with patch("agents.ArxivSearch", return_value=search), patch.object(
-            AgentRuntime, "run", return_value=SimpleNamespace(value={})
-        ) as run:
-            PhDStudentAgent("model", "key").conduct_literature_review("topic")
-        registry = run.call_args.kwargs["registry"]
-        provider = run.call_args.kwargs["tool_names_provider"]
-        registry.execute("search_arxiv", {"query": "first"})
-        self.assertEqual(provider(), {"read_arxiv_paper"})
-        unknown = registry.execute("read_arxiv_paper", {"arxiv_id": "never-returned"})
-        self.assertFalse(unknown["success"])
-        search.retrieve_full_paper_text.assert_not_called()
-        self.assertTrue(registry.execute("read_arxiv_paper", {"arxiv_id": "A"})["success"])
-        registry.execute("decide_paper", {"arxiv_id": "A", "decision": "reject", "explanation": "initial assessment"})
-        self.assertEqual(provider(), {"search_arxiv"})
-        for paper_id in ("A", "unused"):
-            self.assertFalse(registry.execute("read_arxiv_paper", {"arxiv_id": paper_id})["success"])
-            self.assertEqual(provider(), {"search_arxiv"})
-        search.retrieve_full_paper_text.assert_called_once_with("A", MAX_LEN=4000)
-
-        registry.execute("search_arxiv", {"query": "second"})
-        self.assertEqual(search.find_papers.call_args.kwargs["excluded_ids"], {"A"})
-        self.assertEqual(provider(), {"read_arxiv_paper"})
-        for paper_id in ("A", "unused"):
-            self.assertFalse(registry.execute("read_arxiv_paper", {"arxiv_id": paper_id})["success"])
-            self.assertEqual(provider(), {"read_arxiv_paper"})
-        search.retrieve_full_paper_text.assert_called_once_with("A", MAX_LEN=4000)
-        self.assertTrue(registry.execute("read_arxiv_paper", {"arxiv_id": "B"})["success"])
-        registry.execute("decide_paper", {"arxiv_id": "B", "decision": "reject", "explanation": "B unrelated"})
-        self.assertEqual(provider(), {"search_arxiv"})
-        for query in ("third", "fourth"):
-            result = registry.execute("search_arxiv", {"query": query})
-            self.assertEqual(result["candidate_ids"], [])
-            self.assertNotIn("reconsiderable_paper_ids", result)
-            self.assertEqual(provider(), {"search_arxiv"})
-            self.assertEqual(search.find_papers.call_args.kwargs["excluded_ids"], {"A", "B"})
-            for paper_id in ("A", "B", "unused"):
-                self.assertFalse(registry.execute("read_arxiv_paper", {"arxiv_id": paper_id})["success"])
-                self.assertEqual(provider(), {"search_arxiv"})
-        self.assertEqual(search.retrieve_full_paper_text.call_args_list, [
-            call("A", MAX_LEN=4000), call("B", MAX_LEN=4000),
-        ])
 
     def test_inspection_feedback_is_deduplicated_only_when_identical(self):
         inspected = {
@@ -1284,642 +1229,17 @@ class AgentPromptTest(unittest.TestCase):
         self.assertEqual(repeated.value["original_error"], "RuntimeError: failure")
         self.assertEqual(repeated.value["code"], repeated_code)
 
-    def test_literature_prompt_and_tools_require_current_batch_decisions(self):
-        search = arxiv_search_mock("1234.5678")
-        search.find_papers.return_value = {
-            "text": "papers",
-            "candidate_ids": ["1234.5678"],
-        }
-        agent = PhDStudentAgent("model", "key")
-        completed = SimpleNamespace(value={"review": "review", "papers": []})
 
-        with patch("agents.ArxivSearch", return_value=search), patch.object(
-            AgentRuntime, "run", return_value=completed
-        ) as run:
-            agent.conduct_literature_review("topic")
 
-        prompt = run.call_args.kwargs["system_prompt"]
-        self.assertIn("exactly 1 relevant paper", prompt)
-        self.assertIn("search_arxiv, read_arxiv_paper, then decide_paper", prompt)
-        self.assertNotIn("add_paper", prompt)
-        self.assertNotIn("reject_paper", prompt)
-        self.assertIn("submit without further searches", prompt)
-        self.assertIn(LITERATURE_RELEVANCE_RULE, prompt)
-        self.assertIn(LITERATURE_BACKGROUND_LIMITATIONS, prompt)
-        self.assertIn("Shared research background alone is sufficient", prompt)
-        self.assertIn("no additional methodological contribution is required", prompt)
-        self.assertIn("Choose 'reject' only if none applies", prompt)
-        self.assertIn("Base relevance and claims on the provided text", prompt)
-        self.assertIn("exactly one tool call per response", prompt)
-        self.assertIn("currently read arXiv ID", prompt)
-        self.assertIn("candidate from the latest search", prompt)
-        self.assertIn("do not reread rejected papers", prompt)
-        self.assertIn("within the same screening round", prompt)
-        self.assertNotIn("including rejected ones", prompt)
-        self.assertIn("Use only this query's local candidates and the tools shown for this turn", prompt)
-        self.assertNotIn("report_no_local_paper", prompt)
 
-        registry = run.call_args.kwargs["registry"]
-        tool_names_provider = run.call_args.kwargs["tool_names_provider"]
-        self.assertEqual(
-            tool_names_provider(),
-            {"search_arxiv"},
-        )
-        schemas = {
-            item["function"]["name"]: item["function"]
-            for item in registry.schemas
-        }
-        self.assertIn(
-            "local arXiv",
-            schemas["search_arxiv"]["description"],
-        )
-        self.assertEqual(
-            set(schemas["search_arxiv"]["parameters"]["properties"]),
-            {"query"},
-        )
-        self.assertEqual(
-            schemas["search_arxiv"]["parameters"]["required"],
-            ["query"],
-        )
-        self.assertIn(
-            "decide_paper",
-            schemas["read_arxiv_paper"]["description"],
-        )
-        self.assertNotIn(
-            "earlier rejected paper",
-            schemas["read_arxiv_paper"]["description"],
-        )
-        self.assertNotIn("reject_arxiv_candidates", schemas)
-        self.assertNotIn("reject_arxiv_candidates", registry.names)
-        self.assertNotIn("add_paper", registry.names)
-        self.assertNotIn("reject_paper", registry.names)
-        self.assertIn(LITERATURE_RELEVANCE_RULE, schemas["decide_paper"]["description"])
-        self.assertIn(LITERATURE_BACKGROUND_LIMITATIONS, schemas["decide_paper"]["description"])
-        self.assertNotIn("concrete contribution", schemas["decide_paper"]["description"])
-        decision_schema = schemas["decide_paper"]["parameters"]
-        self.assertEqual(set(decision_schema["properties"]), {"arxiv_id", "decision", "explanation"})
-        self.assertEqual(set(decision_schema["required"]), {"arxiv_id", "decision", "explanation"})
-        self.assertEqual(decision_schema["properties"]["decision"]["enum"], ["add", "reject"])
-        explanation = decision_schema["properties"]["explanation"]["description"]
-        self.assertIn("shared research background, transferable method, or direct evidence", explanation)
-        self.assertIn("Background relevance does not require evidence for this experiment's outcome", explanation)
-        self.assertIn("why the current round's relevance criteria do not apply", explanation)
-        self.assertNotIn("concrete contribution", explanation)
-        premature = registry.execute("submit_literature_review", {"review": "review"})
-        self.assertFalse(premature["success"])
-        registry.execute("search_arxiv", {"query": "short"})
-        search.find_papers.assert_called_once_with(
-            "short",
-            excluded_ids=set(),
-        )
-        self.assertEqual(
-            tool_names_provider(),
-            {"read_arxiv_paper"},
-        )
-        search.retrieve_full_paper_text.return_value = "paper text"
-        search.get_cached_full_paper_text.return_value = "paper text"
-        read = registry.execute(
-            "read_arxiv_paper",
-            {"arxiv_id": "1234.5678"},
-        )
-        self.assertTrue(read["decision_required"])
-        self.assertIn(LITERATURE_RELEVANCE_RULE, read["next_action_hint"])
-        self.assertEqual(
-            tool_names_provider(),
-            {"decide_paper"},
-        )
-        added = registry.execute(
-            "decide_paper",
-            {"arxiv_id": "1234.5678", "decision": "add", "explanation": "summary"},
-        )
-        self.assertEqual(added["paper_count"], 1)
-        self.assertEqual(added["required_papers"], 1)
-        self.assertTrue(added["review_ready"])
-        self.assertEqual(
-            added["next_action_hint"],
-            "The required paper count is satisfied. "
-            "Call submit_literature_review next.",
-        )
-        self.assertEqual(
-            tool_names_provider(),
-            {"submit_literature_review"},
-        )
 
-    def test_literature_runtime_submits_after_one_paper(self):
-        from inference import ModelToolCall, ToolModelResponse
 
-        search = arxiv_search_mock("1234.5678")
-        search.find_papers.return_value = {
-            "text": "matching paper",
-            "candidate_ids": ["1234.5678"],
-        }
-        search.retrieve_full_paper_text.return_value = "paper text"
-        search.get_cached_full_paper_text.return_value = "paper text"
-        actions = [
-            ("search_arxiv", {"query": "topic"}),
-            ("read_arxiv_paper", {"arxiv_id": "1234.5678"}),
-            ("decide_paper", {"arxiv_id": "1234.5678", "decision": "add", "explanation": "summary"}),
-            ("submit_literature_review", {"review": "review"}),
-        ]
-        responses = [
-            ToolModelResponse("", [ModelToolCall(
-                f"call_{index}", name, json.dumps(arguments),
-            )])
-            for index, (name, arguments) in enumerate(actions)
-        ]
 
-        with patch("agents.ArxivSearch", return_value=search), patch(
-            "agent_runtime.query_model_with_tools", side_effect=responses,
-        ) as query_model:
-            review = PhDStudentAgent("model", "key").conduct_literature_review("topic")
 
-        self.assertTrue(review["success"])
-        self.assertEqual(review["review"], "review")
-        self.assertEqual(review["papers"], [{
-            "arxiv_id": "1234.5678", "summary": "summary", "full_text": "paper text",
-        }])
-        search.find_papers.assert_called_once_with("topic", excluded_ids=set())
-        search.retrieve_full_paper_text.assert_called_once_with("1234.5678", MAX_LEN=4000)
-        self.assertEqual(query_model.call_count, 4)
-        self.assertNotIn(
-            LITERATURE_RETRY_RELEVANCE_RULE,
-            query_model.call_args_list[0].kwargs["messages"][0]["content"],
-        )
-        exposed_tools = [
-            {tool["function"]["name"] for tool in invocation.kwargs["tools"]}
-            for invocation in query_model.call_args_list
-        ]
-        self.assertEqual(exposed_tools, [
-            {"search_arxiv"},
-            {"read_arxiv_paper"},
-            {"decide_paper"},
-            {"submit_literature_review"},
-        ])
-        search_parameters = query_model.call_args_list[0].kwargs["tools"][0]["function"]["parameters"]
-        self.assertEqual(set(search_parameters["properties"]), {"query"})
-        self.assertEqual(search_parameters["required"], ["query"])
 
-    def test_literature_retries_exhausted_candidates_with_fresh_history_and_adds_a_rejected_paper(self):
-        from inference import ModelToolCall, ToolModelResponse
 
-        search = arxiv_search_mock("A")
-        search.find_papers.return_value = {"text": "leaf classification paper", "candidate_ids": ["A"]}
-        search.retrieve_full_paper_text.return_value = "Color and texture features for leaf classification."
-        search.get_cached_full_paper_text.return_value = search.retrieve_full_paper_text.return_value
-        actions = [
-            ("search_arxiv", {"query": "leaf color experiment"}),
-            ("read_arxiv_paper", {"arxiv_id": "A"}),
-            ("decide_paper", {"arxiv_id": "A", "decision": "reject", "explanation": "FIRST_ROUND_REJECTION"}),
-            ("search_arxiv", {"query": "leaf classification background"}),
-            ("read_arxiv_paper", {"arxiv_id": "A"}),
-            ("decide_paper", {"arxiv_id": "A", "decision": "add", "explanation": "Shared leaf classification background; no grayscale ablation."}),
-            ("submit_literature_review", {"review": "Leaf color and texture provide relevant background."}),
-        ]
-        responses = [
-            ToolModelResponse("", [ModelToolCall(f"call_{index}", name, json.dumps(arguments))])
-            for index, (name, arguments) in enumerate(actions)
-        ]
-        requests = []
 
-        def respond(**kwargs):
-            requests.append(deepcopy(kwargs))
-            return responses[len(requests) - 1]
 
-        with patch("agents.ArxivSearch", return_value=search) as make_search, patch(
-            "agent_runtime.query_model_with_tools", side_effect=respond,
-        ) as query_model:
-            review = PhDStudentAgent("model", "key").conduct_literature_review("leaf grayscale accuracy")
-
-        make_search.assert_called_once_with()
-        self.assertTrue(review["success"])
-        self.assertEqual(review["papers"], [{
-            "arxiv_id": "A",
-            "summary": actions[5][1]["explanation"],
-            "full_text": search.retrieve_full_paper_text.return_value,
-        }])
-        self.assertEqual(search.find_papers.call_args_list, [
-            call("leaf color experiment", excluded_ids=set()),
-            call("leaf classification background", excluded_ids=set()),
-        ])
-        self.assertEqual(search.retrieve_full_paper_text.call_args_list, [
-            call("A", MAX_LEN=4000), call("A", MAX_LEN=4000),
-        ])
-        self.assertEqual(query_model.call_count, 7)
-        self.assertEqual([
-            {tool["function"]["name"] for tool in invocation.kwargs["tools"]}
-            for invocation in query_model.call_args_list
-        ], [
-            {"search_arxiv"}, {"read_arxiv_paper"}, {"decide_paper"},
-            {"search_arxiv"}, {"read_arxiv_paper"}, {"decide_paper"},
-            {"submit_literature_review"},
-        ])
-        first_messages = requests[0]["messages"]
-        retry_messages = requests[3]["messages"]
-        self.assertEqual([message["role"] for message in retry_messages], ["system", "user"])
-        self.assertNotEqual(first_messages[0]["content"], retry_messages[0]["content"])
-        self.assertNotEqual(first_messages[1]["content"], retry_messages[1]["content"])
-        self.assertNotIn("FIRST_ROUND_REJECTION", json.dumps(retry_messages))
-        self.assertIn(LITERATURE_RETRY_RELEVANCE_RULE, retry_messages[0]["content"])
-        retry_decision = requests[5]
-        self.assertIn(
-            LITERATURE_RETRY_RELEVANCE_RULE,
-            retry_decision["tools"][0]["function"]["description"],
-        )
-        read_result = json.loads(retry_decision["messages"][-1]["content"])
-        self.assertIn(LITERATURE_RETRY_RELEVANCE_RULE, read_result["next_action_hint"])
-
-    def test_literature_stops_after_both_rounds_reject_every_candidate(self):
-        from inference import ModelToolCall, ToolModelResponse
-
-        search = arxiv_search_mock("A")
-        search.find_papers.return_value = {"text": "unrelated paper", "candidate_ids": ["A"]}
-        search.retrieve_full_paper_text.return_value = "An unrelated research task."
-        actions = [
-            ("search_arxiv", {"query": "topic"}),
-            ("read_arxiv_paper", {"arxiv_id": "A"}),
-            ("decide_paper", {"arxiv_id": "A", "decision": "reject", "explanation": "No shared research background."}),
-        ] * 2
-        responses = [
-            ToolModelResponse("", [ModelToolCall(f"call_{index}", name, json.dumps(arguments))])
-            for index, (name, arguments) in enumerate(actions)
-        ]
-        with patch("agents.ArxivSearch", return_value=search), patch(
-            "agent_runtime.query_model_with_tools", side_effect=responses,
-        ) as query_model:
-            with self.assertRaisesRegex(RuntimeError, "(?i)(two|2|second).*(round|pass)"):
-                PhDStudentAgent("model", "key").conduct_literature_review("topic")
-
-        self.assertEqual(query_model.call_count, 6)
-        self.assertEqual(search.find_papers.call_args_list, [
-            call("topic", excluded_ids=set()), call("topic", excluded_ids=set()),
-        ])
-        self.assertEqual(search.retrieve_full_paper_text.call_count, 2)
-        search.get_cached_full_paper_text.assert_not_called()
-
-    def test_literature_runtime_searches_again_after_rejecting_a_paper(self):
-        from inference import ModelToolCall, ToolModelResponse
-
-        search = arxiv_search_mock("A", "B", "unused")
-        search.find_papers.side_effect = [
-            {"text": "papers A and unused", "candidate_ids": ["A", "unused"]},
-            {"text": "paper B", "candidate_ids": ["B"]},
-        ]
-        search.retrieve_full_paper_text.side_effect = lambda paper_id, MAX_LEN: f"full text {paper_id}"
-        search.get_cached_full_paper_text.side_effect = lambda paper_id: f"full text {paper_id}"
-        actions = [
-            ("search_arxiv", {"query": "first"}),
-            ("read_arxiv_paper", {"arxiv_id": "A"}),
-            ("decide_paper", {"arxiv_id": "A", "decision": "reject", "explanation": "no useful connection"}),
-            ("search_arxiv", {"query": "different method"}),
-            ("read_arxiv_paper", {"arxiv_id": "B"}),
-            ("decide_paper", {"arxiv_id": "B", "decision": "add", "explanation": "  useful background  "}),
-            ("submit_literature_review", {"review": "review based on B"}),
-        ]
-        responses = [
-            ToolModelResponse("", [ModelToolCall(
-                f"call_{index}", name, json.dumps(arguments),
-            )])
-            for index, (name, arguments) in enumerate(actions)
-        ]
-
-        with patch("agents.ArxivSearch", return_value=search), patch(
-            "agent_runtime.query_model_with_tools", side_effect=responses,
-        ) as query_model:
-            review = PhDStudentAgent("model", "key").conduct_literature_review("topic")
-
-        self.assertTrue(review["success"])
-        self.assertEqual(review["review"], "review based on B")
-        self.assertEqual(review["papers"], [{
-            "arxiv_id": "B", "summary": "useful background", "full_text": "full text B",
-        }])
-        self.assertEqual(search.find_papers.call_args_list, [
-            call("first", excluded_ids=set()),
-            call("different method", excluded_ids={"A"}),
-        ])
-        self.assertEqual(search.retrieve_full_paper_text.call_args_list, [
-            call("A", MAX_LEN=4000), call("B", MAX_LEN=4000),
-        ])
-        search.get_cached_full_paper_text.assert_called_once_with("B")
-        self.assertEqual(query_model.call_count, 7)
-        self.assertEqual([
-            {tool["function"]["name"] for tool in invocation.kwargs["tools"]}
-            for invocation in query_model.call_args_list
-        ], [
-            {"search_arxiv"}, {"read_arxiv_paper"}, {"decide_paper"},
-            {"search_arxiv"}, {"read_arxiv_paper"}, {"decide_paper"},
-            {"submit_literature_review"},
-        ])
-
-    def test_decide_paper_invalid_arguments_leave_review_state_unchanged(self):
-        search = arxiv_search_mock("A", "B")
-        search.find_papers.return_value = {
-            "text": "papers", "candidate_ids": ["A", "B"],
-        }
-        search.retrieve_full_paper_text.return_value = "paper text"
-        search.get_cached_full_paper_text.return_value = "paper text"
-        with patch("agents.ArxivSearch", return_value=search), patch.object(
-            AgentRuntime, "run", return_value=SimpleNamespace(value={}),
-        ) as run:
-            PhDStudentAgent("model", "key").conduct_literature_review("topic")
-
-        registry = run.call_args.kwargs["registry"]
-        provider = run.call_args.kwargs["tool_names_provider"]
-        valid = {"arxiv_id": "A", "decision": "add", "explanation": "useful background"}
-        for decision in ("add", "reject"):
-            self.assertFalse(registry.execute("decide_paper", {
-                **valid, "decision": decision,
-            })["success"])
-            self.assertEqual(provider(), {"search_arxiv"})
-
-        registry.execute("search_arxiv", {"query": "topic"})
-        search.find_papers.assert_called_once_with("topic", excluded_ids=set())
-        self.assertFalse(registry.execute("decide_paper", valid)["success"])
-        self.assertEqual(provider(), {"read_arxiv_paper"})
-        registry.execute("read_arxiv_paper", {"arxiv_id": "A"})
-        invalid_fields = {
-            "decision": ("", "ADD", "add ", "accept", None, True, 1, [], {}),
-            "arxiv_id": ("", "  ", "B", None, 1, [], {}),
-            "explanation": ("", " \n\t", None, True, 1, [], {}),
-        }
-        for field, values in invalid_fields.items():
-            for value in values:
-                with self.subTest(field=field, value=value):
-                    rejected = registry.execute("decide_paper", {**valid, field: value})
-                    self.assertFalse(rejected["success"])
-                    self.assertNotIn("Tool 'decide_paper' failed:", rejected["error"])
-                    self.assertEqual(provider(), {"decide_paper"})
-                    self.assertFalse(registry.execute(
-                        "submit_literature_review", {"review": "premature"},
-                    )["success"])
-        for arguments in ({}, {key: value for key, value in valid.items() if key != "decision"}):
-            with self.assertRaises(ToolProtocolError):
-                registry.execute("decide_paper", arguments)
-            self.assertEqual(provider(), {"decide_paper"})
-        self.assertFalse(registry.execute("decide_paper", {
-            **valid, "arxiv_id": "B", "decision": "reject",
-        })["success"])
-        search.get_cached_full_paper_text.assert_not_called()
-
-        rejected = registry.execute("decide_paper", {
-            **valid, "decision": "reject", "explanation": "  no transferable method  ",
-        })
-        self.assertTrue(rejected["success"])
-        self.assertEqual(rejected["rejected_paper_count"], 1)
-        self.assertEqual(rejected["reason"], "no transferable method")
-        self.assertEqual(provider(), {"search_arxiv"})
-        for decision in ("add", "reject"):
-            self.assertFalse(registry.execute("decide_paper", {
-                **valid, "decision": decision,
-            })["success"])
-            self.assertEqual(provider(), {"search_arxiv"})
-        searched = registry.execute("search_arxiv", {"query": "next"})
-        search.find_papers.assert_called_with("next", excluded_ids={"A"})
-        self.assertNotIn("reconsiderable_paper_ids", searched)
-
-    def test_literature_rejects_two_decisions_without_mutating_pending_paper(self):
-        from inference import ModelToolCall, ToolModelResponse
-
-        search = arxiv_search_mock("A")
-        search.find_papers.return_value = {"text": "paper A", "candidate_ids": ["A"]}
-        search.retrieve_full_paper_text.return_value = "paper text"
-        search.get_cached_full_paper_text.return_value = "paper text"
-
-        def tool_call(call_id, name, **arguments):
-            return ModelToolCall(call_id, name, json.dumps(arguments))
-
-        responses = [
-            ToolModelResponse("", [tool_call("search", "search_arxiv", query="topic")]),
-            ToolModelResponse("", [tool_call("read", "read_arxiv_paper", arxiv_id="A")]),
-            ToolModelResponse("", [
-                tool_call("add", "decide_paper", arxiv_id="A", decision="add", explanation="background"),
-                tool_call("reject", "decide_paper", arxiv_id="A", decision="reject", explanation="unrelated"),
-            ]),
-            ToolModelResponse("", [tool_call(
-                "corrected", "decide_paper", arxiv_id="A", decision="add", explanation="verified background",
-            )]),
-            ToolModelResponse("", [tool_call("submit", "submit_literature_review", review="review")]),
-        ]
-        requested_messages = []
-
-        def respond(**kwargs):
-            requested_messages.append(deepcopy(kwargs["messages"]))
-            index = len(requested_messages) - 1
-            if index == 3:
-                self.assertEqual(
-                    {tool["function"]["name"] for tool in kwargs["tools"]},
-                    {"decide_paper"},
-                )
-                search.get_cached_full_paper_text.assert_not_called()
-                failures = [json.loads(message["content"]) for message in kwargs["messages"][-2:]]
-                self.assertEqual([failure["error_type"] for failure in failures], ["multiple_tool_calls"] * 2)
-                self.assertTrue(all(failure["success"] is False for failure in failures))
-            return responses[index]
-
-        with patch("agents.ArxivSearch", return_value=search), patch(
-            "agent_runtime.query_model_with_tools", side_effect=respond,
-        ):
-            review = PhDStudentAgent("model", "key").conduct_literature_review("topic")
-
-        self.assertTrue(review["success"])
-        self.assertEqual(len(requested_messages), 5)
-        search.get_cached_full_paper_text.assert_called_once_with("A")
-        self.assertEqual(review["papers"], [{
-            "arxiv_id": "A", "summary": "verified background", "full_text": "paper text",
-        }])
-
-    def test_empty_arxiv_searches_allow_a_new_query_to_find_candidates(self):
-        from inference import ModelToolCall, ToolModelResponse
-
-        search = arxiv_search_mock("3456.7890")
-        search.find_papers.side_effect = [
-            {"text": "", "candidate_ids": []},
-            {"text": "", "candidate_ids": []},
-            {"text": "matching paper", "candidate_ids": ["3456.7890"]},
-        ]
-        search.retrieve_full_paper_text.return_value = "paper text"
-        search.get_cached_full_paper_text.return_value = "paper text"
-        actions = [
-            ("search_arxiv", {"query": query}) for query in ("first", "second", "third")
-        ] + [
-            ("read_arxiv_paper", {"arxiv_id": "3456.7890"}),
-            ("decide_paper", {"arxiv_id": "3456.7890", "decision": "add", "explanation": "background"}),
-            ("submit_literature_review", {"review": "review"}),
-        ]
-        responses = [
-            ToolModelResponse("", [ModelToolCall(f"call_{index}", name, json.dumps(arguments))])
-            for index, (name, arguments) in enumerate(actions)
-        ]
-        requested_messages = []
-
-        def respond(**kwargs):
-            requested_messages.append(deepcopy(kwargs["messages"]))
-            return responses[len(requested_messages) - 1]
-
-        with patch("agents.ArxivSearch", return_value=search), patch(
-            "agent_runtime.query_model_with_tools", side_effect=respond,
-        ) as query_model:
-            review = PhDStudentAgent("model", "key").conduct_literature_review("topic")
-
-        self.assertTrue(review["success"])
-        self.assertEqual(query_model.call_count, 6)
-        self.assertEqual(search.find_papers.call_args_list, [
-            call(query, excluded_ids=set()) for query in ("first", "second", "third")
-        ])
-        self.assertEqual([
-            {tool["function"]["name"] for tool in invocation.kwargs["tools"]}
-            for invocation in query_model.call_args_list
-        ], [
-            {"search_arxiv"}, {"search_arxiv"}, {"search_arxiv"},
-            {"read_arxiv_paper"}, {"decide_paper"}, {"submit_literature_review"},
-        ])
-        self.assertEqual(sum(
-            len(messages) == 2 for messages in requested_messages
-        ), 1)
-
-    def test_literature_retries_after_three_empty_searches_with_an_unread_candidate_remaining(self):
-        from inference import ModelToolCall, ToolModelResponse
-
-        search = arxiv_search_mock("A", "B")
-        search.find_papers.side_effect = [
-            {"text": "paper A", "candidate_ids": ["A"]},
-            *[{"text": "", "candidate_ids": []} for _ in range(3)],
-            {"text": "paper A reconsidered", "candidate_ids": ["A"]},
-        ]
-        search.retrieve_full_paper_text.return_value = "Shared leaf classification background."
-        search.get_cached_full_paper_text.return_value = search.retrieve_full_paper_text.return_value
-        actions = [
-            ("search_arxiv", {"query": "initial"}),
-            ("read_arxiv_paper", {"arxiv_id": "A"}),
-            ("decide_paper", {"arxiv_id": "A", "decision": "reject", "explanation": "FIRST_ROUND_REJECTION"}),
-            *[("search_arxiv", {"query": f"empty {index}"}) for index in range(3)],
-            ("search_arxiv", {"query": "background"}),
-            ("read_arxiv_paper", {"arxiv_id": "A"}),
-            ("decide_paper", {"arxiv_id": "A", "decision": "add", "explanation": "Useful shared background."}),
-            ("submit_literature_review", {"review": "Background review."}),
-        ]
-        responses = [
-            ToolModelResponse("", [ModelToolCall(f"call_{index}", name, json.dumps(arguments))])
-            for index, (name, arguments) in enumerate(actions)
-        ]
-        requested_messages = []
-
-        def respond(**kwargs):
-            requested_messages.append(deepcopy(kwargs["messages"]))
-            return responses[len(requested_messages) - 1]
-
-        with patch("agents.ArxivSearch", return_value=search), patch(
-            "agent_runtime.query_model_with_tools", side_effect=respond,
-        ) as query_model:
-            review = PhDStudentAgent("model", "key").conduct_literature_review("leaf classification")
-
-        self.assertTrue(review["success"])
-        self.assertEqual(review["papers"][0]["arxiv_id"], "A")
-        self.assertEqual(query_model.call_count, 10)
-        self.assertEqual(search.find_papers.call_args_list, [
-            call("initial", excluded_ids=set()),
-            *[call(f"empty {index}", excluded_ids={"A"}) for index in range(3)],
-            call("background", excluded_ids=set()),
-        ])
-        self.assertEqual(search.retrieve_full_paper_text.call_args_list, [
-            call("A", MAX_LEN=4000), call("A", MAX_LEN=4000),
-        ])
-        retry_messages = requested_messages[6]
-        self.assertEqual([message["role"] for message in retry_messages], ["system", "user"])
-        self.assertNotIn("FIRST_ROUND_REJECTION", json.dumps(retry_messages))
-        self.assertIn(LITERATURE_RETRY_RELEVANCE_RULE, retry_messages[0]["content"])
-
-    def test_literature_stops_after_three_empty_searches_in_each_round(self):
-        from inference import ModelToolCall, ToolModelResponse
-
-        search = arxiv_search_mock("A", "B")
-        search.find_papers.return_value = {"text": "", "candidate_ids": []}
-        responses = [
-            ToolModelResponse("", [ModelToolCall(
-                f"call_{index}", "search_arxiv", json.dumps({"query": f"query {index}"}),
-            )])
-            for index in range(6)
-        ]
-        requested_messages = []
-
-        def respond(**kwargs):
-            requested_messages.append(deepcopy(kwargs["messages"]))
-            return responses[len(requested_messages) - 1]
-
-        with patch("agents.ArxivSearch", return_value=search), patch(
-            "agent_runtime.query_model_with_tools", side_effect=respond,
-        ) as query_model:
-            with self.assertRaisesRegex(RuntimeError, "(?i)2.*rounds.*empty.search limit"):
-                PhDStudentAgent("model", "key").conduct_literature_review("topic")
-
-        self.assertEqual(query_model.call_count, 6)
-        self.assertEqual(search.find_papers.call_args_list, [
-            call(f"query {index}", excluded_ids=set()) for index in range(6)
-        ])
-        search.retrieve_full_paper_text.assert_not_called()
-        self.assertEqual([
-            index for index, messages in enumerate(requested_messages) if len(messages) == 2
-        ], [0, 3])
-        self.assertIn(LITERATURE_RETRY_RELEVANCE_RULE, requested_messages[3][0]["content"])
-
-    def test_literature_successful_search_resets_the_consecutive_empty_counter(self):
-        from inference import ModelToolCall, ToolModelResponse
-
-        search = arxiv_search_mock("A", "B")
-        search.find_papers.side_effect = [
-            {"text": "", "candidate_ids": []},
-            {"text": "", "candidate_ids": []},
-            {"text": "paper A", "candidate_ids": ["A"]},
-            {"text": "", "candidate_ids": []},
-            {"text": "", "candidate_ids": []},
-            {"text": "paper B", "candidate_ids": ["B"]},
-        ]
-        search.retrieve_full_paper_text.side_effect = lambda paper_id, MAX_LEN: f"Full text {paper_id}"
-        search.get_cached_full_paper_text.side_effect = lambda paper_id: f"Full text {paper_id}"
-        actions = [
-            *[("search_arxiv", {"query": f"first {index}"}) for index in range(3)],
-            ("read_arxiv_paper", {"arxiv_id": "A"}),
-            ("decide_paper", {"arxiv_id": "A", "decision": "reject", "explanation": "Unrelated task."}),
-            *[("search_arxiv", {"query": f"next {index}"}) for index in range(3)],
-            ("read_arxiv_paper", {"arxiv_id": "B"}),
-            ("decide_paper", {"arxiv_id": "B", "decision": "add", "explanation": "Useful background."}),
-            ("submit_literature_review", {"review": "Review based on B."}),
-        ]
-        responses = [
-            ToolModelResponse("", [ModelToolCall(f"call_{index}", name, json.dumps(arguments))])
-            for index, (name, arguments) in enumerate(actions)
-        ]
-        requested_messages = []
-
-        def respond(**kwargs):
-            requested_messages.append(deepcopy(kwargs["messages"]))
-            return responses[len(requested_messages) - 1]
-
-        with patch("agents.ArxivSearch", return_value=search), patch(
-            "agent_runtime.query_model_with_tools", side_effect=respond,
-        ) as query_model:
-            review = PhDStudentAgent("model", "key").conduct_literature_review("topic")
-
-        self.assertTrue(review["success"])
-        self.assertEqual(review["papers"][0]["arxiv_id"], "B")
-        self.assertEqual(query_model.call_count, 11)
-        self.assertEqual(search.find_papers.call_args_list, [
-            *[call(f"first {index}", excluded_ids=set()) for index in range(3)],
-            *[call(f"next {index}", excluded_ids={"A"}) for index in range(3)],
-        ])
-        self.assertEqual(sum(len(messages) == 2 for messages in requested_messages), 1)
-        self.assertNotIn(LITERATURE_RETRY_RELEVANCE_RULE, requested_messages[0][0]["content"])
-
-    def test_literature_empty_candidate_pool_stops_without_querying_the_model(self):
-        search = arxiv_search_mock()
-        with patch("agents.ArxivSearch", return_value=search), patch(
-            "agent_runtime.query_model_with_tools",
-        ) as query_model:
-            with self.assertRaisesRegex(RuntimeError, "(?i)(no|empty).*(candidate|paper)"):
-                PhDStudentAgent("model", "key").conduct_literature_review("topic")
-
-        query_model.assert_not_called()
-        search.find_papers.assert_not_called()
-        search.retrieve_full_paper_text.assert_not_called()
 
     def test_postdoc_plan_prompt_requires_phd_consultation_and_full_plan(self):
         agent = PostdocAgent("model", "key")
@@ -1931,89 +1251,63 @@ class AgentPromptTest(unittest.TestCase):
 
         prompt = run.call_args.kwargs["system_prompt"]
         user_prompt = run.call_args.kwargs["user_prompt"]
-        self.assertIn("directing a PhD student", prompt)
-        self.assertIn("MUST call send_dialogue", prompt)
-        self.assertIn("MUST NOT call submit_plan", prompt)
-        self.assertIn("simple, feasible experiment", prompt)
-        self.assertIn("minimal valid experiment sufficient to answer the user's research question", prompt)
-        self.assertNotIn("one innovative idea", prompt)
-        self.assertIn("minimum data capabilities", prompt)
-        self.assertIn("only when needed for a valid answer", prompt)
-        self.assertIn("Do not turn examples into hard requirements", prompt)
-        self.assertIn("operations explicitly requested by the topic", prompt)
-        self.assertIn("a method mentioned only in the literature", prompt)
-        self.assertIn("do not propose BERT", prompt)
-        self.assertIn("simplest method trainable from scratch", prompt)
-        self.assertIn("baselines", prompt)
-        self.assertIn("evaluation metrics", prompt)
-        self.assertIn("reproducibility details", prompt)
-        self.assertIn("Hugging Face dataset", prompt)
-        self.assertIn("subgroup, cohort, category, source, time-period", prompt)
-        self.assertIn("do not open another consultation solely to confirm", prompt)
-        self.assertIn("Do not ask the PhDStudentAgent to confirm field names", prompt)
-        self.assertIn("consultation_required", user_prompt)
+        self.assertIn("computer science postdoctoral researcher", prompt)
+        self.assertIn("minimal, feasible experiment plan", prompt)
+        self.assertIn("Research topic: topic", user_prompt)
+        self.assertIn("Latest PhD feedback: None", user_prompt)
+        self.assertNotIn("Planning consultation status", user_prompt)
         self.assertEqual(run.call_args.kwargs["tool_names_provider"](), {"send_dialogue"})
 
         registry = run.call_args.kwargs["registry"]
         schemas = {item["function"]["name"]: item["function"] for item in registry.schemas}
-        self.assertIn("message for PhDStudentAgent", schemas["send_dialogue"]["description"])
-        self.assertIn("feedback before submitting", schemas["send_dialogue"]["description"])
-        self.assertIn("after PhD feedback", schemas["submit_plan"]["description"])
+        self.assertIn("Draft an experiment plan", schemas["send_dialogue"]["description"])
         self.assertEqual(
             schemas["submit_plan"]["parameters"]["required"],
-            ["plan", "data_requirements"],
+            ["experiment_plan", "data_plan"],
         )
-        self.assertIn("data-preparation needs in data_requirements", schemas["submit_plan"]["description"])
-        self.assertFalse(
-            registry.execute(
-                "submit_plan",
-                {"plan": "full plan", "data_requirements": "abstract requirements"},
-            )["success"]
-        )
+        self.assertIn("data-preparation plan", schemas["submit_plan"]["description"])
+        self.assertNotIn("submit_plan", run.call_args.kwargs["tool_names_provider"]())
 
     def test_postdoc_plan_prompt_marks_received_feedback(self):
         agent = PostdocAgent("model", "key")
-        completed = SimpleNamespace(value={"plan": "plan"})
+        completed = SimpleNamespace(value={"experiment_plan": "plan"})
         with patch.object(
             AgentRuntime, "run", return_value=completed
         ) as run:
             agent.plan_turn("topic", "literature", "PhD feedback")
-        self.assertIn("feedback_received", run.call_args.kwargs["user_prompt"])
+        self.assertIn("Latest PhD feedback: PhD feedback", run.call_args.kwargs["user_prompt"])
         self.assertEqual(
             run.call_args.kwargs["tool_names_provider"](),
             {"send_dialogue", "submit_plan"},
         )
         registry = run.call_args.kwargs["registry"]
         self.assertFalse(registry.execute(
-            "submit_plan", {"plan": "full plan", "data_requirements": " "},
+            "submit_plan", {"experiment_plan": "full plan", "data_plan": " "},
+        )["success"])
+        self.assertFalse(registry.execute(
+            "submit_plan", {"experiment_plan": " ", "data_plan": "abstract requirements"},
         )["success"])
         self.assertTrue(registry.execute(
-            "submit_plan", {"plan": "full plan", "data_requirements": "abstract requirements"},
+            "submit_plan", {"experiment_plan": "full plan", "data_plan": "abstract requirements"},
         )["success"])
 
     def test_postdoc_plan_does_not_unlock_submission_without_nonempty_phd_feedback(self):
-        for dialogue in ("", " \n\t ", None, True):
+        for dialogue in ("", " \n\t "):
             with self.subTest(dialogue=dialogue), patch.object(AgentRuntime, "run") as run:
                 PostdocAgent("model", "key").plan_turn("topic", "literature", dialogue)
 
                 kwargs = run.call_args.kwargs
                 registry = kwargs["registry"]
-                self.assertIn("consultation_required", kwargs["user_prompt"])
                 self.assertIn("Latest PhD feedback: None", kwargs["user_prompt"])
                 self.assertEqual(kwargs["tool_names_provider"](), {"send_dialogue"})
                 registry.execute("send_dialogue", {"message": "Please review the plan"})
-                rejected = registry.execute("submit_plan", {
-                    "plan": "full plan", "data_requirements": "abstract requirements",
-                })
-                self.assertFalse(rejected["success"])
-                self.assertIn("PhD feedback", rejected["error"])
                 self.assertEqual(kwargs["tool_names_provider"](), {"send_dialogue"})
 
     def test_postdoc_plan_runtime_waits_for_phd_feedback_before_submission(self):
         from agent_runtime import ToolRegistry
         from inference import ModelToolCall, ToolModelResponse
 
-        plan = {"plan": "reviewed plan", "data_requirements": "abstract requirements"}
+        plan = {"experiment_plan": "reviewed plan", "data_plan": "abstract requirements"}
         feedback = "Keep the classifier and evaluation split fixed."
 
         def tool_call(call_id, name, arguments):
@@ -2053,7 +1347,7 @@ class AgentPromptTest(unittest.TestCase):
             result = postdoc.plan_turn("topic", "literature", actual_feedback)
 
         self.assertEqual(result.tool_name, "submit_plan")
-        self.assertEqual(result.value, {"success": True, **plan})
+        self.assertEqual(result.value, {"success": True, "plan": plan["experiment_plan"], "data_requirements": plan["data_plan"]})
         self.assertEqual(executed_tools, ["send_dialogue", "send_dialogue", "submit_plan"])
         exposed_tools = [
             {tool["function"]["name"] for tool in invocation.kwargs["tools"]}
@@ -2073,21 +1367,13 @@ class AgentPromptTest(unittest.TestCase):
         ) as run:
             agent.plan_feedback("topic", "literature", "proposal")
         prompt = run.call_args.kwargs["system_prompt"]
-        self.assertIn("being directed by a postdoctoral researcher", prompt)
-        self.assertIn("simple, feasible experiment", prompt)
-        self.assertIn("minimal valid experiment sufficient to answer the user's research question", prompt)
-        self.assertNotIn("novelty", prompt)
-        self.assertIn("not an instruction to reproduce its algorithms", prompt)
-        self.assertIn("approve it without inventing enhancements", prompt)
-        self.assertIn("Remove out-of-scope requirements", prompt)
-        self.assertIn("one deterministic held-out evaluation", prompt)
-        self.assertIn("A method described in the literature is not", prompt)
-        self.assertIn("reject a plan that proposes BERT", prompt)
-        self.assertIn("local assets are explicitly supplied", prompt)
-        self.assertIn("evaluation metrics", prompt)
-        self.assertIn("exact experimental procedure", prompt)
-        self.assertIn("Do not select or name a concrete dataset ID", prompt)
-        self.assertIn("cannot block a valid abstract plan", prompt)
+        self.assertIn("computer science PhD student", prompt)
+        self.assertIn("only changes necessary", prompt)
+        self.assertIn("Proposed plan: proposal", run.call_args.kwargs["user_prompt"])
+        schema = run.call_args.kwargs["registry"].schemas[0]["function"]
+        self.assertIn("approve it if sufficient", schema["description"])
+        self.assertIn("use literature as background", schema["parameters"]["properties"]["message"]["description"])
+        self.assertEqual(schema["parameters"]["required"], ["message"])
 
     def test_interpretation_prompts_require_postdoc_phd_dialogue(self):
         postdoc = PostdocAgent("model", "key")

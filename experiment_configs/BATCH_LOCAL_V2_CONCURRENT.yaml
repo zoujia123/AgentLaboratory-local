@@ -68,45 +68,9 @@ paper_writing:
 queries:
 
 queries:
-  - query-id: query_001
-    recording-id: latest
-  - query-id: query_002
-    recording-id: latest
-  - query-id: query_003
-    recording-id: latest
-  - query-id: query_004
-    recording-id: latest
-  - query-id: query_005
-    recording-id: latest
-  - query-id: query_006
-    recording-id: latest
-  - query-id: query_007
-    recording-id: latest
-  - query-id: query_008
-    recording-id: latest
-  - query-id: query_009
-    recording-id: latest
-  - query-id: query_010
-    recording-id: latest   
-  - query-id: query_011
-    recording-id: latest
-  - query-id: query_012
-    recording-id: latest  
-  - query-id: query_013
-    recording-id: latest 
   - query-id: query_014
     recording-id: latest   
-  - query-id: query_015
-    recording-id: latest
-  - query-id: query_016
-    recording-id: latest
-  - query-id: query_017
-    recording-id: latest 
-  - query-id: query_018
-    recording-id: latest 
-  - query-id: query_019
-    recording-id: latest   
-  - query-id: query_020
+  - query-id: query_011
     recording-id: latest 
 
 
