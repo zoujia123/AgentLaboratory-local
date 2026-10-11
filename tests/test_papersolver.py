@@ -11,6 +11,7 @@ import yaml
 
 from agent_runtime import AgentRuntime
 from agents import PaperSolverAgent
+from inference import ModelToolCall, ToolModelResponse
 
 with patch("dotenv.load_dotenv"):
     from ai_lab_repo import load_paper_writing_config, parse_yaml
@@ -51,7 +52,16 @@ class PaperSolverTest(unittest.TestCase):
         original_state = deepcopy(vars(state))
 
         def fake_run_one(runtime, system_prompt, user_prompt, registry):
-            del system_prompt
+            self.assertLess(len(system_prompt), 200)
+            self.assertNotIn("Figure_1.png", system_prompt)
+            self.assertIn("Figure_1.png", user_prompt)
+            self.assertNotIn("Approved paper blueprint", user_prompt)
+            if runtime.phase != "report writing blueprint":
+                for requirement in (
+                    "fixed seeds", "potential negative impacts", "focused paragraph",
+                    "Preserve reported numbers exactly", "supplied citation keys",
+                ):
+                    self.assertIn(requirement, user_prompt)
             evidence = json.loads(user_prompt.split("Authoritative evidence:\n", 1)[1])
             include_code = runtime.phase in {
                 "report writing section Methods", "report writing section Experimental Setup",
@@ -148,6 +158,79 @@ class PaperSolverTest(unittest.TestCase):
                 filename = f"{index:02d}_{section.lower().replace(' ', '_')}.tex"
                 self.assertTrue(Path(temp_dir, "tex", "sections", filename).is_file())
 
+    def test_runtime_keeps_failed_submissions_in_the_current_step(self):
+        config = {
+            "sections": [
+                {"name": "Methods", "word_target": 100, "max_chars": 1000},
+                {"name": "Results", "word_target": 100, "max_chars": 1000},
+            ],
+            "generation_order": ["Methods", "Results"],
+        }
+        state = SimpleNamespace(
+            topic="topic", literature_review="review", plan="plan",
+            dataset_selection={}, experiment_code="print(1)",
+            experiment_output="1", interpretation="interpretation",
+        )
+        blueprint = {
+            "title": "Paper", "central_claim": "Observed evidence",
+            "section_plans": {"Methods": "Method plan", "Results": "Result plan"},
+        }
+        attempts = [
+            # An unavailable tool cannot bypass the blueprint.
+            ("submit_paper_section", {"section_name": "Methods", "latex_body": "Early"}),
+            ("submit_paper_blueprint", {**blueprint, "section_plans": {"Methods": "Plan"}}),
+            ("submit_paper_blueprint", {**blueprint, "section_plans": {"Methods": 7, "Results": "Plan"}}),
+            *[
+                ("submit_paper_blueprint", {**blueprint, field: empty})
+                for field in ("title", "central_claim")
+                for empty in ("", " \t\n")
+            ],
+            *[
+                ("submit_paper_blueprint", {
+                    **blueprint,
+                    "section_plans": {**blueprint["section_plans"], section: empty},
+                })
+                for section in ("Methods", "Results")
+                for empty in ("", " \t\n")
+            ],
+            ("submit_paper_blueprint", {
+                "title": "  Paper  ", "central_claim": "  Observed evidence  ",
+                "section_plans": {"Methods": "  Method plan  ", "Results": "  Result plan  "},
+            }),
+            ("submit_paper_section", {"section_name": "Results", "latex_body": "Wrong section"}),
+            ("submit_paper_section", {"section_name": "Methods", "latex_body": 7}),
+            ("submit_paper_section", {"section_name": "Methods", "latex_body": "  "}),
+            ("submit_paper_section", {"section_name": "Methods", "latex_body": "Method body"}),
+            ("submit_paper_section", {"section_name": "Results", "latex_body": "Result body"}),
+        ]
+        observed = []
+
+        def respond(**kwargs):
+            tool = kwargs["tools"][0]["function"]
+            self.assertEqual(len(kwargs["tools"]), 1)
+            current_section = tool["parameters"]["properties"].get("section_name", {}).get("enum")
+            observed.append((tool["name"], current_section))
+            name, arguments = attempts[len(observed) - 1]
+            return ToolModelResponse("", [ModelToolCall(
+                str(len(observed)), name, json.dumps(arguments),
+            )])
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("agent_runtime.query_model_with_tools", side_effect=respond), patch(
+                "agents.compile_latex", return_value="Compilation disabled",
+            ):
+                result = PaperSolverAgent("model", "key", paper_writing=config).write(state, directory)
+            self.assertEqual(result["blueprint"], {"success": True, **blueprint})
+            saved_blueprint = json.loads(Path(directory, "tex", "paper_blueprint.json").read_text())
+            self.assertEqual(saved_blueprint, result["blueprint"])
+            self.assertEqual(result["sections"], {"Methods": "Method body", "Results": "Result body"})
+            self.assertEqual(Path(directory, "tex", "sections", "01_methods.tex").read_text(), "Method body\n")
+        self.assertEqual(observed, [
+            *[("submit_paper_blueprint", None)] * 12,
+            *[("submit_paper_section", ["Methods"])] * 4,
+            ("submit_paper_section", ["Results"]),
+        ])
+
     def test_custom_config_controls_generation_prompts_schemas_and_document_order(self):
         config = {
             "sections": [
@@ -169,7 +252,8 @@ class PaperSolverTest(unittest.TestCase):
         def fake_run_one(runtime, system_prompt, user_prompt, registry):
             schema = registry.schemas[0]["function"]["parameters"]
             if runtime.phase == "report writing blueprint":
-                self.assertIn(", ".join(sections), system_prompt)
+                self.assertIn(", ".join(sections), user_prompt)
+                self.assertNotIn(", ".join(sections), system_prompt)
                 self.assertEqual(
                     schema["properties"]["section_plans"]["required"], list(sections),
                 )
@@ -182,12 +266,18 @@ class PaperSolverTest(unittest.TestCase):
             section = schema["properties"]["section_name"]["enum"][0]
             generated.append(section)
             self.assertEqual(runtime.phase, f"report writing section {section}")
-            self.assertIn(f"approximately {by_name[section]['word_target']} words", system_prompt)
+            self.assertIn(f"approximately {by_name[section]['word_target']} words", user_prompt)
+            self.assertNotIn("approximately", system_prompt)
+            self.assertIn(f"Current section: {section}", user_prompt)
             self.assertEqual(
                 schema["properties"]["latex_body"]["maxLength"],
                 by_name[section]["max_chars"],
             )
-            self.assertIn(f"Current section plan:\nPlan for {section}", user_prompt)
+            blueprint_text = user_prompt.split("Paper blueprint:\n", 1)[1].split(
+                "\nAuthoritative evidence:\n", 1,
+            )[0]
+            self.assertEqual(json.loads(blueprint_text)["section_plans"][section], f"Plan for {section}")
+            self.assertNotIn("Current section plan:", user_prompt)
             return SimpleNamespace(value=registry.execute("submit_paper_section", {
                 "section_name": section, "latex_body": f"Body for {section}.",
             }))
@@ -201,7 +291,6 @@ class PaperSolverTest(unittest.TestCase):
                 "llm_sampling": {"temperature": 0.1, "top_p": 1, "max_tokens": 8192},
                 "collaboration_rounds": {
                     "plan_max_rounds": 2, "data_preparation_max_rounds": 3,
-                    "interpretation_max_phd_reviews": 1,
                 },
                 "code_execution_timeout_seconds": 17.5,
                 "paper_writing": config,

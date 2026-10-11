@@ -254,8 +254,7 @@ def _process_execution_result(current, fingerprint, execution, phase):
 
     if success:
         current.update(last_failure_category=None,consecutive_failure_category_count=0,force_replace=False,)   # 如果执行成功，就清理当前失败状态
-        if "latest_execution_failure" in current:
-            current["latest_execution_failure"] = None  # 主实验使用这个字段保存最新错误；补充实验目前没有使用它。如果有这个字段，就清空它，表示当前执行已经成功。
+        current["latest_execution_failure"] = None
         return feedback
 
     # Classify the original diagnostic before shortening it for the model.
@@ -295,9 +294,8 @@ def _process_execution_result(current, fingerprint, execution, phase):
     # Historical failures and the latest failure reuse this read-only snapshot.
     if not infrastructure_error:
         current["failed_hashes"].add(fingerprint)
-        current.setdefault("failed_failures", {})[fingerprint] = diagnostic
-    if "latest_execution_failure" in current:
-        current["latest_execution_failure"] = diagnostic
+        current["failed_failures"][fingerprint] = diagnostic
+    current["latest_execution_failure"] = diagnostic
 
     if compact_traceback != original_traceback:
         current_run_logger().debug(f"[MLESolverAgent][{phase}] FULL EXECUTION DIAGNOSTIC\n"+ json.dumps(feedback, ensure_ascii=False, indent=2, default=str))

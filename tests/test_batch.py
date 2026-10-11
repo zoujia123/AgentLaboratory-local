@@ -13,7 +13,6 @@ from ai_lab_repo import BatchConfig, QueryJob, main, run_batch
 COLLABORATION_ROUNDS = {
     "plan_max_rounds": 8,
     "data_preparation_max_rounds": 12,
-    "interpretation_max_phd_reviews": 8,
 }
 
 

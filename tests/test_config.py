@@ -22,7 +22,6 @@ class ConfigTest(unittest.TestCase):
             "collaboration_rounds:\n"
             "  plan_max_rounds: 8\n"
             "  data_preparation_max_rounds: 12\n"
-            "  interpretation_max_phd_reviews: 8\n"
             + content
         )
         config_file.close()

@@ -80,15 +80,15 @@ class SolverDiagnosticTest(unittest.TestCase):
                     ) as compact:
                         agent = MLESolverAgent("model", "key", code_execution_timeout_seconds=123)
                         if supplement:
-                            agent.supplement(state, {
+                            agent.solve(state, directory, supplement_request={
                                 "objective": "check", "reason": "check",
                                 "required_outputs": [], "constraints": [],
-                            }, directory, 1)
+                            })
                         else:
                             agent.solve(state, directory)
                         registry = run.call_args.kwargs["registry"]
-                        replace = "write_supplement_code" if supplement else "write_experiment_code"
-                        execute = "execute_supplement_code" if supplement else "execute_experiment_code"
+                        replace = "write_experiment_code"
+                        execute = "execute_experiment_code"
                         registry.execute(replace, {"code": "print(data)"})
                         feedback = registry.execute(execute, {})
                         compact.assert_called_once_with(original["traceback"])
