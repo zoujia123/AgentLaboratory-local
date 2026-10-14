@@ -184,7 +184,7 @@ class PhDStudentAgent(BaseResearchAgent):
                     "properties": {
                         "review": {
                             "type": "string",
-                            "description": "Review connecting the selected paper to the research topic."
+                            "description": "Write a review about the selected papers."
                         }
                     },
                     "required": ["review"]
@@ -205,10 +205,8 @@ class PhDStudentAgent(BaseResearchAgent):
             return result.value
 
     def plan_feedback(self, topic, literature_review, postdoc_message, *, planning_history=None, seeds=None):
-        def review_plan(message, approved, required_changes):
-            if approved == bool(required_changes) or any(not item.strip() for item in required_changes):
-                return {"success": False, "error": "Approve only with no required_changes; otherwise list concrete necessary corrections."}
-            return {"success": True, "message": message, "approved": approved, "required_changes": required_changes}
+        def review_plan(message, approved):
+            return {"success": True, "message": message, "approved": approved}
 
         registry = ToolRegistry().register(
             "send_dialogue",
@@ -217,14 +215,13 @@ class PhDStudentAgent(BaseResearchAgent):
                 "type": "object",
                 "properties": {
                     "approved": {"type": "boolean", "description": "Whether the plan is sufficient to answer the research question."},
-                    "required_changes": {"type": "array", "items": {"type": "string"}, "description": "Necessary corrections only; empty when approved."},
                     "message": {
                         "type": "string",
                         "description": "Give concise feedback to PostdocAgent; preserve the requested scope and use literature as background, not a requirement to reproduce its methods."
                     }
                 },
                 "required": [
-                    "message", "approved", "required_changes"
+                    "message", "approved"
                 ]
             },
             review_plan,
@@ -273,13 +270,12 @@ class PhDStudentAgent(BaseResearchAgent):
                 "review": {"send_dialogue"},
                 "supplement": {"request_supplementary_experiment"},
                 "submit": {"submit_interpretation"},
-                "decide": {"request_supplementary_experiment", "submit_interpretation"},
             }[stage]
 
         registry = ToolRegistry()
         registry.register(
             "send_dialogue",
-            "Send the proposed result interpretation for review.",
+            "Send a complete result interpretation or a justified supplementary experiment proposal to PostdocAgent for approval.",
             {
                 "type": "object",
                 "properties": {
@@ -289,12 +285,11 @@ class PhDStudentAgent(BaseResearchAgent):
                     },
                 },
                 "required": ["message"],
-                "additionalProperties": False,
             },
             send_dialogue,
         ).register(
             "request_supplementary_experiment",
-            "Request a bounded supplementary experiment.",
+            "Request a supplementary experiment.",
             {
                 "type": "object",
                 "properties": {
@@ -318,7 +313,6 @@ class PhDStudentAgent(BaseResearchAgent):
                     },
                 },
                 "required": ["objective", "reason", "required_outputs", "constraints"],
-                "additionalProperties": False,
             },
             request_supplementary_experiment,
         ).register(
@@ -333,7 +327,6 @@ class PhDStudentAgent(BaseResearchAgent):
                     },
                 },
                 "required": ["interpretation"],
-                "additionalProperties": False,
             },
             submit_interpretation,
         )
@@ -444,8 +437,8 @@ class PostdocAgent(BaseResearchAgent):
         def send_dialogue(message, supplement_required):
             if not message.strip():
                 return {"success": False, "error": "Provide non-empty feedback."}
-            if supplement_required is not None and not isinstance(supplement_required, bool):
-                return {"success": False, "error": "supplement_required must be a boolean or null."}
+            if not isinstance(supplement_required, bool):
+                return {"success": False, "error": "supplement_required must be a boolean."}
             return {"success": True, "message": message, "supplement_required": supplement_required}
 
         registry = ToolRegistry().register(
@@ -459,8 +452,8 @@ class PostdocAgent(BaseResearchAgent):
                         "description": "Evidence-based feedback on metrics, comparisons, anomalies, plausible explanations, limitations, and claim support in relation to the literature and planned hypothesis. Use only observed values; if additional evidence is necessary, specify its goal and expected outputs.",
                     },
                     "supplement_required": {
-                        "type": ["boolean", "null"],
-                        "description": "True when a bounded, executable experiment is necessary; false when existing evidence suffices with remaining limitations; null when either supplementing or submitting is acceptable.",
+                        "type": "boolean",
+                        "description": "True when a bounded, executable experiment is necessary; false when existing evidence suffices with remaining limitations.",
                     },
                 },
                 "required": ["message", "supplement_required"],
@@ -682,7 +675,7 @@ class SWEngineerAgent(BaseResearchAgent):
                 "properties": {
                     "message": {
                         "type": "string",
-                        "description": "Concise requirements feedback or a concrete correction supported by execution results."
+                        "description": "Concise requirements feedback or a concrete suggestions supported by execution results."
                     }
                 },
                 "required": [
@@ -1363,14 +1356,12 @@ class ProfessorAgent(BaseResearchAgent):
                         "type": "string",
                         "description": (
                             "Complete Markdown README covering the research objective, "
-                            "method, repository outputs, reproduction steps, dependencies, "
-                            "fixed numerical seeds, observed metrics, and limitations, "
+                            "method, repository outputs, observed metrics, and limitations, "
                             "using only supported information."
                         ),
                     },
                 },
                 "required": ["markdown"],
-                "additionalProperties": False,
             },
             lambda markdown: {"success": True, "markdown": markdown},
         )

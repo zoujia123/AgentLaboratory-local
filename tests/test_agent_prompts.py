@@ -1325,7 +1325,7 @@ class AgentPromptTest(unittest.TestCase):
                 "consult", "send_dialogue", {"message": "Please review this plan"},
             )]),
             ToolModelResponse("", [tool_call(
-                "feedback", "send_dialogue", {"message": feedback, "approved": True, "required_changes": []},
+                "feedback", "send_dialogue", {"message": feedback, "approved": True},
             )]),
             ToolModelResponse("", [tool_call("submit", "submit_plan", plan)]),
         ]
@@ -1375,9 +1375,9 @@ class AgentPromptTest(unittest.TestCase):
         schema = run.call_args.kwargs["registry"].schemas[0]["function"]
         self.assertIn("approve it if sufficient", schema["description"])
         self.assertIn("use literature as background", schema["parameters"]["properties"]["message"]["description"])
-        self.assertEqual(schema["parameters"]["required"], ["message", "approved", "required_changes"])
+        self.assertEqual(schema["parameters"]["required"], ["message", "approved"])
 
-    def test_planning_preserves_context_and_requires_consistent_approval(self):
+    def test_planning_preserves_context_and_feedback(self):
         history = [{"round": 1, "plan": "CNN with 32 filters", "feedback": {"approved": False}}]
         with patch.object(AgentRuntime, "run") as run:
             PostdocAgent("model", "key").plan_turn(
@@ -1396,14 +1396,10 @@ class AgentPromptTest(unittest.TestCase):
                 "topic", "literature", "plan", planning_history=history,
             )
         registry = review.call_args.kwargs["registry"]
-        for approved, changes, valid in (
-            (True, [], True), (False, ["Specify split"], True),
-            (True, ["Specify split"], False), (False, [], False),
-            (False, [" "], False),
-        ):
+        for approved in (True, False):
             self.assertEqual(registry.execute("send_dialogue", {
-                "message": "Review", "approved": approved, "required_changes": changes,
-            })["success"], valid)
+                "message": "Review", "approved": approved,
+            }), {"success": True, "message": "Review", "approved": approved})
 
     def test_interpretation_tools_preserve_contracts_and_evidence_requirements(self):
         phd = PhDStudentAgent("model", "key")
@@ -1509,7 +1505,7 @@ class AgentPromptTest(unittest.TestCase):
             parameters = registry.schemas_for({"send_dialogue"})[0]["function"]["parameters"]
             self.assertFalse(parameters["additionalProperties"])
             self.assertEqual(set(parameters["required"]), {"message", "supplement_required"})
-            self.assertEqual(parameters["properties"]["supplement_required"]["type"], ["boolean", "null"])
+            self.assertEqual(parameters["properties"]["supplement_required"]["type"], "boolean")
             self.assertIn("limitations", parameters["properties"]["supplement_required"]["description"])
             self.assertIn("observed values", parameters["properties"]["message"]["description"])
             feedback = registry.execute(
@@ -1529,7 +1525,6 @@ class AgentPromptTest(unittest.TestCase):
             ("feedback", {"stage": "review"}, {"send_dialogue"}),
             ("feedback", {"stage": "supplement"}, {"request_supplementary_experiment"}),
             ("feedback", {"stage": "submit"}, {"submit_interpretation"}),
-            ("feedback", {"stage": "decide"}, {"request_supplementary_experiment", "submit_interpretation"}),
         ]
         phd = PhDStudentAgent("model", "key")
         with patch.object(AgentRuntime, "run", return_value=SimpleNamespace(value={})) as run:
@@ -1614,7 +1609,7 @@ class AgentPromptTest(unittest.TestCase):
         ]
         cases.append(("postdoc", "send_dialogue", {"message": "Feedback"},
                       {"message": "Evidence sufficient", "supplement_required": False}))
-        for invalid in ("false", 0, 1, [], {}):
+        for invalid in (None, "false", 0, 1, [], {}):
             cases.append(("postdoc", "send_dialogue", {"message": "Feedback", "supplement_required": invalid},
                           {"message": "Evidence sufficient", "supplement_required": False}))
         for stage, tool, invalid, valid in cases:

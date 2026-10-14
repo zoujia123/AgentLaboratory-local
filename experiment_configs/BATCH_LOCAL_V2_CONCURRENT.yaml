@@ -1,5 +1,5 @@
 material-root: "D:/work/HUST/MASLab_v2"
-output-root: "research_runs_qwen_32B"
+output-root: "research_runs_glm_32B"
 max-concurrent-queries: 1
 max-llm-http-attempts-per-query: 100
 code_execution_timeout_seconds: 2000  # 单次代码执行上限（秒），用于数据准备、主实验和补充实验
@@ -64,16 +64,48 @@ paper_writing:
     - Discussion
     - Abstract
 
-queries:
 
 queries:
   - query-id: query_001
     recording-id: latest
-  - query-id: query_014
+  - query-id: query_002
+    recording-id: latest
+  - query-id: query_003
+    recording-id: latest
+  - query-id: query_004
+    recording-id: latest
+  - query-id: query_005
+    recording-id: latest
+  - query-id: query_006
+    recording-id: latest
+  - query-id: query_007
+    recording-id: latest
+  - query-id: query_008
+    recording-id: latest
+  - query-id: query_009
+    recording-id: latest
+  - query-id: query_010
     recording-id: latest   
   - query-id: query_011
+    recording-id: latest
+  - query-id: query_012
+    recording-id: latest  
+  - query-id: query_013
     recording-id: latest 
-
+  - query-id: query_014
+    recording-id: latest   
+  - query-id: query_015
+    recording-id: latest
+  - query-id: query_016
+    recording-id: latest
+  - query-id: query_017
+    recording-id: latest 
+  - query-id: query_018
+    recording-id: latest 
+  - query-id: query_019
+    recording-id: latest   
+  - query-id: query_020
+    recording-id: latest 
 
 
 

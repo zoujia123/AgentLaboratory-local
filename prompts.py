@@ -35,15 +35,17 @@ LITERATURE_RETRY_RELEVANCE_RULE = (
 
 def literature_review_prompt():
     return (
-        "Read the available papers and choose at least one for the literature review. "
+        "You are a computer science PhD student. Read the available papers and choose at least one for the literature review. "
         "The paper does not need to study exactly the same question. "
         "Explain how it helps with the topic and what it cannot tell us."
+        "\nAt each turn, choose exactly one available tool and call it once."
     )
 
 
 def phd_plan_feedback_prompt():
     return (
         "You are a computer science PhD student. Review the proposed experiment plan and suggest only changes necessary to answer the research question correctly."
+        "\nAt each turn, choose exactly one available tool and call it once."
     )
 
 
@@ -51,12 +53,14 @@ def postdoc_interpretation_feedback_prompt():
     return (
         "You are a computer science postdoctoral researcher. Review the PhD student's "
         "interpretation of observed results and assess the need for additional evidence."
+        "\nAt each turn, choose exactly one available tool and call it once."
     )
 
 
 def postdoc_plan_prompt():
     return (
         "You are a computer science postdoctoral researcher. Develop a minimal, feasible experiment plan that answers the research question, using the literature and PhD feedback."
+        "\nAt each turn, choose exactly one available tool and call it once."
     )
 
 
@@ -64,21 +68,29 @@ def phd_interpretation_prompt():
     return (
         "You are a computer science PhD student. Develop an evidence-based "
         "interpretation of experimental results using the research context and Postdoc feedback."
+        "\nAt each turn, choose exactly one available tool and call it once."
     )
 
 
 def ml_dataset_selection_prompt():
-    return "You are a machine learning engineer. Prepare reusable data for the research task from the provided local datasets, following the data-preparation plan."
+    return (
+        "You are a machine learning engineer. Prepare reusable data for the research task from the provided local datasets, following the data-preparation plan."
+        "\nAt each turn, choose exactly one available tool and call it once."
+    )
 
 
 def sw_data_preparation_prompt():
-    return "You are a software engineer. Review data preparation and suggest necessary fixes, without adding model training or evaluation."
+    return (
+        "You are a software engineer. Review data preparation and suggest necessary fixes, without adding model training or evaluation."
+        "\nAt each turn, choose exactly one available tool and call it once."
+    )
 
 
 def professor_readme_prompt():
     return (
         "You are a computer science professor. Write an accurate English research "
         "README grounded in the supplied evidence."
+        "\nAt each turn, choose exactly one available tool and call it once."
     )
 
 
@@ -86,6 +98,7 @@ def experiment_solver_prompt():
     return (
         "You are a machine learning engineer. Implement the current experiment task using "
         "the prepared data and produce reproducible, observed results."
+        "\nAt each turn, choose exactly one available tool and call it once."
     )
 
 
@@ -93,6 +106,7 @@ def paper_blueprint_prompt():
     return (
         "You are a research paper writer. Develop a concise blueprint for an English "
         "research paper grounded in the supplied evidence."
+        "\nAt each turn, choose exactly one available tool and call it once."
     )
 
 
@@ -100,4 +114,5 @@ def paper_section_prompt():
     return (
         "You are a research paper writer. Write the requested section of an English "
         "research paper using the supplied blueprint and evidence."
+        "\nAt each turn, choose exactly one available tool and call it once."
     )

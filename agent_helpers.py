@@ -83,8 +83,7 @@ def _preparation_feedback_for_prompt(feedback, inspected_dataset, latest_executi
             "error": "The last submission repeated a failed program and was not executed again.",
             "repair_hint": (
                 "Use the authoritative execution failure below to correct the failing "
-                "operation, then call write_and_run_dataset_code with the complete corrected "
-                "program. Do not resubmit the rejected code hash."
+                "operation. Do not resubmit the rejected code hash."
             ),
         }
     return _stale_diagnostic_marker()

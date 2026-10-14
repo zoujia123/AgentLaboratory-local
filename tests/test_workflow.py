@@ -305,7 +305,7 @@ class WorkflowTest(unittest.TestCase):
                 "papers": [{"arxiv_id": "1", "summary": "paper", "full_text": "text"}],
             })
             workflow.phd.plan_feedback = MagicMock(return_value={
-                "approved": True, "required_changes": [], "message": "Approved",
+                "approved": True, "message": "Approved",
             })
             workflow.postdoc.plan_turn = MagicMock(
                 side_effect=[result("send_dialogue", {"message": "complete plan"}), result(
@@ -761,7 +761,7 @@ class WorkflowTest(unittest.TestCase):
             self.assertNotIn("budget exhausted", initial_prompt)
             self.assertEqual(workflow.ml_solver.solve.call_count, 2)
 
-    def test_interpretation_postdoc_null_allows_phd_to_choose_either_action(self):
+    def test_interpretation_postdoc_boolean_selects_phd_action(self):
         from inference import ModelToolCall, ToolModelResponse
 
         for supplement_chosen in (False, True):
@@ -778,7 +778,10 @@ class WorkflowTest(unittest.TestCase):
                 })
                 actions = [
                     ("send_dialogue", {"message": "Proposed interpretation"}),
-                    ("send_dialogue", {"message": "Either choice is acceptable", "supplement_required": None}),
+                    ("send_dialogue", {
+                        "message": "More evidence needed" if supplement_chosen else "Evidence sufficient",
+                        "supplement_required": supplement_chosen,
+                    }),
                 ]
                 expected_roles = ["PhD student", "postdoctoral researcher", "PhD student"]
                 if supplement_chosen:
@@ -798,17 +801,22 @@ class WorkflowTest(unittest.TestCase):
                 self.assertEqual(len(calls), len(expected_roles))
                 for call, role in zip(calls, expected_roles):
                     self.assertIn(role, call.kwargs["messages"][0]["content"])
+                feedback_schema = calls[1].kwargs["tools"][0]["function"]["parameters"]
+                self.assertEqual(feedback_schema["properties"]["supplement_required"]["type"], "boolean")
                 self.assertEqual(
                     {tool["function"]["name"] for tool in calls[2].kwargs["tools"]},
-                    {"request_supplementary_experiment", "submit_interpretation"},
+                    {"request_supplementary_experiment"} if supplement_chosen else {"submit_interpretation"},
                 )
-                self.assertIn('"supplement_required": null', calls[2].kwargs["messages"][1]["content"])
+                self.assertIn(
+                    f'"supplement_required": {str(supplement_chosen).lower()}',
+                    calls[2].kwargs["messages"][1]["content"],
+                )
                 self.assertEqual(workflow.ml_solver.solve.call_count, int(supplement_chosen))
                 history = workflow.state.interpretation_history
                 self.assertEqual(history[0]["sender"], "PhDStudentAgent")
                 self.assertEqual(history[1]["sender"], "PostdocAgent")
                 self.assertEqual(history[1]["type"], "postdoc_feedback")
-                self.assertIsNone(history[1]["supplement_required"])
+                self.assertIs(history[1]["supplement_required"], supplement_chosen)
                 self.assertEqual(history[-1]["sender"], "PhDStudentAgent")
                 if supplement_chosen:
                     self.assertEqual(
